@@ -1,0 +1,18 @@
+# secrets
+.env
+.env.*
+!.env.example
+
+# environments
+.venv/
+venv/
+
+# generated data (vector store + results)
+data/
+
+# python
+__pycache__/
+*.pyc
+
+# os
+.DS_Store
