@@ -19,9 +19,22 @@ cd il_profiler
 # Create the app WITHOUT deploying yet (reads fly.toml; pick a unique name).
 fly apps create il-profiler        # or: fly launch --no-deploy --copy-config
 
-# Persistent volume the container mounts at /app/data (1–2 GB is plenty).
-fly volumes create il_data --region iad --size 2
+# Persistent volume the container mounts at /app/data. The index is ~0.4 GB,
+# so 1 GB is plenty (volume storage is ~$0.15/GB/month).
+fly volumes create il_data --region iad --size 1
 ```
+
+### Cap Fly spending at ~$10
+
+In the [Fly dashboard](https://fly.io/dashboard) → your org → **Billing**:
+
+1. Add **$10 prepaid credit**.
+2. Under **Spending management**, set a **monthly spending limit** (e.g. $10) —
+   Fly suspends resources if you hit it.
+
+With scale-to-zero (set in `fly.toml`) the machine only bills compute while in
+use, so a small-team tool stays far under $10/month — mostly just the ~$0.15/mo
+volume.
 
 If you change the app name or region, update `fly.toml` to match.
 

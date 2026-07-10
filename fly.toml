@@ -15,11 +15,14 @@ primary_region = "iad"   # change to a region near your team (e.g. "lhr", "sjc")
 [http_service]
   internal_port = 8080
   force_https = true
-  # Keep exactly one machine alive: the app holds a persistent Chroma index and
-  # runs multi-minute jobs, so it must NOT scale to zero mid-run.
-  auto_stop_machines = false
+  # Cost-minimizing: the machine sleeps when nobody is connected and wakes on the
+  # next request, so Fly charges compute only while the app is actually in use.
+  # An open Streamlit tab holds a websocket (= active connection), so a run in
+  # progress keeps the machine awake as long as the tab stays open. If the tab is
+  # closed mid-run the machine may sleep, but runs are resumable — just reopen.
+  auto_stop_machines = true
   auto_start_machines = true
-  min_machines_running = 1
+  min_machines_running = 0
 
   [http_service.concurrency]
     # One instance, modest concurrency — this is a small-team tool, and runs are
