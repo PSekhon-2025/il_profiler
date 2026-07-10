@@ -43,6 +43,8 @@ falsification check, not an oversight.
 
 ## Setup
 
+macOS / Linux:
+
 ```bash
 cd il_profiler
 python3 -m venv .venv
@@ -50,10 +52,23 @@ python3 -m venv .venv
 cp .env.example .env        # then paste your TOGETHER_API_KEY
 ```
 
+Windows (PowerShell or cmd):
+
+```bat
+cd il_profiler
+python -m venv .venv
+.venv\Scripts\pip install -r requirements.txt
+copy .env.example .env      REM then paste your TOGETHER_API_KEY
+```
+
 ## Run — GUI (recommended)
 
-Double-click **`Launch IL Profiler.command`** in Finder (or run
-`.venv/bin/streamlit run app.py`). The app opens in your browser with four tabs:
+macOS: double-click **`Launch IL Profiler.command`** in Finder (or run
+`.venv/bin/streamlit run app.py`).
+Windows: double-click **`Launch IL Profiler.bat`** in Explorer (or run
+`.venv\Scripts\streamlit run app.py`).
+
+The app opens in your browser with four tabs:
 
 - **Run** — paste/save your API key, build the vector index, and run the
   questionnaire for any subset of labs/sources, with live logs. Stages run as
@@ -69,6 +84,8 @@ Double-click **`Launch IL Profiler.command`** in Finder (or run
   see what a rewritten questionnaire changed.
 
 ## Run — CLI
+
+(On Windows, replace `.venv/bin/python` with `.venv\Scripts\python`.)
 
 ```bash
 .venv/bin/python scripts/01_ingest.py --fresh     # build the vector index (once)
@@ -121,6 +138,7 @@ scripts/
   02_run_profiles.py  stage 2: produce the profiles
 app.py                Streamlit GUI (Run / Results / Audit / Compare runs)
 Launch IL Profiler.command   double-clickable launcher (macOS)
+Launch IL Profiler.bat       double-clickable launcher (Windows)
 ```
 
 ## Cost notes

@@ -1,7 +1,8 @@
-"""Streamlit GUI for the Institutional-Logics RAG profiler.
+r"""Streamlit GUI for the Institutional-Logics RAG profiler.
 
-Run with:  .venv/bin/streamlit run app.py
-(or double-click "Launch IL Profiler.command")
+Run with:  .venv/bin/streamlit run app.py        (macOS/Linux)
+           .venv\Scripts\streamlit run app.py    (Windows)
+(or double-click "Launch IL Profiler.command" / "Launch IL Profiler.bat")
 
 Three areas:
   Run      — configure the API key, build the vector index, run profiles.
@@ -14,6 +15,7 @@ Three areas:
              reasoning from per_question.jsonl.
 """
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -28,7 +30,18 @@ from il_rag import runs
 from il_rag.config import CHROMA_DIR, COLLECTION_NAME, ORGS, SOURCE_TYPES
 from il_rag.questionnaire import CATEGORIES, LOGICS
 
-PYTHON = str(PROJECT_ROOT / ".venv" / "bin" / "python")
+
+def _venv_python() -> str:
+    """Path to the project venv's python (POSIX or Windows layout), else the
+    interpreter running this app."""
+    for cand in (PROJECT_ROOT / ".venv" / "bin" / "python",
+                 PROJECT_ROOT / ".venv" / "Scripts" / "python.exe"):
+        if cand.exists():
+            return str(cand)
+    return sys.executable
+
+
+PYTHON = _venv_python()
 ENV_PATH = PROJECT_ROOT / ".env"
 
 # Fold any pre-snapshot flat outputs into a run so the app only ever deals with
@@ -52,7 +65,7 @@ st.set_page_config(page_title="IL Profiler", page_icon="🏛️", layout="wide")
 def api_key_present() -> bool:
     if not ENV_PATH.exists():
         return False
-    for line in ENV_PATH.read_text().splitlines():
+    for line in ENV_PATH.read_text(encoding="utf-8").splitlines():
         if line.strip().startswith("TOGETHER_API_KEY="):
             val = line.split("=", 1)[1].strip()
             return bool(val) and val != "your_together_api_key_here"
@@ -60,7 +73,7 @@ def api_key_present() -> bool:
 
 
 def save_api_key(key: str) -> None:
-    ENV_PATH.write_text(f"TOGETHER_API_KEY={key.strip()}\n")
+    ENV_PATH.write_text(f"TOGETHER_API_KEY={key.strip()}\n", encoding="utf-8")
 
 
 @st.cache_data(ttl=30)
@@ -159,10 +172,13 @@ def stream_subprocess(args: list[str], log_box) -> int:
     semantics and keep a mid-run browser refresh from corrupting state — the
     worst case is the UI loses the log while the run completes on its own.
     """
+    # Force UTF-8 on the child's stdio so log streaming behaves identically on
+    # macOS and Windows (whose console default is a legacy codepage).
+    env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
     proc = subprocess.Popen(
-        args, cwd=str(PROJECT_ROOT),
+        args, cwd=str(PROJECT_ROOT), env=env,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, bufsize=1,
+        text=True, encoding="utf-8", errors="replace", bufsize=1,
     )
     lines: list[str] = []
     for raw in proc.stdout:  # tqdm progress arrives as \r-updates on one line
