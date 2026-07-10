@@ -3,7 +3,11 @@
 Usage:
     python scripts/02_run_profiles.py
     python scripts/02_run_profiles.py --orgs OpenAI --sources published   # subset
-    python scripts/02_run_profiles.py --fresh                             # start over
+    python scripts/02_run_profiles.py --fresh                             # new snapshot
+    python scripts/02_run_profiles.py --fresh --label "questionnaire v2"  # named run
+
+Each --fresh run is archived as its own snapshot under data/profiles/runs/ (the
+previous run is preserved), so runs can be compared in the app.
 """
 import argparse
 import sys
@@ -23,6 +27,9 @@ if __name__ == "__main__":
     ap.add_argument("--k", type=int, default=TOP_K,
                     help="chunks retrieved per question")
     ap.add_argument("--fresh", action="store_true",
-                    help="discard prior results and start over")
+                    help="start a new run snapshot (previous runs are kept)")
+    ap.add_argument("--label", default=None,
+                    help="optional label for this run (e.g. the questionnaire version)")
     args = ap.parse_args()
-    run_profiles(orgs=args.orgs, source_types=args.sources, k=args.k, fresh=args.fresh)
+    run_profiles(orgs=args.orgs, source_types=args.sources, k=args.k,
+                 fresh=args.fresh, label=args.label)

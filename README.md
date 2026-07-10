@@ -53,16 +53,20 @@ cp .env.example .env        # then paste your TOGETHER_API_KEY
 ## Run — GUI (recommended)
 
 Double-click **`Launch IL Profiler.command`** in Finder (or run
-`.venv/bin/streamlit run app.py`). The app opens in your browser with three tabs:
+`.venv/bin/streamlit run app.py`). The app opens in your browser with four tabs:
 
 - **Run** — paste/save your API key, build the vector index, and run the
   questionnaire for any subset of labs/sources, with live logs. Stages run as
-  the same resumable subprocesses as the CLI.
-- **Results** — the six profiles as grouped bar charts (published vs thirdparty
-  per lab), dominant-logic metrics, an automatic Family/Religion sanity-check
-  banner, a per-category heatmap, and download buttons for all output files.
-- **Audit** — filter and read every question's RAG answer, graded weights, and
-  matcher reasoning.
+  the same resumable subprocesses as the CLI. Each run is saved as its own
+  snapshot (optionally labelled), so a re-run never overwrites an earlier one.
+- **Results** — pick any saved run, then view the six profiles as grouped bar
+  charts (published vs thirdparty per lab), dominant-logic metrics, an automatic
+  Family/Religion sanity-check banner, a per-category heatmap, and downloads.
+- **Audit** — pick a run, then filter and read every question's RAG answer,
+  graded weights, and matcher reasoning.
+- **Compare runs** — diff two snapshots: per-logic profile deltas (B − A),
+  a question-wording diff, and a per-question answer/weight diff. This is how you
+  see what a rewritten questionnaire changed.
 
 ## Run — CLI
 
@@ -72,18 +76,32 @@ Double-click **`Launch IL Profiler.command`** in Finder (or run
 
 # iterate on a subset first (recommended before a full run):
 .venv/bin/python scripts/02_run_profiles.py --orgs OpenAI --sources published
+
+# start a fresh, labelled run snapshot (e.g. after rewriting the questionnaire):
+.venv/bin/python scripts/02_run_profiles.py --fresh --label "questionnaire v2"
 ```
 
-Both stages are **resumable**: rerunning skips completed work; `--fresh` starts
-over. All LLM calls run at temperature 0.
+Both stages are **resumable**: rerunning skips completed work. `--fresh` starts
+a **new run snapshot** rather than overwriting the previous one. All LLM calls
+run at temperature 0.
 
-## Outputs (`data/profiles/`)
+## Outputs — run snapshots (`data/profiles/runs/<run_id>/`)
+
+Every run is archived immutably under its own timestamped folder, so old and new
+runs can be compared in the app's **Compare** tab. `data/profiles/CURRENT` names
+the active run (used for resumption). Each snapshot contains:
 
 - `company_profiles.json` — `lab -> source_type -> {logic_pct, answered, abstained, by_category}`
 - `profiles_matrix.csv` — wide table: one row per (lab, source_type), one column per logic
 - `per_question.jsonl` — full audit trail: every question's RAG answer, retrieved
   chunk ids, graded weights, and matcher reasoning
-- a console report printing each profile as a ranked bar list
+- `questionnaire.json` — the exact questionnaire (questions + reference answers)
+  that produced this run, so wording changes can be diffed
+- `meta.json` — label, timestamps, params, answered/abstained counts, status
+
+Pre-snapshot results (flat files from before this layout) are migrated into a
+`legacy` run automatically on first launch. A console report still prints each
+profile as a ranked bar list.
 
 ## Layout
 
@@ -97,10 +115,11 @@ il_rag/
   rag_qa.py           retrieve -> grounded free-form answer
   graded_matcher.py   answer -> weight distribution over the 7 logics
   profile_harness.py  orchestration, aggregation, outputs, report
+  runs.py             run snapshots: archive/list/compare, legacy migration
 scripts/
   01_ingest.py        stage 1: build the index
   02_run_profiles.py  stage 2: produce the profiles
-app.py                Streamlit GUI (Run / Results / Audit)
+app.py                Streamlit GUI (Run / Results / Audit / Compare runs)
 Launch IL Profiler.command   double-clickable launcher (macOS)
 ```
 

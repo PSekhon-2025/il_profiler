@@ -7,13 +7,17 @@ answered questions, reported as percentages summing to ~100. Abstentions are
 counted separately and excluded from the denominator — a silent corpus reduces
 confidence (fewer answered questions), it never shifts the distribution.
 
-Outputs (data/profiles/):
+Outputs live in a per-run snapshot (data/profiles/runs/<run_id>/), managed by
+runs.py, so a run never overwrites an earlier one:
   per_question.jsonl    audit trail, one row per (org, source_type, question)
   company_profiles.json org -> source_type -> {logic_pct, answered, abstained, by_category}
   profiles_matrix.csv   wide table: one row per (org, source_type)
+  questionnaire.json    the questionnaire that produced this run (for diffing)
+  meta.json             run params, counts, status
 
-Resumable: rows already present in per_question.jsonl are skipped on rerun, so
-an interrupted run continues where it stopped. --fresh starts over.
+Resumable: rows already present in the active run's per_question.jsonl are
+skipped on rerun, so an interrupted run continues where it stopped. --fresh
+starts a NEW snapshot (the previous one is kept untouched).
 """
 import json
 from collections import defaultdict
@@ -22,15 +26,12 @@ from pathlib import Path
 import pandas as pd
 from tqdm import tqdm
 
-from .config import ORGS, PROFILES_DIR, SOURCE_TYPES, TOP_K
+from . import runs
+from .config import ORGS, SOURCE_TYPES, TOP_K
 from .graded_matcher import match_graded
 from .questionnaire import LOGICS, build_questionnaire
 from .rag_qa import answer_question
 from .retriever import Retriever
-
-PER_QUESTION_PATH = PROFILES_DIR / "per_question.jsonl"
-PROFILES_JSON_PATH = PROFILES_DIR / "company_profiles.json"
-PROFILES_CSV_PATH = PROFILES_DIR / "profiles_matrix.csv"
 
 
 def _load_existing(path: Path) -> tuple[set[tuple], list[dict]]:
@@ -54,17 +55,34 @@ def _load_existing(path: Path) -> tuple[set[tuple], list[dict]]:
 
 def run_profiles(orgs: list[str] | None = None,
                  source_types: list[str] | None = None,
-                 k: int = TOP_K, fresh: bool = False) -> dict:
-    """Run the full Design-A evaluation and write all outputs.
+                 k: int = TOP_K, fresh: bool = False,
+                 label: str | None = None) -> dict:
+    """Run the full Design-A evaluation into a run snapshot and write all outputs.
 
-    Returns the nested profiles dict (also written to company_profiles.json).
+    fresh=True mints a NEW snapshot; otherwise the active (CURRENT) run is
+    resumed, or a new one is created if none exists. Returns the nested profiles
+    dict (also written to the run's company_profiles.json).
     """
     orgs = orgs or ORGS
     source_types = source_types or SOURCE_TYPES
 
-    done, rows = (set(), []) if fresh else _load_existing(PER_QUESTION_PATH)
+    runs.migrate_legacy()  # one-time: fold pre-snapshot flat files into a run
+
+    if fresh or runs.get_current() is None:
+        run_id = runs.new_run(label=label, orgs=orgs, source_types=source_types, k=k)
+        print(f"new run: {run_id}")
+    else:
+        run_id = runs.get_current()
+        if label:
+            runs.update_meta(run_id, label=label)
+        print(f"resuming run: {run_id}")
+    paths = runs.run_paths(run_id)
+
+    # A fresh run's folder is empty, so resumption is a no-op there; for a
+    # resumed run we skip questions already on disk in THIS run.
+    done, rows = _load_existing(paths["per_question"])
     if done:
-        print(f"resuming: {len(done)} questions already answered on disk")
+        print(f"resuming: {len(done)} questions already answered in this run")
 
     todo = [
         (org, st, q)
@@ -75,11 +93,12 @@ def run_profiles(orgs: list[str] | None = None,
     ]
 
     retriever = Retriever()
-    with open(PER_QUESTION_PATH, "w" if fresh else "a", encoding="utf-8") as f:
+    with open(paths["per_question"], "a", encoding="utf-8") as f:
         for org, st, q in tqdm(todo, desc="profile", unit="q"):
             rag = answer_question(retriever, q["question"], org=org, source_type=st, k=k)
             verdict = match_graded(
-                question=q["question"], candidate=rag.answer, category=q["category"]
+                question=q["question"], candidate=rag.answer,
+                category=q["category"], variant=q["variant"],
             )
             row = {
                 "org": org,
@@ -99,8 +118,9 @@ def run_profiles(orgs: list[str] | None = None,
             rows.append(row)
 
     profiles = aggregate(rows, orgs, source_types)
-    _write_outputs(profiles)
-    _print_report(profiles)
+    _write_outputs(profiles, paths)
+    runs.finalize_meta(run_id, rows, orgs, source_types)
+    _print_report(profiles, run_id)
     return profiles
 
 
@@ -150,8 +170,8 @@ def aggregate(rows: list[dict], orgs: list[str], source_types: list[str]) -> dic
     return profiles
 
 
-def _write_outputs(profiles: dict) -> None:
-    with open(PROFILES_JSON_PATH, "w", encoding="utf-8") as f:
+def _write_outputs(profiles: dict, paths: dict) -> None:
+    with open(paths["profiles_json"], "w", encoding="utf-8") as f:
         json.dump(profiles, f, ensure_ascii=False, indent=2)
 
     records = []
@@ -164,14 +184,15 @@ def _write_outputs(profiles: dict) -> None:
             })
     pd.DataFrame(
         records, columns=["org", "source_type", "answered", "abstained", *LOGICS]
-    ).to_csv(PROFILES_CSV_PATH, index=False)
+    ).to_csv(paths["profiles_csv"], index=False)
 
 
-def _print_report(profiles: dict) -> None:
-    print("\n=== Institutional-logic alignment profiles (% per logic) ===")
+def _print_report(profiles: dict, run_id: str) -> None:
+    print(f"\n=== Institutional-logic alignment profiles (% per logic) "
+          f"[run {run_id}] ===")
     for org, by_st in profiles.items():
         for st, p in by_st.items():
             print(f"\n{org} [{st}]  answered={p['answered']}  abstained={p['abstained']}")
             for logic, pct in sorted(p["logic_pct"].items(), key=lambda kv: -kv[1]):
                 print(f"  {logic:<12} {pct:5.1f}%  {'#' * round(pct / 2)}")
-    print(f"\noutputs: {PROFILES_DIR}")
+    print(f"\noutputs: {runs.run_dir(run_id)}")

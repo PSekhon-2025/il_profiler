@@ -1,18 +1,24 @@
 """Fixed questionnaire + per-logic reference answers (Design A).
 
->>> PLACEHOLDER CONTENT <<<
-The 27 questions and the per-logic reference answers below are a starting
-point. The researcher (Pushpinder) WILL REWRITE these later. Treat both the
-wording of questions AND every reference answer as provisional. Nothing in the
-pipeline may depend on the exact strings; only the STRUCTURE is stable and
-relied upon: 9 categories x 3 questions, and exactly one reference answer per
-logic per category.
+The 27 questions and per-logic reference answers below are the researcher's
+(Pushpinder's) finalized set, formed from Thornton & Ocasio's seven logics and
+the Structural Transparency paper WITHOUT reference to the corpus. The load-
+bearing structure: 9 categories x 3 questions, and a full 7-logic reference set
+for every question.
+
+Most logics share one reference answer across a category's three questions, so
+each category declares a base `reference_answers` block (7 logics). Where a
+logic's exemplar genuinely differs by question — currently the State logic in a
+few categories — the category also declares `reference_overrides`:
+{variant: {logic: text}}, replacing just those cells. Questions without an
+override reuse the base text (so a category that only specifies State for some
+questions still has every question fully scored).
 
 Scoring contract:
   - Each question is templated with {org} (the lab name) at runtime.
-  - A question's RAG answer is matched against reference_answers[category] —
-    the 7 per-logic exemplars for that question's category (one row of the
-    Thornton & Ocasio matrix fleshed out into full sentences). The matcher
+  - A question's RAG answer is matched against reference_answers(category,
+    variant) — the 7 per-logic exemplars for that specific question (one row of
+    the Thornton & Ocasio matrix fleshed out into full sentences). The matcher
     returns a weight per logic.
 
 The same questionnaire is applied identically to every lab and source type so
@@ -57,9 +63,8 @@ QUESTIONNAIRE = {
             "What standards of appropriate conduct is {org} held to in its AI work — by itself and by others — and where do those standards come from?",
             "Describe a case where {org} followed, defended, or broke from common practice in AI development. What obligation or duty did it invoke to explain its conduct?",
         ],
-        # >>> PLACEHOLDER reference answers — replace later <<<
         "reference_answers": {
-            "State":       "The lab's obligations are owed to the public and humanity at large: conduct is appropriate when it serves citizens, complies with law and regulation, and honors commitments made to governments and society as a whole.",
+            "State":       "The lab's obligations are owed to the welfare of the people within a country, the laws of the country, and the legitimate authority in power. Conduct is appropriate when it serves the laws of the country, complies with regulation and bureaucratic orders, and honors commitments made to the state.",
             "Profession":  "Conduct is held to the standards of the scientific and research community: peer review, publication norms, methodological rigor, responsible-disclosure practices, and the shared duties of the AI research field.",
             "Market":      "Appropriate conduct is whatever serves the lab's own competitive self-interest: norms are framed around winning customers, outpacing rivals, and maximizing the lab's own advantage.",
             "Corporation": "Obligations derive from firm membership and employment: people are expected to follow company policy, protect the firm's interests, and act according to internal rules and their role in the organization.",
@@ -74,9 +79,8 @@ QUESTIONNAIRE = {
             "How do {org} and third parties writing about it establish that its approach to AI development and safety is credible? What achievements, qualities, or endorsements get cited?",
             "When {org} has faced public criticism or skepticism about its conduct, on what grounds did it — or its defenders — argue that its actions were justified?",
         ],
-        # >>> PLACEHOLDER reference answers — replace later <<<
         "reference_answers": {
-            "State":       "Legitimacy is claimed through democratic accountability and public benefit: cooperating with regulators, testifying before legislatures, supporting government oversight, and serving the public interest.",
+            "State":       "Legitimacy is claimed through serving the state, maintaining social order, and public benefit. It cooperates with regulators, testifying before legislatures, supporting government oversight, and serving the public interest.",
             "Profession":  "Legitimacy rests on technical and scientific expertise: world-class researchers, breakthroughs, peer-reviewed publications, and the authority of expert judgment.",
             "Market":      "Legitimacy comes from market performance: valuation, revenue growth, customer adoption, and investor confidence are what validate the lab's choices.",
             "Corporation": "Legitimacy rests on the firm's standing and market position: being a leading, established company with dominant products is what entitles it to act.",
@@ -91,7 +95,6 @@ QUESTIONNAIRE = {
             "What oversight bodies, governance structures, or external actors does {org} answer to in practice, and which of them does it treat as binding rather than advisory?",
             "Describe an instance where a major decision at or about {org} was contested, overridden, or reversed. Who turned out to hold the real power to decide?",
         ],
-        # >>> PLACEHOLDER reference answers — replace later <<<
         "reference_answers": {
             "State":       "Final authority rests with governments and regulators: the lab defers to legal mandates, regulatory approval, national-security review, and state oversight bodies.",
             "Profession":  "Authority rests with expert peers: scientific advisory boards, researcher consensus, and the judgment of acknowledged technical authorities inside and outside the lab.",
@@ -108,17 +111,22 @@ QUESTIONNAIRE = {
             "Who gets access to {org}'s models and infrastructure, on what terms, and what reasons does {org} give for those access decisions?",
             "When {org} describes the purpose of its technical infrastructure — platforms, APIs, evaluation tools, safety systems — what is that infrastructure said to be for?",
         ],
-        # >>> PLACEHOLDER reference answers — replace later <<<
         # NOTE: Family & Religion have no canonical affordance in the literature;
         # these are deliberately weak so they score ~0 (sanity check).
         "reference_answers": {
-            "State":       "Technology serves to broaden accessibility and traceability: making AI widely available as a public resource and making its behavior transparent, auditable, and accountable to society.",
+            # Base State = the Q1 affordance; Q2/Q3 override below.
+            "State":       "The technology can enable: 1. efficient coordination and control of the population through the state apparatus and bureaucracy, thereby improving administrative reach; 2. central planning and redistribution efforts; 3. building a national capacity of AI.",
             "Profession":  "Technology serves to enhance knowledgeability and autonomy: research tools, model access for scientists, and capabilities that deepen expert understanding and independent judgment.",
             "Market":      "Technology serves to stimulate and coordinate transactions: commercial products, usage-priced APIs, marketplaces, and features designed to drive exchange between buyers and sellers.",
             "Corporation": "Technology serves to standardize and control operations: enterprise integration, centralized control over deployment and use, and uniform, managed processes.",
             "Family":      "Technology mainly serves to reinforce the inner circle's bonds and position (no canonical affordance in the literature).",
             "Religion":    "Technology mainly serves as an expression of the sacred mission (no canonical affordance in the literature).",
             "Community":   "Technology serves to connect members and open governance: open weights and tooling, community forums and contributions, and participatory decision processes.",
+        },
+        # State's affordance differs by question; the other six logics are stable.
+        "reference_overrides": {
+            2: {"State": "Access depends on political capital: the state has meaningful control of any strategic infrastructure and capital, often through licensing, permits, or regulation. The stated reasons are egalitarian."},
+            3: {"State": "The justification is framed in the language of national interest, public service, and the collective good."},
         },
     },
     "Sources of Identity": {
@@ -127,15 +135,19 @@ QUESTIONNAIRE = {
             "What achievements or qualities does {org} most prominently claim credit for, and what does it appear to want to be known for?",
             "When {org} distinguishes itself from other AI developers, what differences does it emphasize?",
         ],
-        # >>> PLACEHOLDER reference answers — replace later <<<
         "reference_answers": {
-            "State":       "The lab identifies through its societal role: a steward acting on behalf of the public, defined by its responsibilities to society and its standing in the public order.",
+            # Base State = the Q1 identity; Q2/Q3 override below.
+            "State":       "The lab identifies as a contributor to a larger collective project — a servant to the nation and the masses. Outside observers characterize it through its political embeddedness, its relationship to the ownership structure, and its alignment with state goals and priorities.",
             "Profession":  "The lab identifies through craft and reputation: a research institution known for the quality of its science and the eminence of its researchers.",
             "Market":      "The lab presents as an interchangeable market actor: one company among competitors, defined by products, pricing, and market share rather than a distinctive persona.",
             "Corporation": "Identity comes from organizational structure and role: the lab describes itself through its divisions, hierarchy, parent company, and corporate position.",
             "Family":      "Identity centers on a founder family or inner circle: the lab is understood as someone's personal project, defined by lineage and insider belonging.",
             "Religion":    "Identity is devotional: the lab presents itself as a congregation united by faith in a transcendent cause.",
             "Community":   "Identity is relational and emotional: the lab presents itself as a movement or community that members and supporters feel they belong to.",
+        },
+        "reference_overrides": {
+            2: {"State": "It claims credit for its contributions to the nation and its economic development — job creation and the provision of welfare (e.g. healthcare). It wishes to be known as a socially responsible and nationally important organization."},
+            3: {"State": "It distinguishes itself through attributes that signal greater alignment with collective norms within the state: contribution to the nation's interest and reputation."},
         },
     },
     "Basis of Attention": {
@@ -144,15 +156,19 @@ QUESTIONNAIRE = {
             "Whose reactions does {org} appear most responsive to? Which audiences does it address first and most carefully in its communications and decisions?",
             "What kinds of developments or events have prompted {org} to change its behavior — for example competitor releases, new regulation, research findings, or public reaction?",
         ],
-        # >>> PLACEHOLDER reference answers — replace later <<<
         "reference_answers": {
-            "State":       "Attention tracks public and governmental standing: regulation, policy debates, public opinion, and the concerns of societal stakeholders dominate the agenda.",
+            # The source gives State only for Q2 and Q3. Per design, Q1 reuses the
+            # category's other text, so base State = the Q2 exemplar; Q3 overrides.
+            "State":       "Attention tracks entities with public and governmental standing — ministries, proposed regulations, and the officials responsible for granting capital and data access. Communication addresses alignment with national development and public benefit; the secondary audience is the public, reassuring on safety, stability, and jobs without destabilizing disruption.",
             "Profession":  "Attention tracks professional standing: benchmark results, publications and citations, research breakthroughs, and esteem among scientific peers.",
             "Market":      "Attention tracks market position: market share, competitor moves, revenue, and product adoption are the signals that drive responses.",
             "Corporation": "Attention tracks the internal hierarchy: reorganizations, leadership changes, reporting lines, and standing within the firm.",
             "Family":      "Attention tracks the inner circle: who is in or out of favor with the founder and the household around them.",
             "Religion":    "Attention tracks fidelity to the mission: perceived progress toward the transcendent goal eclipses worldly metrics.",
             "Community":   "Attention tracks member engagement: community contributions, participation, and how invested members are in the group.",
+        },
+        "reference_overrides": {
+            3: {"State": "Behavior change is triggered by actions of the state — new regulation, content and security directives, and shifts in national-plan priorities. Another trigger is anything that threatens political or social stability or the firm's legitimacy with the state: public grievances, social-movement attention, or media coverage."},
         },
     },
     "Basis of Strategy": {
@@ -161,7 +177,6 @@ QUESTIONNAIRE = {
             "Describe a major strategic choice {org} made — a partnership, product launch, restructuring, or research bet. What payoff was that choice said to pursue?",
             "When {org} discusses trade-offs between safety and its other goals, how does it describe the trade-off and what does it say takes priority?",
         ],
-        # >>> PLACEHOLDER reference answers — replace later <<<
         "reference_answers": {
             "State":       "Strategy aims to increase the public good: choices are justified by societal benefit, safety for humanity, and broad, equitable distribution of AI's gains.",
             "Profession":  "Strategy aims to increase reputation for excellence: research leadership, scientific firsts, and recognition within the field.",
@@ -178,7 +193,6 @@ QUESTIONNAIRE = {
             "How are internal dissent, departures, and whistleblowing handled at or around {org}? What has happened to insiders who deviated from expected behavior?",
             "What role do outside watchers — peers, analysts, journalists, online communities — play in checking or disciplining {org}'s behavior?",
         ],
-        # >>> PLACEHOLDER reference answers — replace later <<<
         "reference_answers": {
             "State":       "Discipline operates through political maneuvering: lobbying, alliances, and backroom negotiation with government and interest-group actors.",
             "Profession":  "Discipline operates through celebrated experts: the esteem or censure of renowned researchers and scientific peers keeps behavior in line.",
@@ -195,7 +209,6 @@ QUESTIONNAIRE = {
             "How does {org} explain the relationship between its mission and its commercial activities — why does it say it makes money the way it does?",
             "Who captures the economic value {org} creates, and how are ownership, profit, and control distributed?",
         ],
-        # >>> PLACEHOLDER reference answers — replace later <<<
         "reference_answers": {
             "State":       "Welfare capitalism: funding and structure are oriented to public benefit — capped returns, nonprofit oversight, public-interest missions, or partnership with the state.",
             "Profession":  "Personal capitalism: the enterprise is sustained by the expertise and reputation of its practitioners, who are its central economic asset.",
@@ -230,14 +243,30 @@ def build_questionnaire(org: str) -> list[dict]:
     return items
 
 
-def reference_answers(category: str) -> dict[str, str]:
-    """The 7 per-logic reference answers for a category (the matching space)."""
-    return QUESTIONNAIRE[category]["reference_answers"]
+def reference_answers(category: str, variant: int | None = None) -> dict[str, str]:
+    """The 7 per-logic reference answers for a (category, variant) — the matching space.
+
+    The category's `reference_answers` block is the base set shared by all three
+    question variants. If the category declares `reference_overrides`
+    ({variant: {logic: text}}), those cells replace the base for that variant;
+    variants without an override reuse the base text. Passing variant=None
+    returns the base set unchanged.
+    """
+    refs = dict(QUESTIONNAIRE[category]["reference_answers"])
+    if variant is not None:
+        overrides = QUESTIONNAIRE[category].get("reference_overrides", {})
+        refs.update(overrides.get(variant, {}))
+    return refs
 
 
-# Structural invariants the scoring pipeline depends on. These guard against
-# accidental breakage when the researcher rewrites the placeholder strings.
+# Structural invariants the scoring pipeline depends on. Every category must have
+# 3 questions and a full 7-logic base reference set; any overrides must target a
+# real variant (1-3) and known logics, so every (category, variant) resolves to
+# all 7 logics.
 assert set(QUESTIONNAIRE) == set(CATEGORIES), "category set mismatch"
 for _cat, _block in QUESTIONNAIRE.items():
     assert len(_block["questions"]) == 3, f"{_cat}: expected 3 questions"
     assert set(_block["reference_answers"]) == set(LOGICS), f"{_cat}: expected 7 reference answers"
+    for _v, _ov in _block.get("reference_overrides", {}).items():
+        assert _v in (1, 2, 3), f"{_cat}: override variant {_v} out of range"
+        assert set(_ov) <= set(LOGICS), f"{_cat}: override targets an unknown logic"

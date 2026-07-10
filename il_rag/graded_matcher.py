@@ -75,13 +75,17 @@ def _normalize(raw: dict) -> dict[str, float]:
     return {logic: v / total for logic, v in w.items()}
 
 
-def match_graded(*, question: str, candidate: str, category: str) -> dict:
+def match_graded(*, question: str, candidate: str, category: str,
+                 variant: int | None = None) -> dict:
     """Grade one candidate answer into a weight distribution over the 7 logics.
+
+    `variant` (1-3) selects the per-question reference set where a category
+    overrides it; without it the category's base references are used.
 
     Returns:
         {abstain: bool, weights: {logic: float}, reasoning: str, raw: str}
     """
-    refs = reference_answers(category)
+    refs = reference_answers(category, variant)
     references = "\n".join(f'- {logic}: "{refs[logic]}"' for logic in LOGICS)
     weight_keys = ", ".join(f'"{logic}": 0.0' for logic in LOGICS)
     messages = [
