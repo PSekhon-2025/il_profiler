@@ -1,0 +1,39 @@
+# Fly.io config for the IL Profiler app.
+# Rename `app` to your chosen unique name before first deploy (or let
+# `fly launch` set it). Secrets (TOGETHER_API_KEY, APP_PASSWORD) are set with
+# `fly secrets set`, never here. See DEPLOY.md for the full runbook.
+app = "il-profiler"
+primary_region = "iad"   # change to a region near your team (e.g. "lhr", "sjc")
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  # Hide the ingest controls: the cloud instance has the index, not the corpus.
+  IL_PROFILER_CLOUD = "1"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  # Keep exactly one machine alive: the app holds a persistent Chroma index and
+  # runs multi-minute jobs, so it must NOT scale to zero mid-run.
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [http_service.concurrency]
+    # One instance, modest concurrency — this is a small-team tool, and runs are
+    # long-lived subprocesses.
+    type = "requests"
+    soft_limit = 20
+    hard_limit = 40
+
+# Persistent storage for the vector index and run snapshots. The volume is
+# created once (`fly volumes create il_data`) and seeded from the local index.
+[mounts]
+  source = "il_data"
+  destination = "/app/data"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "1gb"   # Chroma + embedding/query calls; bump to 2gb if OOM on big runs

@@ -44,6 +44,11 @@ def _venv_python() -> str:
 PYTHON = _venv_python()
 ENV_PATH = PROJECT_ROOT / ".env"
 
+# Cloud deployments ship a prebuilt vector index but NOT the (copyrighted) raw
+# corpus, so ingestion can't run there. Set IL_PROFILER_CLOUD=1 to hide the
+# "Build the vector index" controls and expose only running profiles + viewing.
+CLOUD_MODE = os.environ.get("IL_PROFILER_CLOUD") == "1"
+
 # Fold any pre-snapshot flat outputs into a run so the app only ever deals with
 # the runs/ layout. No-op once a run exists.
 runs.migrate_legacy()
@@ -57,6 +62,34 @@ LOGIC_COLORS = {
 }
 
 st.set_page_config(page_title="IL Profiler", page_icon="🏛️", layout="wide")
+
+
+def _require_password() -> None:
+    """Lightweight shared-password gate for hosted deployments.
+
+    Enabled only when APP_PASSWORD is set (e.g. on Fly). This keeps the public
+    *.fly.dev URL from being open to anyone while remaining trivial for the team.
+    For per-reviewer identity, front the app with Cloudflare Access instead (see
+    DEPLOY.md) and leave APP_PASSWORD unset.
+    """
+    expected = os.environ.get("APP_PASSWORD")
+    if not expected:
+        return  # no gate configured (local use)
+    if st.session_state.get("authed"):
+        return
+    st.title("🏛️ IL Profiler")
+    with st.form("login"):
+        pw = st.text_input("Password", type="password")
+        if st.form_submit_button("Enter") and pw == expected:
+            st.session_state["authed"] = True
+            st.rerun()
+    if st.session_state.get("_login_tried") and not st.session_state.get("authed"):
+        st.error("Incorrect password.")
+    st.session_state["_login_tried"] = True
+    st.stop()
+
+
+_require_password()
 
 
 # ---------------------------------------------------------------------------
@@ -252,25 +285,35 @@ with tab_run:
             st.rerun()
 
     # --- Ingest ---
-    with st.expander("2 · Build the vector index",
-                     expanded=counts is None or (counts is not None and counts["chunks"].sum() == 0)):
-        st.caption(
-            "Parses the published PDF corpora and third-party RTF dumps, chunks, "
-            "embeds via Together, and stores everything in Chroma. Thousands of "
-            "embedding calls — run once, it persists on disk. Resumable."
+    # Hidden in cloud mode: the deployed instance ships a prebuilt index but not
+    # the raw corpus, so there is nothing to ingest there.
+    if CLOUD_MODE:
+        st.info(
+            "This hosted instance ships with a prebuilt vector index. Index "
+            "building is disabled here — it runs locally where the source "
+            "corpus lives. Use the questionnaire below to run profiles.",
+            icon="🏛️",
         )
-        fresh_ingest = st.checkbox("Rebuild from scratch (--fresh)", value=False,
-                                   key="fresh_ingest")
-        if st.button("Build index", type="primary",
-                     disabled=not api_key_present()):
-            args = [PYTHON, "scripts/01_ingest.py"] + (["--fresh"] if fresh_ingest else [])
-            with st.status("Building index…", expanded=True) as status:
-                rc = stream_subprocess(args, st.empty())
-                if rc == 0:
-                    status.update(label="Index built ✅", state="complete")
-                    index_counts.clear()
-                else:
-                    status.update(label=f"Ingest failed (exit {rc})", state="error")
+    else:
+        with st.expander("2 · Build the vector index",
+                         expanded=counts is None or (counts is not None and counts["chunks"].sum() == 0)):
+            st.caption(
+                "Parses the published PDF corpora and third-party RTF dumps, chunks, "
+                "embeds via Together, and stores everything in Chroma. Thousands of "
+                "embedding calls — run once, it persists on disk. Resumable."
+            )
+            fresh_ingest = st.checkbox("Rebuild from scratch (--fresh)", value=False,
+                                       key="fresh_ingest")
+            if st.button("Build index", type="primary",
+                         disabled=not api_key_present()):
+                args = [PYTHON, "scripts/01_ingest.py"] + (["--fresh"] if fresh_ingest else [])
+                with st.status("Building index…", expanded=True) as status:
+                    rc = stream_subprocess(args, st.empty())
+                    if rc == 0:
+                        status.update(label="Index built ✅", state="complete")
+                        index_counts.clear()
+                    else:
+                        status.update(label=f"Ingest failed (exit {rc})", state="error")
 
     # --- Profiles ---
     with st.expander("3 · Run the questionnaire", expanded=True):

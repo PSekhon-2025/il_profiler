@@ -1,0 +1,20 @@
+# Keep the image lean and secret-free. Anything here is NOT copied into the image.
+.git
+.gitignore
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Secrets — provided at runtime as Fly secrets / env vars, never baked in.
+.env
+.env.*
+!.env.example
+
+# Generated data — lives on the persistent Fly volume, not in the image.
+data/
+
+# Local-only launchers and OS cruft.
+Launch IL Profiler.command
+Launch IL Profiler.bat
+.DS_Store
