@@ -16,7 +16,13 @@ load_dotenv()  # pull TOGETHER_API_KEY from .env if present
 # Paths
 # ---------------------------------------------------------------------------
 PROJECT_ROOT = Path(__file__).resolve().parents[1]          # .../code/il_profiler
-CORPUS_ROOT = Path(__file__).resolve().parents[3]           # .../Research Project
+# Locally the raw corpus lives three levels up (.../Research Project). In a
+# container the app sits at /app, which has no parents[3] — indexing it raised
+# IndexError at import and crashed the whole app. Fall back to PROJECT_ROOT:
+# cloud deployments ship only the prebuilt index, so the corpus paths derived
+# from CORPUS_ROOT simply won't exist there (ingestion is disabled anyway).
+_here = Path(__file__).resolve()
+CORPUS_ROOT = _here.parents[3] if len(_here.parents) > 3 else PROJECT_ROOT
 
 DATA_DIR = PROJECT_ROOT / "data"
 CHROMA_DIR = DATA_DIR / "chroma"
