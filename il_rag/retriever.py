@@ -85,3 +85,31 @@ class Retriever:
             if len(out) >= k:
                 break
         return out
+
+    def get_by_ids(self, ids: list[str]) -> list[Chunk]:
+        """Refetch chunks by id, preserving the given order (provenance replay).
+
+        Used by the metamorphic eval to reconstruct the exact evidence a past
+        run answered from. There is no query, so similarity is undefined —
+        score is set to 0.0 and must not be interpreted. Ids missing from the
+        collection (e.g. after a --fresh reingest) are silently dropped; the
+        caller decides whether a shortened set is still usable.
+        """
+        if not ids:
+            return []
+        res = self.collection.get(ids=ids, include=["documents", "metadatas"])
+        by_id = {
+            cid: (doc, meta)
+            for cid, doc, meta in zip(res["ids"], res["documents"], res["metadatas"])
+        }
+        out = []
+        for cid in ids:
+            if cid not in by_id:
+                continue
+            doc, meta = by_id[cid]
+            out.append(Chunk(
+                id=cid, text=doc,
+                org=meta.get("org", ""), source_type=meta.get("source_type", ""),
+                filename=meta.get("filename", ""), score=0.0,
+            ))
+        return out

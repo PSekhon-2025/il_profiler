@@ -29,6 +29,7 @@ from tqdm import tqdm
 from . import runs
 from .config import ORGS, SOURCE_TYPES, TOP_K
 from .graded_matcher import match_graded
+from .grounding import bucket, grounding_scores, summarize_buckets
 from .questionnaire import LOGICS, build_questionnaire
 from .rag_qa import answer_question
 from .retriever import Retriever
@@ -56,12 +57,21 @@ def _load_existing(path: Path) -> tuple[set[tuple], list[dict]]:
 def run_profiles(orgs: list[str] | None = None,
                  source_types: list[str] | None = None,
                  k: int = TOP_K, fresh: bool = False,
-                 label: str | None = None) -> dict:
+                 label: str | None = None,
+                 grounding: bool = False, quotes: bool = False) -> dict:
     """Run the full Design-A evaluation into a run snapshot and write all outputs.
 
     fresh=True mints a NEW snapshot; otherwise the active (CURRENT) run is
     resumed, or a new one is created if none exists. Returns the nested profiles
     dict (also written to the run's company_profiles.json).
+
+    Opt-in hallucination checks (both default off, leaving rows byte-identical
+    to the original schema):
+      grounding=True  adds a no-LLM retrieval-grounding score and a three-way
+                      bucket (retrieval_missed / abstained / committed) to each
+                      row, plus a per-bucket section in the printed report;
+      quotes=True     answers via the quote-grounded prompt and persists the
+                      model's supporting quotes with code-side verification.
     """
     orgs = orgs or ORGS
     source_types = source_types or SOURCE_TYPES
@@ -95,7 +105,8 @@ def run_profiles(orgs: list[str] | None = None,
     retriever = Retriever()
     with open(paths["per_question"], "a", encoding="utf-8") as f:
         for org, st, q in tqdm(todo, desc="profile", unit="q"):
-            rag = answer_question(retriever, q["question"], org=org, source_type=st, k=k)
+            rag = answer_question(retriever, q["question"], org=org, source_type=st,
+                                  k=k, require_quotes=quotes)
             verdict = match_graded(
                 question=q["question"], candidate=rag.answer,
                 category=q["category"], variant=q["variant"],
@@ -113,6 +124,15 @@ def run_profiles(orgs: list[str] | None = None,
                 "weights": verdict["weights"],
                 "reasoning": verdict["reasoning"],
             }
+            if grounding:
+                g = grounding_scores(q["question"], rag.chunks)
+                row["retrieval_grounding_score"] = g["score"]
+                row["retrieval_cosine_top"] = g["cosine_top"]
+                row["grounding_bucket"] = bucket(
+                    abstain=verdict["abstain"], grounding_score=g["score"])
+            if quotes:
+                row["quotes"] = rag.quotes
+                row["quotes_verified"] = rag.quotes_verified
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
             f.flush()  # crash-safe: every completed row is durable immediately
             rows.append(row)
@@ -121,6 +141,8 @@ def run_profiles(orgs: list[str] | None = None,
     _write_outputs(profiles, paths)
     runs.finalize_meta(run_id, rows, orgs, source_types)
     _print_report(profiles, run_id)
+    if grounding:
+        _print_bucket_report(rows)
     return profiles
 
 
@@ -196,3 +218,18 @@ def _print_report(profiles: dict, run_id: str) -> None:
             for logic, pct in sorted(p["logic_pct"].items(), key=lambda kv: -kv[1]):
                 print(f"  {logic:<12} {pct:5.1f}%  {'#' * round(pct / 2)}")
     print(f"\noutputs: {runs.run_dir(run_id)}")
+
+
+def _print_bucket_report(rows: list[dict]) -> None:
+    """Three-way grounding breakdown (only rows that carry a bucket — a run
+    resumed across a flag change is summarized over its scored portion)."""
+    scored = [r for r in rows if "grounding_bucket" in r]
+    print(f"\n=== Retrieval-grounding buckets ({len(scored)}/{len(rows)} rows scored) ===")
+    stats = summarize_buckets(scored)
+    for b, s in stats.items():
+        if s["n"] == 0:
+            print(f"  {b:<17} n=0")
+            continue
+        top = f"{s['mean_top_weight']:.3f}" if s["mean_top_weight"] is not None else "—"
+        print(f"  {b:<17} n={s['n']:<4} abstain_rate={s['abstain_rate']:.3f} "
+              f"mean_top_weight={top}")

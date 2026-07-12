@@ -14,9 +14,7 @@ Guarantees enforced in code (never trusted to the LLM):
   - on abstention all weights are zeroed, so "no evidence" can never leak
     weight into any logic.
 """
-import json
-import re
-
+from .json_utils import extract_json
 from .llm import chat
 from .questionnaire import LOGICS, reference_answers
 
@@ -47,18 +45,6 @@ Task:
 
 Output strictly this JSON object, nothing else:
 {{"abstain": false, "weights": {{{weight_keys}}}, "reasoning": "one short sentence"}}"""
-
-
-def _extract_json(text: str) -> dict | None:
-    """Pull a JSON object out of an LLM reply, tolerating markdown fences."""
-    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip(), flags=re.MULTILINE)
-    m = re.search(r"\{.*\}", text, re.DOTALL)
-    if not m:
-        return None
-    try:
-        return json.loads(m.group(0))
-    except json.JSONDecodeError:
-        return None
 
 
 def _normalize(raw: dict) -> dict[str, float]:
@@ -100,10 +86,10 @@ def match_graded(*, question: str, candidate: str, category: str,
     # parses as nothing and silently becomes a spurious abstention. 1536 leaves
     # ample room; if parsing still fails, retry once with double the budget.
     raw = chat(messages, temperature=0.0, max_tokens=1536)
-    parsed = _extract_json(raw)
+    parsed = extract_json(raw)
     if parsed is None:
         raw = chat(messages, temperature=0.0, max_tokens=3072)
-        parsed = _extract_json(raw) or {}
+        parsed = extract_json(raw) or {}
     weights = _normalize(parsed.get("weights", {}))
     abstain = bool(parsed.get("abstain", False)) or sum(weights.values()) <= 0.0
     if abstain:

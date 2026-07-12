@@ -4,15 +4,22 @@ Run with:  .venv/bin/streamlit run app.py        (macOS/Linux)
            .venv\Scripts\streamlit run app.py    (Windows)
 (or double-click "Launch IL Profiler.command" / "Launch IL Profiler.bat")
 
-Three areas:
-  Run      — configure the API key, build the vector index, run profiles.
-             Pipeline stages execute as subprocesses with live log streaming,
-             so the resumable behavior of the CLI scripts is preserved and a
-             closed browser tab never corrupts a run.
-  Results  — the six alignment profiles as charts, the published-vs-thirdparty
-             comparison per lab, the Family/Religion sanity check, downloads.
-  Audit    — browse every question's RAG answer, graded weights, and matcher
-             reasoning from per_question.jsonl.
+Areas:
+  Run           — configure the API key, build the vector index, run profiles
+                  (optionally with the grounding / quotes checks enabled).
+                  Pipeline stages execute as subprocesses with live log
+                  streaming, so the resumable behavior of the CLI scripts is
+                  preserved and a closed browser tab never corrupts a run.
+  Results       — the six alignment profiles as charts, the published-vs-
+                  thirdparty comparison per lab, the Family/Religion sanity
+                  check, downloads.
+  Audit         — browse every question's RAG answer, graded weights, matcher
+                  reasoning, and (when enabled) quotes + grounding bucket.
+  Hallucination — the three opt-in checks for any saved run: retrieval-
+                  grounding buckets, quote verification, and the metamorphic
+                  label-stability eval (launchable from here), with alert
+                  banners when a detection fires.
+  Compare       — diff two run snapshots.
 """
 import json
 import os
@@ -27,7 +34,13 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from il_rag import runs
-from il_rag.config import CHROMA_DIR, COLLECTION_NAME, ORGS, SOURCE_TYPES
+from il_rag.config import (
+    CHROMA_DIR,
+    COLLECTION_NAME,
+    GROUNDING_LOW_THRESHOLD,
+    ORGS,
+    SOURCE_TYPES,
+)
 from il_rag.questionnaire import CATEGORIES, LOGICS
 
 
@@ -135,6 +148,35 @@ def load_questionnaire(run_id: str | None) -> dict | None:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def load_stability(run_id: str | None) -> dict | None:
+    """The metamorphic eval's stability.json for a run, if it has been run."""
+    if not run_id:
+        return None
+    path = runs.run_dir(run_id) / "metamorphic" / "stability.json"
+    if not path.exists():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def load_variants(run_id: str | None) -> pd.DataFrame | None:
+    """The metamorphic eval's per-variant audit rows for a run."""
+    if not run_id:
+        return None
+    path = runs.run_dir(run_id) / "metamorphic" / "variants.jsonl"
+    if not path.exists():
+        return None
+    rows = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    return pd.DataFrame(rows) if rows else None
+
+
 def run_selectbox(label: str, key: str, default_run_id: str | None = None) -> str | None:
     """Dropdown of all runs (newest first); returns the chosen run_id."""
     metas = runs.list_runs()
@@ -185,7 +227,7 @@ def stream_subprocess(args: list[str], log_box) -> int:
         part = raw.rstrip("\n").split("\r")[-1]
         if not part.strip():
             continue
-        if lines and (part.startswith(("ingest", "profile")) and
+        if lines and (part.startswith(("ingest", "profile", "metamorphic")) and
                       lines[-1].startswith(part.split(":")[0])):
             lines[-1] = part  # collapse progress-bar updates in place
         else:
@@ -231,8 +273,8 @@ with st.sidebar:
         st.caption(f"Active run: **{runs.display_name(cur_meta)}**  \n"
                    f"{len(all_metas)} run(s) saved")
 
-tab_run, tab_results, tab_audit, tab_compare = st.tabs(
-    ["▶️ Run", "📊 Results", "🔍 Audit", "🆚 Compare runs"])
+tab_run, tab_results, tab_audit, tab_halluc, tab_compare = st.tabs(
+    ["▶️ Run", "📊 Results", "🔍 Audit", "🚨 Hallucination", "🆚 Compare runs"])
 
 # ---------------------------------------------------------------------------
 # Run tab
@@ -296,6 +338,17 @@ with tab_run:
             cur = runs.read_meta(runs.get_current())
             st.caption(f"↻ Will resume the active run **{runs.display_name(cur)}** "
                        "(only unanswered questions are run).")
+        h1, h2 = st.columns(2)
+        opt_grounding = h1.checkbox(
+            "Grounding pre-check (--grounding)", value=False, key="opt_grounding",
+            help="Scores question↔chunk overlap and buckets each row as "
+                 "retrieval_missed / abstained / committed. No extra API calls. "
+                 "Results appear on the Hallucination tab.")
+        opt_quotes = h2.checkbox(
+            "Quote-grounded answers (--quotes)", value=False, key="opt_quotes",
+            help="Requires the answer model to return verbatim supporting quotes, "
+                 "verified in code against the retrieved chunks. Same call count; "
+                 "results appear on the Audit and Hallucination tabs.")
         n_pairs = len(sel_orgs) * len(sel_sources)
         st.caption(f"Selected: {n_pairs} profile(s) × {n_q} questions = "
                    f"{n_pairs * n_q} RAG + {n_pairs * n_q} matcher calls.")
@@ -307,6 +360,10 @@ with tab_run:
                 args.append("--fresh")
             if run_label.strip():
                 args += ["--label", run_label.strip()]
+            if opt_grounding:
+                args.append("--grounding")
+            if opt_quotes:
+                args.append("--quotes")
             with st.status("Running profiles…", expanded=True) as status:
                 rc = stream_subprocess(args, st.empty())
                 if rc == 0:
@@ -487,7 +544,338 @@ with tab_audit:
                     ).sort_values("weight", ascending=False)
                     st.dataframe(wdf, hide_index=True)
                 st.markdown(f"**Matcher reasoning:** {row['reasoning']}")
+                if isinstance(row.get("quotes"), list):
+                    ok = bool(row.get("quotes_verified"))
+                    st.markdown("**Supporting quotes:** "
+                                + ("✅ all verified in sources" if ok
+                                   else "⚠️ not verified"))
+                    for q in row["quotes"]:
+                        mark = "✅" if q.get("verified") else "❌"
+                        st.markdown(f"> {mark} [excerpt {q.get('excerpt', '?')}] "
+                                    f"“{q.get('quote', '')}”")
+                gb = row.get("grounding_bucket")
+                if isinstance(gb, str):
+                    st.caption(f"grounding: {gb} · score "
+                               f"{row.get('retrieval_grounding_score', 0):.2f} · "
+                               f"cosine {row.get('retrieval_cosine_top', 0):.2f}")
                 st.caption("retrieved: " + ", ".join(row["retrieved_ids"][:5]))
+
+# ---------------------------------------------------------------------------
+# Hallucination tab — the three opt-in checks, with alerts when one fires
+# ---------------------------------------------------------------------------
+with tab_halluc:
+    st.header("Hallucination & grounding checks")
+    st.caption(
+        "Three black-box checks: **retrieval grounding** (was there relevant "
+        "text to answer from?), **quote verification** (does the cited support "
+        "actually appear in the sources?), and **metamorphic stability** (does "
+        "the label survive paraphrase and a lab-name swap?)."
+    )
+    hal_run = run_selectbox("Run to inspect", key="halluc_run",
+                            default_run_id=runs.get_current())
+    dfh = load_per_question(hal_run)
+    stab = load_stability(hal_run)
+
+    if dfh is None or dfh.empty:
+        st.info("No per-question results yet — run the pipeline on the **Run** "
+                "tab first.")
+    else:
+        import altair as alt
+
+        has_grounding = ("grounding_bucket" in dfh.columns
+                         and dfh["grounding_bucket"].notna().any())
+        has_quotes = ("quotes_verified" in dfh.columns
+                      and dfh["quotes_verified"].notna().any())
+        gdf = dfh[dfh["grounding_bucket"].notna()] if has_grounding else None
+        qdf = dfh[dfh["quotes_verified"].notna()] if has_quotes else None
+        # "Fabricated" = the model DID cite quotes but at least one span is not
+        # in the sources. Rows with an empty quote list (typically abstentions
+        # or parse fallbacks) are reported separately, not as fabrications.
+        fab_rows = (qdf[qdf.apply(
+            lambda r: isinstance(r["quotes"], list) and len(r["quotes"]) > 0
+            and not bool(r["quotes_verified"]), axis=1)]
+            if has_quotes else None)
+        noq_rows = (qdf[qdf["quotes"].apply(
+            lambda q: not (isinstance(q, list) and len(q) > 0))]
+            if has_quotes else None)
+
+        # --- Detection banner: loud when something fired, green when clean ---
+        alerts: list[tuple[str, str]] = []
+        if has_grounding:
+            n_missed = int((gdf["grounding_bucket"] == "retrieval_missed").sum())
+            if n_missed:
+                alerts.append(("warning",
+                               f"🔎 **Retrieval likely missed** on {n_missed} "
+                               f"question(s) — their answers rest on weak evidence, "
+                               f"whatever the model did next. See section 1."))
+        if has_quotes and len(fab_rows):
+            alerts.append(("error",
+                           f"❌ **Unverified quotes** on {len(fab_rows)} answer(s): "
+                           f"cited spans do not appear verbatim in the retrieved "
+                           f"sources — possible fabricated support. See section 2."))
+        if stab:
+            s = stab["summary"]
+            if s.get("n_unstable"):
+                alerts.append(("error",
+                               f"🎲 **{s['n_unstable']} unstable item(s)**: the "
+                               f"predicted logic flipped under meaning-preserving "
+                               f"paraphrase. See section 3."))
+            if s.get("n_swap_label_changed"):
+                alerts.append(("error",
+                               f"🏷️ **{s['n_swap_label_changed']} lab-swap flip(s)**: "
+                               f"the label changed when only the lab's NAME changed — "
+                               f"the model may be keyed on its prior about the lab, "
+                               f"not the text. See section 3."))
+        if not (has_grounding or has_quotes or stab):
+            st.info("None of the checks have run for this snapshot yet. Enable "
+                    "**--grounding** / **--quotes** on the Run tab for the next "
+                    "run, or launch the metamorphic eval below (works on any "
+                    "existing run).")
+        elif alerts:
+            for kind, msg in alerts:
+                getattr(st, kind)(msg)
+        else:
+            st.success("✅ No hallucination signals fired on the checks that ran "
+                       "for this snapshot.")
+
+        BUCKET_ORDER = ["committed", "abstained", "retrieval_missed"]
+        BUCKET_COLORS = ["#54A24B", "#F58518", "#E45756"]
+
+        # ---------------- 1 · Retrieval grounding ----------------
+        st.subheader("1 · Retrieval grounding")
+        if not has_grounding:
+            st.caption("Not scored for this run — check **Grounding pre-check** "
+                       "on the Run tab (adds no API calls).")
+        else:
+            n_by = gdf["grounding_bucket"].value_counts()
+            m1, m2, m3 = st.columns(3)
+            m1.metric("🟢 committed", int(n_by.get("committed", 0)),
+                      help="retrieval looked plausible; answer graded into logics")
+            m2.metric("🟠 abstained", int(n_by.get("abstained", 0)),
+                      help="retrieval looked plausible but the model said the "
+                           "excerpts don't answer — honest silence")
+            m3.metric("🔴 retrieval missed", int(n_by.get("retrieval_missed", 0)),
+                      help=f"grounding score < {GROUNDING_LOW_THRESHOLD}: the "
+                           "question's content words barely appear in any "
+                           "retrieved chunk")
+            hist = (
+                alt.Chart(gdf[["retrieval_grounding_score", "grounding_bucket"]])
+                .mark_bar()
+                .encode(
+                    x=alt.X("retrieval_grounding_score:Q",
+                            bin=alt.Bin(maxbins=20),
+                            title="grounding score (question↔chunk overlap)"),
+                    y=alt.Y("count()", title="questions"),
+                    color=alt.Color("grounding_bucket:N", title="bucket",
+                                    scale=alt.Scale(domain=BUCKET_ORDER,
+                                                    range=BUCKET_COLORS)),
+                )
+                .properties(height=200)
+            )
+            rule = (
+                alt.Chart(pd.DataFrame({"x": [GROUNDING_LOW_THRESHOLD]}))
+                .mark_rule(color="#E45756", strokeDash=[6, 4], size=2)
+                .encode(x="x:Q")
+            )
+            st.altair_chart(hist + rule, width="stretch")
+            missed = gdf[gdf["grounding_bucket"] == "retrieval_missed"]
+            if len(missed):
+                with st.expander(f"🔴 {len(missed)} question(s) where retrieval "
+                                 "likely missed", expanded=False):
+                    for _, r in missed.iterrows():
+                        st.markdown(
+                            f"**{r['org']} · {r['source_type']} · {r['qid']}** — "
+                            f"score {r['retrieval_grounding_score']:.2f}"
+                            + ("  · model abstained ✅" if r["abstain"]
+                               else "  · **model still committed** ⚠️"))
+                        st.caption(r["question"])
+
+        # ---------------- 2 · Quote verification ----------------
+        st.subheader("2 · Quote verification")
+        if not has_quotes:
+            st.caption("Not enabled for this run — check **Quote-grounded "
+                       "answers** on the Run tab.")
+        else:
+            n_ok = int(qdf["quotes_verified"].astype(bool).sum())
+            m1, m2, m3 = st.columns(3)
+            m1.metric("✅ all quotes verified", n_ok)
+            m2.metric("❌ unverified quotes", len(fab_rows),
+                      help="the answer cited at least one span that is not in "
+                           "the retrieved sources")
+            m3.metric("∅ no quotes returned", len(noq_rows),
+                      help="empty quote list — expected for abstentions")
+            if len(fab_rows):
+                for _, r in fab_rows.iterrows():
+                    with st.expander(f"❌ {r['org']} · {r['source_type']} · "
+                                     f"{r['qid']}"):
+                        st.markdown(f"**Q:** {r['question']}")
+                        st.markdown(f"**Answer:** {r['answer']}")
+                        for q in r["quotes"]:
+                            mark = "✅" if q.get("verified") else "❌"
+                            st.markdown(f"> {mark} [excerpt {q.get('excerpt', '?')}]"
+                                        f" “{q.get('quote', '')}”")
+            else:
+                st.caption("Every quoted span was found verbatim in its retrieved "
+                           "sources.")
+
+        # ---------------- 3 · Metamorphic label stability ----------------
+        st.subheader("3 · Metamorphic label stability")
+        with st.expander("Run the metamorphic eval for this snapshot",
+                         expanded=stab is None):
+            st.caption(
+                "For each item: k LLM paraphrases of its retrieved chunks + one "
+                "deterministic lab-name swap, each re-answered and re-graded "
+                "through the production path. A grounded label survives both. "
+                "Resumable; results land inside this run's folder."
+            )
+            c1, c2, c3 = st.columns(3)
+            n_para = c1.number_input("Paraphrases per item", 1, 10, 3,
+                                     key="mm_para")
+            mm_sample = c2.number_input("Sample size (0 = all items)", 0, 500, 30,
+                                        key="mm_sample")
+            mm_seed = c3.number_input("Sample seed", 0, 9999, 0, key="mm_seed")
+            n_items = len(dfh) if not mm_sample else min(int(mm_sample), len(dfh))
+            st.caption(f"≈ {n_items} item(s) × ({int(n_para)} paraphrases + 1 swap) "
+                       f"≈ {n_items * (3 * int(n_para) + 2)} chat calls.")
+            if st.button("Run metamorphic eval", type="primary",
+                         disabled=not api_key_present() or not hal_run,
+                         key="mm_go"):
+                args = [PYTHON, "scripts/03_run_metamorphic_eval.py",
+                        "--run", hal_run,
+                        "--paraphrases", str(int(n_para)),
+                        "--seed", str(int(mm_seed))]
+                if mm_sample:
+                    args += ["--sample", str(int(mm_sample))]
+                with st.status("Running metamorphic eval…", expanded=True) as status:
+                    rc = stream_subprocess(args, st.empty())
+                    if rc == 0:
+                        status.update(label="Metamorphic eval complete ✅",
+                                      state="complete")
+                    else:
+                        status.update(label=f"Eval failed (exit {rc})",
+                                      state="error")
+                st.rerun()
+
+        if stab:
+            s = stab["summary"]
+            items = pd.DataFrame(stab["per_item"])
+            st.caption(f"Evaluated {s['items']} item(s) "
+                       f"({s['paraphrases_per_item']} paraphrases + 1 swap each"
+                       + (f", sample={s['sample']}" if s.get("sample") else "")
+                       + ") — self-referential: the same model paraphrases and "
+                         "classifies, so audit a few variants by hand.")
+            m1, m2, m3, m4 = st.columns(4)
+            ms = s.get("mean_label_stability")
+            m1.metric("Mean label stability",
+                      "—" if ms is None else f"{ms:.2f}",
+                      help="fraction of paraphrase variants keeping the "
+                           "original label, averaged over items")
+            pf = s.get("pct_fully_stable")
+            m2.metric("Fully stable items",
+                      "—" if pf is None else f"{pf:.0f}%")
+            m3.metric("🎲 Unstable items", s.get("n_unstable", 0),
+                      delta=None if not s.get("n_unstable") else "detection",
+                      delta_color="inverse")
+            m4.metric("🏷️ Lab-swap flips",
+                      f"{s.get('n_swap_label_changed', 0)}"
+                      f"/{s.get('n_swap_evaluated', 0)}",
+                      help="label changed although only the lab's name changed "
+                           "— suggests prior-keyed, not text-grounded")
+
+            cat_rows = [{"category": c, "stability": v}
+                        for c, v in s.get("by_category", {}).items()
+                        if v is not None]
+            if cat_rows:
+                cdf = pd.DataFrame(cat_rows)
+                cat_chart = (
+                    alt.Chart(cdf)
+                    .mark_bar()
+                    .encode(
+                        x=alt.X("stability:Q", title="mean label stability",
+                                scale=alt.Scale(domain=[0, 1])),
+                        y=alt.Y("category:N", title=None,
+                                sort=[c for c in CATEGORIES]),
+                        color=alt.Color("stability:Q", legend=None,
+                                        scale=alt.Scale(scheme="redyellowgreen",
+                                                        domain=[0, 1])),
+                        tooltip=["category",
+                                 alt.Tooltip("stability:Q", format=".2f")],
+                    )
+                    .properties(height=220)
+                )
+                st.altair_chart(cat_chart, width="stretch")
+
+            if "by_grounding_bucket" in s:
+                st.caption("Stability by grounding bucket (from this run's "
+                           "--grounding scores):")
+                st.dataframe(pd.DataFrame(s["by_grounding_bucket"]).T,
+                             width="stretch")
+
+            flagged = items[(items.get("unstable") == True)  # noqa: E712
+                            | (items.get("swap_label_changed") == True)]  # noqa: E712
+            if flagged.empty:
+                st.success("✅ Every evaluated item kept its label under all "
+                           "paraphrases and the lab swap.")
+            else:
+                st.markdown(f"**⚠️ {len(flagged)} flagged item(s)** — the "
+                            "detection firing, item by item:")
+                vdf = load_variants(hal_run)
+                for _, it in flagged.iterrows():
+                    badges = []
+                    if it.get("unstable"):
+                        badges.append("🎲 unstable")
+                    if it.get("swap_label_changed"):
+                        badges.append("🏷️ swap flip")
+                    ls = it.get("label_stability")
+                    title = (f"{' + '.join(badges)} · {it['org']} · "
+                             f"{it['source_type']} · {it['qid']} — original "
+                             f"label: {it['original_label']}"
+                             + (f", stability {ls:.2f}" if ls is not None else ""))
+                    with st.expander(title):
+                        if it.get("swap_label_changed"):
+                            st.markdown(
+                                f"**Lab swap:** text renamed to "
+                                f"**{it.get('swap_to', '?')}** → label flipped "
+                                f"**{it['original_label']} → "
+                                f"{it.get('swap_label', '?')}**")
+                        if vdf is not None:
+                            sub = vdf[(vdf["org"] == it["org"])
+                                      & (vdf["source_type"] == it["source_type"])
+                                      & (vdf["qid"] == it["qid"])]
+                            if not sub.empty:
+                                disp = sub[["variant_kind", "variant_idx",
+                                            "label", "label_matches_original"]
+                                           ].copy() if "label" in sub.columns else None
+                                if disp is not None:
+                                    disp["label_matches_original"] = disp[
+                                        "label_matches_original"].map(
+                                        {True: "✅ kept", False: "❌ flipped"})
+                                    st.dataframe(
+                                        disp.rename(columns={
+                                            "variant_kind": "variant",
+                                            "variant_idx": "#",
+                                            "label_matches_original": "vs original",
+                                        }), hide_index=True, width="stretch")
+                                flips = sub[(sub.get("label_matches_original")
+                                             == False)]  # noqa: E712
+                                for _, v in flips.iterrows():
+                                    st.markdown(
+                                        f"**{v['variant_kind']} #"
+                                        f"{v['variant_idx']} → "
+                                        f"{v.get('label', '?')}** — variant "
+                                        f"answer:")
+                                    st.caption(v.get("answer") or "(no answer)")
+
+            dl1, dl2 = st.columns(2)
+            mdir = runs.run_dir(hal_run) / "metamorphic"
+            if (mdir / "stability.json").exists():
+                dl1.download_button("stability.json",
+                                    (mdir / "stability.json").read_bytes(),
+                                    file_name=f"stability_{hal_run}.json")
+            if (mdir / "variants.jsonl").exists():
+                dl2.download_button("variants.jsonl",
+                                    (mdir / "variants.jsonl").read_bytes(),
+                                    file_name=f"variants_{hal_run}.jsonl")
 
 # ---------------------------------------------------------------------------
 # Compare tab — diff two run snapshots (the point of saving runs)
