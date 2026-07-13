@@ -210,6 +210,35 @@ def load_variants(run_id: str | None) -> pd.DataFrame | None:
     return pd.DataFrame(rows) if rows else None
 
 
+def load_embedding_summary(run_id: str | None) -> dict | None:
+    """The embedding-agreement summary for a run, if computed."""
+    if not run_id:
+        return None
+    path = runs.run_dir(run_id) / "embedding_agreement" / "summary.json"
+    if not path.exists():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def load_embedding_rows(run_id: str | None) -> pd.DataFrame | None:
+    """Per-row embedding similarities for a run, if computed."""
+    if not run_id:
+        return None
+    path = runs.run_dir(run_id) / "embedding_agreement" / "similarities.jsonl"
+    if not path.exists():
+        return None
+    rows = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    return pd.DataFrame(rows) if rows else None
+
+
 def run_selectbox(label: str, key: str, default_run_id: str | None = None) -> str | None:
     """Dropdown of all runs (newest first); returns the chosen run_id."""
     metas = runs.list_runs()
@@ -609,15 +638,17 @@ with tab_audit:
 with tab_halluc:
     st.header("Hallucination & grounding checks")
     st.caption(
-        "Three black-box checks: **retrieval grounding** (was there relevant "
+        "Four black-box checks: **retrieval grounding** (was there relevant "
         "text to answer from?), **quote verification** (does the cited support "
-        "actually appear in the sources?), and **metamorphic stability** (does "
-        "the label survive paraphrase and a lab-name swap?)."
+        "actually appear in the sources?), **metamorphic stability** (does "
+        "the label survive paraphrase and a lab-name swap?), and **embedding "
+        "agreement** (does a non-LLM judge rank the same reference nearest?)."
     )
     hal_run = run_selectbox("Run to inspect", key="halluc_run",
                             default_run_id=runs.get_current())
     dfh = load_per_question(hal_run)
     stab = load_stability(hal_run)
+    emb = load_embedding_summary(hal_run)
 
     if dfh is None or dfh.empty:
         st.info("No per-question results yet — run the pipeline on the **Run** "
@@ -669,11 +700,18 @@ with tab_halluc:
                                f"the label changed when only the lab's NAME changed — "
                                f"the model may be keyed on its prior about the lab, "
                                f"not the text. See section 3."))
-        if not (has_grounding or has_quotes or stab):
+        if emb and emb["overall"].get("rate") is not None \
+                and emb["overall"]["rate"] < 0.5:
+            alerts.append(("warning",
+                           f"🧭 **Low embedding agreement** "
+                           f"({emb['overall']['rate']:.0%}): the non-LLM judge "
+                           f"often ranks a different logic's reference nearest "
+                           f"than the matcher's top pick. See section 4."))
+        if not (has_grounding or has_quotes or stab or emb):
             st.info("None of the checks have run for this snapshot yet. Enable "
                     "**--grounding** / **--quotes** on the Run tab for the next "
-                    "run, or launch the metamorphic eval below (works on any "
-                    "existing run).")
+                    "run, or launch the metamorphic eval / embedding agreement "
+                    "below (both work on any existing run).")
         elif alerts:
             for kind, msg in alerts:
                 getattr(st, kind)(msg)
@@ -919,6 +957,102 @@ with tab_halluc:
                 dl2.download_button("variants.jsonl",
                                     (mdir / "variants.jsonl").read_bytes(),
                                     file_name=f"variants_{hal_run}.jsonl")
+
+        # ---------------- 4 · Embedding agreement ----------------
+        st.subheader("4 · Embedding agreement (second judge)")
+        st.caption(
+            "Embeds every committed answer and the run's own seven reference "
+            "answers per category, ranks the references by cosine similarity, "
+            "and checks whether the nearest reference's logic agrees with the "
+            "LLM matcher's top logic. Deterministic and LLM-free. Absolute "
+            "cosine values are NOT interpretable (e5 compresses them into a "
+            "narrow band) — only the ranking and the top1–top2 margin are."
+        )
+        if st.button("Compute embedding agreement",
+                     disabled=not api_key_present(),
+                     help="One embedding per committed row + 63 references, "
+                          "batched — fractions of a cent. Recomputing "
+                          "overwrites the previous result for this run."):
+            args = [PYTHON, "scripts/04_run_embedding_agreement.py",
+                    "--run", hal_run]
+            with st.status("Computing embedding agreement…",
+                           expanded=True) as status:
+                rc = stream_subprocess(args, st.empty())
+                if rc == 0:
+                    status.update(label="Embedding agreement complete ✅",
+                                  state="complete")
+                else:
+                    status.update(label=f"Check failed (exit {rc})",
+                                  state="error")
+            st.rerun()
+
+        if emb:
+            o = emb["overall"]
+            e1, e2, e3 = st.columns(3)
+            e1.metric("Agreement with matcher",
+                      f"{o['rate']:.0%}" if o.get("rate") is not None else "—",
+                      help="share of committed answers where the embedding-"
+                           "nearest reference logic equals the matcher's top "
+                           "logic")
+            e2.metric("Rows compared", o.get("n", 0))
+            e3.metric("Mean top1–top2 margin", f"{emb.get('mean_margin', 0):.3f}",
+                      help="how decisively the nearest reference wins; small "
+                           "margins mean the embedding judge itself was "
+                           "uncertain")
+
+            cat_rows = [{"category": c, "rate": v["rate"], "n": v["n"]}
+                        for c, v in emb.get("by_category", {}).items()
+                        if v.get("rate") is not None]
+            if cat_rows:
+                edf = pd.DataFrame(cat_rows)
+                emb_chart = (
+                    alt.Chart(edf)
+                    .mark_bar()
+                    .encode(
+                        x=alt.X("rate:Q", title="agreement rate",
+                                scale=alt.Scale(domain=[0, 1])),
+                        y=alt.Y("category:N", title=None,
+                                sort=[c for c in CATEGORIES]),
+                        color=alt.Color("rate:Q", legend=None,
+                                        scale=alt.Scale(scheme="redyellowgreen",
+                                                        domain=[0, 1])),
+                        tooltip=["category",
+                                 alt.Tooltip("rate:Q", format=".2f"), "n"],
+                    )
+                    .properties(height=220)
+                )
+                st.altair_chart(emb_chart, width="stretch")
+
+            erows = load_embedding_rows(hal_run)
+            if erows is not None and not erows.empty:
+                dis = erows[~erows["agree"]]
+                if dis.empty:
+                    st.success("✅ The embedding judge agrees with the matcher "
+                               "on every committed answer.")
+                else:
+                    st.markdown(f"**{len(dis)} disagreement(s)** — where the "
+                                "two judges split (low margins mean the "
+                                "embedding side was itself a coin toss):")
+                    st.dataframe(
+                        dis[["org", "source_type", "qid", "matcher_top",
+                             "matcher_top_weight", "embedding_nearest",
+                             "margin"]].rename(columns={
+                                 "matcher_top": "matcher says",
+                                 "matcher_top_weight": "weight",
+                                 "embedding_nearest": "embedding says",
+                             }),
+                        hide_index=True, width="stretch")
+
+            edir = runs.run_dir(hal_run) / "embedding_agreement"
+            dle1, dle2 = st.columns(2)
+            if (edir / "summary.json").exists():
+                dle1.download_button("summary.json",
+                                     (edir / "summary.json").read_bytes(),
+                                     file_name=f"embedding_summary_{hal_run}.json")
+            if (edir / "similarities.jsonl").exists():
+                dle2.download_button("similarities.jsonl",
+                                     (edir / "similarities.jsonl").read_bytes(),
+                                     file_name=f"embedding_rows_{hal_run}.jsonl")
 
 # ---------------------------------------------------------------------------
 # Compare tab — diff two run snapshots (the point of saving runs)
