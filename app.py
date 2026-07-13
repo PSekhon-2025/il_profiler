@@ -210,6 +210,16 @@ def load_variants(run_id: str | None) -> pd.DataFrame | None:
     return pd.DataFrame(rows) if rows else None
 
 
+def load_bootstrap_ci(run_id: str | None) -> dict | None:
+    """The bootstrap-CI result for a run, if computed."""
+    if not run_id:
+        return None
+    path = runs.run_dir(run_id) / "bootstrap_ci" / "ci.json"
+    if not path.exists():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
 def load_embedding_summary(run_id: str | None) -> dict | None:
     """The embedding-agreement summary for a run, if computed."""
     if not run_id:
@@ -464,6 +474,47 @@ with tab_results:
                 f"{res_meta.get('abstained', 0)} abstained"
             )
 
+        # --- Bootstrap confidence intervals (optional, zero-API, post-hoc) ---
+        ci_data = load_bootstrap_ci(res_run)
+        with st.expander("Confidence intervals (bootstrap over questions)",
+                         expanded=bool(ci_data)):
+            st.caption(
+                "Each % is a mean over the answered questions, so its error bar "
+                "comes from resampling those questions with replacement. Wide "
+                "bars mean the estimate leans on which questions were asked — "
+                "expected with ~27 questions. Zero API cost, deterministic."
+            )
+            if st.button("Compute / refresh confidence intervals"):
+                args = [PYTHON, "scripts/05_run_bootstrap_ci.py",
+                        "--run", res_run]
+                with st.status("Bootstrapping…", expanded=True) as status:
+                    rc = stream_subprocess(args, st.empty())
+                    status.update(
+                        label="Confidence intervals ready ✅" if rc == 0
+                        else f"Failed (exit {rc})",
+                        state="complete" if rc == 0 else "error")
+                st.rerun()
+            if ci_data:
+                st.caption(f"{int(ci_data['ci'] * 100)}% CI · "
+                           f"{ci_data['iterations']} resamples · seed "
+                           f"{ci_data['seed']} — error bars shown on the charts "
+                           "below; full table in the download.")
+                ci_csv = runs.run_dir(res_run) / "bootstrap_ci" / "ci.csv"
+                if ci_csv.exists():
+                    st.download_button("ci.csv", ci_csv.read_bytes(),
+                                       file_name=f"bootstrap_ci_{res_run}.csv")
+
+        # ci_long: lo/hi per (lab, source, logic) for error-bar overlays.
+        ci_recs = []
+        if ci_data:
+            for org, by_st in ci_data["profiles"].items():
+                for stype, by_logic in by_st.items():
+                    for logic, s in by_logic.items():
+                        ci_recs.append({"lab": org, "source": stype,
+                                        "logic": logic,
+                                        "lo": s["lo"], "hi": s["hi"]})
+        ci_long = pd.DataFrame(ci_recs)
+
         # Long-form dataframe of every profile for charting.
         recs = []
         for org, by_st in profiles.items():
@@ -496,7 +547,7 @@ with tab_results:
             for org in [o for o in ORGS if o in long["lab"].unique()]:
                 st.subheader(org)
                 sub = long[long["lab"] == org]
-                chart = (
+                bars = (
                     alt.Chart(sub)
                     .mark_bar()
                     .encode(
@@ -512,8 +563,27 @@ with tab_results:
                         tooltip=["lab", "source", "logic",
                                  alt.Tooltip("pct:Q", format=".1f")],
                     )
-                    .properties(height=260)
                 )
+                layers = [bars]
+                # Overlay bootstrap CI whiskers when available.
+                if not ci_long.empty:
+                    csub = ci_long[ci_long["lab"] == org]
+                    if not csub.empty:
+                        whiskers = (
+                            alt.Chart(csub)
+                            .mark_rule(strokeWidth=1.5, color="#333")
+                            .encode(
+                                x=alt.X("logic:N", sort=LOGICS, title=None),
+                                xOffset=alt.XOffset("source:N"),
+                                y=alt.Y("lo:Q", title="% of profile"),
+                                y2="hi:Q",
+                                tooltip=["lab", "source", "logic",
+                                         alt.Tooltip("lo:Q", format=".1f"),
+                                         alt.Tooltip("hi:Q", format=".1f")],
+                            )
+                        )
+                        layers.append(whiskers)
+                chart = alt.layer(*layers).properties(height=260)
                 st.altair_chart(chart, width="stretch")
 
                 cols = st.columns(len([s for s in SOURCE_TYPES
