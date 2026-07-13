@@ -47,6 +47,38 @@ TOP_K = 5                # chunks retrieved per question
 COLLECTION_NAME = "il_corpus"
 
 # ---------------------------------------------------------------------------
+# Hallucination / grounding checks — ALL opt-in; a default run never reads
+# these except at import, and produces byte-identical output with them present.
+# ---------------------------------------------------------------------------
+# Feature 1 (grounding pre-check): rows whose retrieval-grounding score (max
+# lexical content-token recall of the question against its retrieved chunks,
+# in [0, 1]) falls below this are bucketed "retrieval_missed". Tune per corpus.
+GROUNDING_LOW_THRESHOLD = 0.2
+
+# Feature 3 (metamorphic label-stability eval).
+METAMORPHIC_PARAPHRASES = 3          # meaning-preserving paraphrases per item
+# label_stability below this flags an item unstable. 1.0 = any paraphrase that
+# flips the predicted logic flags the item; relax if paraphrase noise is high.
+METAMORPHIC_STABILITY_THRESHOLD = 1.0
+# Paraphrases are sampled at nonzero temperature so the k variants differ;
+# answering and matching stay at temperature 0 like the production path.
+METAMORPHIC_PARAPHRASE_TEMPERATURE = 0.9
+
+# Lab-name swap: which lab replaces which in the swap variant, and the alias
+# spellings to rewrite. The swap is a deterministic regex substitution — no
+# LLM — so the swap itself cannot drift the text's meaning.
+LAB_SWAP = {
+    "OpenAI": "DeepMind",
+    "DeepMind": "Anthropic",
+    "Anthropic": "OpenAI",
+}
+LAB_ALIASES = {
+    "OpenAI": ["OpenAI", "Open AI"],
+    "DeepMind": ["Google DeepMind", "DeepMind", "Deep Mind"],
+    "Anthropic": ["Anthropic"],
+}
+
+# ---------------------------------------------------------------------------
 # Study design
 # ---------------------------------------------------------------------------
 ORGS = ["OpenAI", "DeepMind", "Anthropic"]

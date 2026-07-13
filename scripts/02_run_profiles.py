@@ -5,6 +5,8 @@ Usage:
     python scripts/02_run_profiles.py --orgs OpenAI --sources published   # subset
     python scripts/02_run_profiles.py --fresh                             # new snapshot
     python scripts/02_run_profiles.py --fresh --label "questionnaire v2"  # named run
+    python scripts/02_run_profiles.py --grounding                         # + retrieval buckets
+    python scripts/02_run_profiles.py --quotes                            # + supporting quotes
 
 Each --fresh run is archived as its own snapshot under data/profiles/runs/ (the
 previous run is preserved), so runs can be compared in the app.
@@ -30,6 +32,13 @@ if __name__ == "__main__":
                     help="start a new run snapshot (previous runs are kept)")
     ap.add_argument("--label", default=None,
                     help="optional label for this run (e.g. the questionnaire version)")
+    ap.add_argument("--grounding", action="store_true",
+                    help="add a no-LLM retrieval-grounding score and bucket to each "
+                         "row, and a bucket breakdown to the report")
+    ap.add_argument("--quotes", action="store_true",
+                    help="require the answer model to return verbatim supporting "
+                         "quotes (verified in code, persisted per row)")
     args = ap.parse_args()
     run_profiles(orgs=args.orgs, source_types=args.sources, k=args.k,
-                 fresh=args.fresh, label=args.label)
+                 fresh=args.fresh, label=args.label,
+                 grounding=args.grounding, quotes=args.quotes)
