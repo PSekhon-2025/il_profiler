@@ -90,10 +90,12 @@ def _require_password() -> None:
         return  # no gate configured (local use)
     if st.session_state.get("authed"):
         return
+    import hmac
     st.title("🏛️ IL Profiler")
     with st.form("login"):
         pw = st.text_input("Password", type="password")
-        if st.form_submit_button("Enter") and pw == expected:
+        # compare_digest: constant-time comparison (no timing side-channel).
+        if st.form_submit_button("Enter") and hmac.compare_digest(pw, expected):
             st.session_state["authed"] = True
             st.rerun()
     if st.session_state.get("_login_tried") and not st.session_state.get("authed"):

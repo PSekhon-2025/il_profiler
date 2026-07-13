@@ -109,15 +109,26 @@ def run_embedding_agreement(run_id: str | None = None) -> dict:
     if not rows:
         raise SystemExit(f"run {run_id} has no committed rows to check")
 
-    # Embed the 63 references once, then every committed answer.
-    ref_texts, ref_keys = [], []  # ref_keys[i] = (category, logic)
+    # Resolve the reference set per (category, variant), applying any
+    # reference_overrides — the same resolution the matcher uses, so both
+    # judges grade against identical references. Snapshot caveat: JSON turns
+    # the override keys {2: ...} into {"2": ...}, so look up both forms.
+    ref_text_for: dict[tuple, dict[str, str]] = {}
     for category, block in questionnaire.items():
-        for logic in logics:
-            ref_texts.append(block["reference_answers"][logic])
-            ref_keys.append((category, logic))
-    print(f"embedding {len(ref_texts)} references + {len(rows)} answers "
-          f"for run {run_id}")
-    ref_vecs = dict(zip(ref_keys, _embed_batched([_truncate(t) for t in ref_texts])))
+        base = block["reference_answers"]
+        overrides = block.get("reference_overrides", {})
+        for variant in (1, 2, 3):
+            refs = dict(base)
+            refs.update(overrides.get(variant) or overrides.get(str(variant)) or {})
+            ref_text_for[(category, variant)] = refs
+
+    # Embed each distinct reference text once, then every committed answer.
+    unique_refs = sorted({t for refs in ref_text_for.values()
+                          for t in refs.values()})
+    print(f"embedding {len(unique_refs)} distinct references + {len(rows)} "
+          f"answers for run {run_id}")
+    ref_vec_by_text = dict(zip(
+        unique_refs, _embed_batched([_truncate(t) for t in unique_refs])))
     ans_vecs = _embed_batched([_truncate(r["answer"]) for r in rows])
 
     out_dir = runs.run_dir(run_id) / OUT_DIR_NAME
@@ -126,7 +137,11 @@ def run_embedding_agreement(run_id: str | None = None) -> dict:
     per_row = []
     for row, avec in zip(rows, ans_vecs):
         cat = row["category"]
-        sims = {logic: round(_cosine(avec, ref_vecs[(cat, logic)]), 4)
+        # Old rows always carry a 1-3 variant; fall back to the base set (v1)
+        # if a hand-edited row lacks one.
+        refs = ref_text_for.get((cat, row.get("variant") or 1),
+                                ref_text_for[(cat, 1)])
+        sims = {logic: round(_cosine(avec, ref_vec_by_text[refs[logic]]), 4)
                 for logic in logics}
         ranked = sorted(sims.items(), key=lambda kv: kv[1], reverse=True)
         nearest, top_sim = ranked[0]
