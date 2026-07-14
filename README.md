@@ -7,6 +7,10 @@ and per source type. Built for the *structural transparency* argument: AI
 alignment should be evaluated through a company-wide institutional lens, not a
 purely technical one.
 
+> **Full documentation:** see [`ARCHITECTURE.md`](ARCHITECTURE.md) for how the
+> whole system works — theory, pipeline, scoring, validation checks, confidence
+> intervals, determinism, and the file map.
+
 ## Design A in one paragraph
 
 Each lab is probed with a **fixed 27-question questionnaire** (9 elemental
