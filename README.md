@@ -72,7 +72,7 @@ macOS: double-click **`Launch IL Profiler.command`** in Finder (or run
 Windows: double-click **`Launch IL Profiler.bat`** in Explorer (or run
 `.venv\Scripts\streamlit run app.py`).
 
-The app opens in your browser with four tabs:
+The app opens in your browser with five tabs:
 
 - **Run** — paste/save your API key, build the vector index, and run the
   questionnaire for any subset of labs/sources, with live logs. Stages run as
@@ -84,14 +84,16 @@ The app opens in your browser with four tabs:
 - **Audit** — pick a run, then filter and read every question's RAG answer,
   graded weights, and matcher reasoning (plus supporting quotes and grounding
   bucket when those checks were enabled).
-- **Hallucination** — the three opt-in checks for any saved run: alert banners
+- **Hallucination** — the four opt-in checks for any saved run: alert banners
   when a detection fires, retrieval-grounding buckets with a score histogram,
-  unverified-quote listings, and the metamorphic label-stability eval — which
-  can be launched from this tab against any existing run, with flagged items
-  shown variant-by-variant.
+  unverified-quote listings, the metamorphic label-stability eval (launchable
+  from this tab, flagged items shown variant-by-variant), and the
+  embedding-agreement check (binary + graded closeness metrics, launchable
+  from this tab).
 - **Compare runs** — diff two snapshots: per-logic profile deltas (B − A),
-  a question-wording diff, and a per-question answer/weight diff. This is how you
-  see what a rewritten questionnaire changed.
+  a question-wording and reference-answer diff (including per-question
+  overrides), and a per-question answer/weight diff. This is how you see what
+  a rewritten questionnaire changed.
 
 ## Run — CLI
 
@@ -190,6 +192,39 @@ bucket). The console report prints stability alongside the run's profiles.
 > flips aren't artifacts of a drifted paraphrase — before reading the
 > aggregate numbers as evidence.
 
+### 4. Embedding agreement — `scripts/04_run_embedding_agreement.py`
+
+```bash
+.venv/bin/python scripts/04_run_embedding_agreement.py          # CURRENT run
+.venv/bin/python scripts/04_run_embedding_agreement.py --run 2026-07-01_120000
+```
+
+A **non-LLM second judge** over any saved run: embeds every committed answer
+and the run's own seven reference answers per question (respecting per-question
+overrides), ranks the references by cosine similarity, and reports both a
+**binary** agreement (nearest reference's logic == the matcher's top logic) and
+**graded** metrics — min-shifted closeness *shares* per logic compared against
+the matcher's weight distribution (mean share on the matcher's pick, chance
+1/7; distribution overlap vs a uniform-judge baseline). Deterministic; costs a
+few hundred embedding calls. Outputs land in the run's `embedding_agreement/`.
+Interpretation caveat: e5 compresses cosines into a narrow band, so only
+rankings/shares/margins are meaningful — and whole-answer embeddings track
+*topic* more than institutional stance, so treat this as triangulation, not
+ground truth.
+
+### Bootstrap confidence intervals — `scripts/05_run_bootstrap_ci.py`
+
+```bash
+.venv/bin/python scripts/05_run_bootstrap_ci.py                 # CURRENT run
+```
+
+Each profile % is a mean over the answered questions, so its error bar comes
+from **resampling those questions with replacement** (default 2000×, 95% CI,
+seeded — fully deterministic, zero API calls). Chosen over "re-run N times"
+because the temperature-0 pipeline makes repeats near-identical, which would
+understate the real uncertainty. Results land in the run's `bootstrap_ci/`
+(`ci.json`, `ci.csv`) and appear as error-bar whiskers on the Results tab.
+
 ### Tests
 
 ```bash
@@ -223,7 +258,8 @@ profile as a ranked bar list.
 ```
 il_rag/
   config.py           paths, models, hyperparameters, study design
-  questionnaire.py    27 questions + 63 reference answers (PLACEHOLDER data)
+  questionnaire.py    27 questions + per-question 7-logic reference answers
+                      (the researcher's finalized set, from New Question Set.docx)
   llm.py              Together chat/embeddings with transient-error retry
   json_utils.py       shared JSON extraction from LLM replies
   ingest.py           parse corpora -> chunk -> embed -> Chroma
@@ -232,14 +268,18 @@ il_rag/
   graded_matcher.py   answer -> weight distribution over the 7 logics
   grounding.py        opt-in: no-LLM retrieval-grounding score + buckets
   metamorphic.py      opt-in: paraphrase / lab-swap label-stability eval
+  embedding_agreement.py  opt-in: non-LLM second judge (binary + graded)
+  bootstrap_ci.py     confidence intervals over the profiles (seeded, no API)
   profile_harness.py  orchestration, aggregation, outputs, report
   runs.py             run snapshots: archive/list/compare, legacy migration
 scripts/
   01_ingest.py                stage 1: build the index
   02_run_profiles.py          stage 2: produce the profiles
   03_run_metamorphic_eval.py  stage 3 (optional): label-stability eval
+  04_run_embedding_agreement.py  stage 4 (optional): embedding second judge
+  05_run_bootstrap_ci.py      stage 5 (optional): bootstrap error bars
 tests/                offline unit tests (pytest; all API calls stubbed)
-app.py                Streamlit GUI (Run / Results / Audit / Compare runs)
+app.py                Streamlit GUI (Run / Results / Audit / Hallucination / Compare)
 Launch IL Profiler.command   double-clickable launcher (macOS)
 Launch IL Profiler.bat       double-clickable launcher (Windows)
 ```

@@ -15,7 +15,7 @@ Areas:
                   check, downloads.
   Audit         — browse every question's RAG answer, graded weights, matcher
                   reasoning, and (when enabled) quotes + grounding bucket.
-  Hallucination — the three opt-in checks for any saved run: retrieval-
+  Hallucination — the four opt-in checks for any saved run: retrieval-
                   grounding buckets, quote verification, and the metamorphic
                   label-stability eval (launchable from here), with alert
                   banners when a detection fires.
@@ -705,7 +705,7 @@ with tab_audit:
                 st.caption("retrieved: " + ", ".join(row["retrieved_ids"][:5]))
 
 # ---------------------------------------------------------------------------
-# Hallucination tab — the three opt-in checks, with alerts when one fires
+# Hallucination tab — the four opt-in checks, with alerts when one fires
 # ---------------------------------------------------------------------------
 with tab_halluc:
     st.header("Hallucination & grounding checks")
@@ -1278,16 +1278,43 @@ with tab_compare:
                                     st.markdown("**B (new):** " + (tb or "_(none)_"))
                                     st.markdown("**Diff:** " + word_diff_md(ta, tb))
                         if show_refs:
-                            a_ref = a_block.get("reference_answers", {})
-                            b_ref = b_block.get("reference_answers", {})
-                            for logic in LOGICS:
-                                ra_, rb_ = a_ref.get(logic, ""), b_ref.get(logic, "")
-                                if ra_.strip() != rb_.strip():
-                                    changed += 1
-                                    with st.expander(f"📐 {cat} · reference[{logic}]"):
-                                        st.markdown("**A:** " + (ra_ or "_(none)_"))
-                                        st.markdown("**B:** " + (rb_ or "_(none)_"))
-                                        st.markdown("**Diff:** " + word_diff_md(ra_, rb_))
+                            # Diff the RESOLVED reference per (question, logic):
+                            # base + per-variant override, exactly as the matcher
+                            # sees it. Diffing only the base block would miss
+                            # reference_overrides, which now carry most of the
+                            # per-question reference content. Identical changes
+                            # across variants are grouped so a base-only edit
+                            # shows once, not three times.
+                            def _resolved(block: dict) -> dict:
+                                base = block.get("reference_answers", {})
+                                ov = block.get("reference_overrides", {})
+                                out = {}
+                                for v in (1, 2, 3):
+                                    # JSON snapshots stringify override keys.
+                                    o = ov.get(v) or ov.get(str(v)) or {}
+                                    for logic in LOGICS:
+                                        out[(v, logic)] = o.get(
+                                            logic, base.get(logic, ""))
+                                return out
+
+                            a_res, b_res = _resolved(a_block), _resolved(b_block)
+                            grouped: dict[tuple, list[int]] = {}
+                            for v in (1, 2, 3):
+                                for logic in LOGICS:
+                                    ra_, rb_ = a_res[(v, logic)], b_res[(v, logic)]
+                                    if ra_.strip() != rb_.strip():
+                                        grouped.setdefault(
+                                            (logic, ra_, rb_), []).append(v)
+                            for (logic, ra_, rb_), vs in grouped.items():
+                                changed += 1
+                                qtag = ("Q1–3" if len(vs) == 3
+                                        else "Q" + "/".join(str(v) for v in vs))
+                                with st.expander(
+                                        f"📐 {cat} {qtag} · reference[{logic}]"):
+                                    st.markdown("**A:** " + (ra_ or "_(none)_"))
+                                    st.markdown("**B:** " + (rb_ or "_(none)_"))
+                                    st.markdown("**Diff:** "
+                                                + word_diff_md(ra_, rb_))
                     if changed == 0:
                         st.success("No wording changes — both runs used identical "
                                    "questionnaires.")
