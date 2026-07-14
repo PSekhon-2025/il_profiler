@@ -81,3 +81,24 @@ def test_overrides_resolved_per_variant(tmp_path, monkeypatch):
                 .read_text().splitlines()]
     assert sim_rows[0]["embedding_nearest"] == "State"
     assert sim_rows[0]["agree"] is True
+
+
+def test_soft_weights_shares():
+    sims = {"A": 0.86, "B": 0.84, "C": 0.80}
+    w = ea.soft_weights(sims)
+    assert w["C"] == 0.0                       # farthest pinned to zero
+    assert w["A"] == pytest.approx(0.06 / 0.10)
+    assert sum(w.values()) == pytest.approx(1.0)
+    # scale/shift invariance: adding a constant changes nothing
+    w2 = ea.soft_weights({k: v + 0.1 for k, v in sims.items()})
+    assert w2 == pytest.approx(w)
+    # degenerate: no spread -> uniform
+    flat = ea.soft_weights({"A": 0.8, "B": 0.8})
+    assert flat == {"A": 0.5, "B": 0.5}
+
+
+def test_distribution_overlap_bounds():
+    a = {"A": 0.6, "B": 0.4}
+    assert ea.distribution_overlap(a, a) == pytest.approx(1.0)
+    assert ea.distribution_overlap(a, {"C": 1.0}) == 0.0
+    assert ea.distribution_overlap(a, {"A": 0.4, "B": 0.6}) == pytest.approx(0.8)

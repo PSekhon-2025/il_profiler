@@ -1072,6 +1072,26 @@ with tab_halluc:
                            "margins mean the embedding judge itself was "
                            "uncertain")
 
+            # Graded (ratio-of-closeness) metrics, present on newer summaries.
+            if "mean_share_on_matcher_top" in emb:
+                g1, g2 = st.columns(2)
+                g1.metric(
+                    "Closeness share on matcher's pick",
+                    f"{emb['mean_share_on_matcher_top']:.3f}",
+                    delta=f"chance {emb.get('share_chance_baseline', 1/7):.3f}",
+                    delta_color="off",
+                    help="mean share of embedding closeness the matcher's top "
+                         "logic receives (min-shifted shares); above 0.143 = "
+                         "above chance")
+                g2.metric(
+                    "Distribution overlap",
+                    f"{emb['mean_overlap']:.3f}",
+                    delta=f"uniform judge {emb.get('mean_overlap_uniform_baseline', 0):.3f}",
+                    delta_color="off",
+                    help="overlap between embedding closeness shares and the "
+                         "matcher's weights (1 = identical); compare against "
+                         "what a totally uninformative judge would score")
+
             cat_rows = [{"category": c, "rate": v["rate"], "n": v["n"]}
                         for c, v in emb.get("by_category", {}).items()
                         if v.get("rate") is not None]

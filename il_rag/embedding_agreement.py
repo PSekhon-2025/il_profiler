@@ -80,6 +80,33 @@ def _matcher_top(weights: dict) -> tuple[str, float]:
     return logic, float(w)
 
 
+def soft_weights(sims: dict[str, float]) -> dict[str, float]:
+    """Turn the 7 raw cosines into proportional 'closeness shares'.
+
+    Min-shifted normalization: subtract the farthest reference's similarity,
+    then normalize to sum 1. Chosen over softmax because it is parameter-free
+    and scale-invariant — e5 compresses all cosines into a narrow high band
+    (~0.78-0.87), so what carries information is the relative spread WITHIN a
+    row, not the absolute values. The farthest logic gets exactly 0 by
+    construction; a row with no spread at all degrades to uniform 1/7.
+    """
+    m = min(sims.values())
+    shifted = {logic: s - m for logic, s in sims.items()}
+    total = sum(shifted.values())
+    if total <= 0.0:
+        return {logic: 1.0 / len(sims) for logic in sims}
+    return {logic: v / total for logic, v in shifted.items()}
+
+
+def distribution_overlap(a: dict[str, float], b: dict[str, float]) -> float:
+    """Overlap coefficient of two weight distributions: sum of per-logic mins.
+
+    1.0 = identical distributions; 0.0 = disjoint support. Continuous
+    counterpart of the binary argmax agreement.
+    """
+    return sum(min(a.get(k, 0.0), b.get(k, 0.0)) for k in set(a) | set(b))
+
+
 def _load_rows(run_id: str) -> list[dict]:
     path = runs.run_paths(run_id)["per_question"]
     rows = []
@@ -147,14 +174,28 @@ def run_embedding_agreement(run_id: str | None = None) -> dict:
         nearest, top_sim = ranked[0]
         margin = round(top_sim - ranked[1][1], 4)
         m_logic, m_weight = _matcher_top(row["weights"])
+        # Graded comparison: closeness SHARES vs the matcher's weight
+        # distribution, alongside the binary argmax agreement.
+        shares = soft_weights(sims)
+        matcher_w = {logic: float(row["weights"].get(logic, 0.0))
+                     for logic in logics}
         per_row.append({
             "org": row["org"], "source_type": row["source_type"],
             "qid": row["qid"], "category": cat,
             "similarities": sims,
+            "embedding_shares": {logic: round(v, 4) for logic, v in shares.items()},
             "embedding_nearest": nearest,
             "matcher_top": m_logic, "matcher_top_weight": round(m_weight, 4),
             "agree": nearest == m_logic,
             "margin": margin,
+            # share of embedding closeness on the matcher's pick (chance = 1/7)
+            "share_on_matcher_top": round(shares[m_logic], 4),
+            # overlap of the two distributions (1 = identical)
+            "overlap": round(distribution_overlap(shares, matcher_w), 4),
+            # what overlap a totally uninformative (uniform) embedding judge
+            # would score against THIS matcher distribution — the row's baseline
+            "overlap_uniform_baseline": round(distribution_overlap(
+                {logic: 1.0 / len(logics) for logic in logics}, matcher_w), 4),
         })
 
     with open(out_dir / "similarities.jsonl", "w", encoding="utf-8") as f:
@@ -175,23 +216,39 @@ def run_embedding_agreement(run_id: str | None = None) -> dict:
         org, st = key.split("|")
         by_pair[key] = _rate([r for r in per_row
                               if r["org"] == org and r["source_type"] == st])
+    n = len(per_row)
     summary = {
         "run_id": run_id,
         "overall": _rate(per_row),
         "by_category": by_category,
         "by_org_source": by_pair,
-        "mean_margin": round(sum(r["margin"] for r in per_row) / len(per_row), 4),
+        "mean_margin": round(sum(r["margin"] for r in per_row) / n, 4),
+        # Graded (ratio-of-closeness) metrics — continuous counterparts of the
+        # binary agreement above.
+        "mean_share_on_matcher_top": round(
+            sum(r["share_on_matcher_top"] for r in per_row) / n, 4),
+        "share_chance_baseline": round(1.0 / len(logics), 4),
+        "mean_overlap": round(sum(r["overlap"] for r in per_row) / n, 4),
+        "mean_overlap_uniform_baseline": round(
+            sum(r["overlap_uniform_baseline"] for r in per_row) / n, 4),
         "note": ("Agreement = embedding-nearest reference logic equals the LLM "
-                 "matcher's top-weighted logic. Absolute cosine values are not "
-                 "interpretable with e5; only rankings and margins are."),
+                 "matcher's top-weighted logic. Graded metrics compare the "
+                 "min-shifted closeness shares against the matcher's weight "
+                 "distribution. Absolute cosine values are not interpretable "
+                 "with e5; only rankings, margins, and shares are."),
     }
     (out_dir / "summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
 
     o = summary["overall"]
     print(f"\n=== Embedding agreement (run {run_id}) ===")
-    print(f"overall: {o['agree']}/{o['n']}  ({o['rate']:.1%})")
-    print("by category:")
+    print(f"overall (binary argmax): {o['agree']}/{o['n']}  ({o['rate']:.1%})")
+    print(f"mean closeness share on matcher's pick: "
+          f"{summary['mean_share_on_matcher_top']:.3f} "
+          f"(chance {summary['share_chance_baseline']:.3f})")
+    print(f"mean distribution overlap: {summary['mean_overlap']:.3f} "
+          f"(uniform baseline {summary['mean_overlap_uniform_baseline']:.3f})")
+    print("by category (binary):")
     for cat, s in by_category.items():
         print(f"  {cat:<24} {s['agree']:>3}/{s['n']:<3} ({s['rate']:.0%})")
     print(f"mean top1-top2 margin: {summary['mean_margin']}")
