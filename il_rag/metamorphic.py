@@ -28,6 +28,10 @@ classifies them, so a "meaning-preserving" paraphrase is only as trustworthy
 as the model's own judgment. Stability numbers should be anchored by human
 review of a small sample of variants (see README).
 
+The method is metamorphic testing (Chen, Cheung & Yiu, 1998) applied as a
+CheckList-style invariance test (Ribeiro et al., 2020). Full literature
+basis and references: ARCHITECTURE.md §9.3.
+
 Everything is black-box: chat + the existing retriever, no logits or weights.
 Outputs live under the source run's folder (data/profiles/runs/<run_id>/
 metamorphic/) and the variant loop is resumable in the same append-and-skip
@@ -126,6 +130,8 @@ def paraphrase_texts(texts: list[str]) -> list[str] | None:
 def predicted_label(abstain: bool, weights: dict) -> str:
     """Collapse a matcher verdict to one label: "abstain" or the argmax logic.
 
+        label(v) = "abstain" if the matcher abstained, else argmax_k w_k
+
     Ties break by LOGICS order, so the label is deterministic for a given
     weight vector.
     """
@@ -142,6 +148,12 @@ def compute_stability(src_rows: list[dict], variant_rows: list[dict],
                       threshold: float = METAMORPHIC_STABILITY_THRESHOLD,
                       ) -> tuple[list[dict], dict]:
     """Fold variant rows into per-item stability records and an aggregate.
+
+        label_stability    = |{v in P_ok : label(v) = label0}| / |P_ok|
+                             (P_ok = error-free paraphrase variants; None if empty)
+        unstable           = label_stability < threshold
+        swap_label_changed = label(swap) != label0   (error-free swap only)
+        swap_flip_rate     = n_swap_label_changed / n_swap_evaluated
 
     Failed variants (rows carrying "error") are excluded from denominators:
     stability measures label behavior on variants that actually ran, and the

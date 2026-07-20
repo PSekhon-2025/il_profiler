@@ -252,6 +252,32 @@ compared with the original run's:
   grounded label should survive it too; a **flip** suggests the label was
   keyed on the model's prior about the named lab rather than on the text.
 
+**How the score is computed** (full derivation in ARCHITECTURE.md §9.3; the
+GUI's Hallucination tab has the same math in an expander):
+
+```
+label(v)        = "abstain" if the matcher abstained, else argmax_k w_k
+                  (ties break by the fixed LOGICS order; abstain is a label)
+label_stability = |{ v ∈ P_ok : label(v) = label₀ }| / |P_ok|
+                  P_ok = paraphrase variants that ran without error
+unstable        = label_stability < θ
+swap flip       = label(swap) ≠ label₀
+swap_flip_rate  = n_swap_label_changed / n_swap_evaluated
+```
+
+Failed variants (paraphrase parse failure, missing chunks) are excluded from
+denominators — never counted as flips. Config: `k` =
+`METAMORPHIC_PARAPHRASES` (3), `θ` = `METAMORPHIC_STABILITY_THRESHOLD`
+(1.0 — any single flip flags the item; relax if paraphrase noise is high),
+paraphrase temperature = `METAMORPHIC_PARAPHRASE_TEMPERATURE` (0.9, so the
+k variants differ; answering and matching stay at temperature 0).
+
+*Worked example* (the case pinned by
+`tests/test_metamorphic.py::test_compute_stability_paraphrases_and_swap`):
+an item labeled `State` gets 3 paraphrases; 2 keep the label, 1 flips →
+`label_stability = 2/3 ≈ 0.67 < θ = 1.0` → **unstable**. Its lab-swap
+variant comes back `Market` ≠ `State` → **swap flip**.
+
 Outputs land inside the evaluated run's snapshot
 (`data/profiles/runs/<run_id>/metamorphic/`): `variants.jsonl` (resumable
 audit trail) and `stability.json` (per-item records + aggregate summary,
@@ -265,6 +291,16 @@ bucket). The console report prints stability alongside the run's profiles.
 > that paraphrases genuinely preserve the decision content, and that flagged
 > flips aren't artifacts of a drifted paraphrase — before reading the
 > aggregate numbers as evidence.
+
+Literature basis: metamorphic testing for the no-oracle setting
+([Chen et al., 1998](https://arxiv.org/abs/2002.12543); survey:
+[Segura et al., 2016](https://doi.org/10.1109/TSE.2016.2532875));
+invariance tests under label-preserving perturbations incl. name swaps
+([Ribeiro et al., 2020](https://aclanthology.org/2020.acl-main.442/));
+consistency under paraphrase
+([Elazar et al., 2021](https://aclanthology.org/2021.tacl-1.60/)); MetaQA
+([Yang et al., FSE 2025](https://conf.researchr.org/details/fse-2025/fse-2025-research-papers/48/Hallucination-Detection-in-Large-Language-Models-with-Metamorphic-Relations)).
+Full reference list in ARCHITECTURE.md §9.3.
 
 ### 4. Embedding agreement — `scripts/04_run_embedding_agreement.py`
 

@@ -479,13 +479,155 @@ after normalization or it doesn't.
 `{"excerpt": int, "quote": str, "verified": bool}`) and `quotes_verified`
 (their guarded conjunction).
 
-The remaining checks:
+### 9.3 Metamorphic label stability (`il_rag/metamorphic.py`, `scripts/03_run_metamorphic_eval.py`)
 
-3. **Metamorphic label stability** (`il_rag/metamorphic.py`). For each answered
-   item it makes *k* meaning-preserving paraphrases of the evidence (LLM) and one
-   **lab-name swap** (deterministic regex), re-runs the production answer→match
-   path, and checks whether the label survives. A paraphrase flip = unstable; a
-   swap flip suggests the label was keyed on the lab's *name*, not the text.
+There are no gold labels in this pipeline, so correctness cannot be checked
+directly. Instead this check tests an **invariance relation** — the
+metamorphic-testing move for the no-oracle setting: a label that is grounded
+in the text should survive a meaning-preserving rewrite of that text. The
+notation below (`label(v)`, `label₀`, `P_ok`, `θ`) is the same one used in
+the GUI's "How stability is computed" expander and in `metamorphic.py`'s
+docstrings.
+
+**The label.** Each item's label is the matcher's abstention, or else the
+top-weight logic; ties break deterministically by the fixed `LOGICS` order.
+Abstain is a first-class label — a paraphrase that abstains matches iff the
+original also abstained:
+
+```
+label(v) = "abstain"        if the matcher abstained
+           argmax_k w_k     otherwise   (ties → LOGICS order)
+```
+
+**The variants.** For each item of an existing run, the exact retrieved
+chunks are refetched by stored id and perturbed into:
+
+- `k = METAMORPHIC_PARAPHRASES` (3) **paraphrases** — one LLM call per
+  variant, under a strict preservation rule ("every fact, name, number,
+  date, and claim is preserved exactly while the wording and sentence
+  structure change substantially"), sampled at
+  `METAMORPHIC_PARAPHRASE_TEMPERATURE` (0.9) so the k variants differ;
+- one **lab-name swap** — a deterministic regex, no LLM:
+
+```
+swap(text) = re.sub(r"\b(alias₁|alias₂|…)\b", LAB_SWAP[org], text, IGNORECASE)
+```
+
+  Aliases are matched longest-first (so "Google DeepMind" is consumed whole),
+  word-boundaried ("OpenAIish" untouched), and the substitution is applied to
+  the chunks *and* the question. The swap map cycles
+  OpenAI → DeepMind → Anthropic → OpenAI (`LAB_SWAP` in `config.py`).
+
+**Re-running the production path.** Every variant flows through the same
+`answer_question` → `match_graded` pipeline as the original run, at
+temperature 0, on the same (perturbed) chunks — so a changed label is
+attributable to the text perturbation alone.
+
+**Stability score.** With `P_ok` the paraphrase variants that ran without
+error and `label₀` the original run's label:
+
+```
+label_stability = |{ v ∈ P_ok : label(v) = label₀ }| / |P_ok|    (None if P_ok empty)
+unstable        = label_stability < θ          θ = METAMORPHIC_STABILITY_THRESHOLD (1.0)
+swap_label_changed = label(swap) ≠ label₀      (on the error-free swap variant)
+```
+
+**Summary statistics** over the evaluated items:
+
+```
+mean_label_stability = mean of per-item stabilities (scored items only)
+pct_fully_stable     = share of scored items with label_stability ≥ 1.0
+swap_flip_rate       = n_swap_label_changed / n_swap_evaluated
+by_category          = mean stability per question category
+by_grounding_bucket  = mean stability per Feature-1 bucket (only when the
+                       source run carried grounding scores — the checks
+                       cross-validate each other)
+```
+
+**Edge cases.** A paraphrase whose JSON does not parse (or returns the wrong
+number of strings) is retried once at a larger token budget, then recorded
+as `error: "paraphrase_failed"`; rows whose chunks cannot be refetched are
+`"chunks_not_found"`; a lab without a swap target would be
+`"no_swap_target"`. **Failed variants are excluded from denominators, never
+counted as flips** — a parse failure is evidence of nothing about
+stability. Item sampling is deterministic per seed
+(`random.Random(seed).sample`), and the eval is resumable: completed
+error-free variants are kept, error rows are retried.
+
+**Design rationale.** Paraphrases are sampled at nonzero temperature so the
+k variants actually differ, while answering and matching stay at temperature
+0 like the production path — the *system under test* is unchanged, only the
+input moves. The swap is a regex precisely so that it cannot drift meaning:
+any label change under it isolates the effect of the lab's *name*. And
+`θ = 1.0` is the strictest default — any single paraphrase flip flags the
+item; the config comment says to relax it if paraphrase noise is high.
+
+**Interpretation.** A paraphrase flip and a swap flip mean different
+things: a paraphrase flip says the label is not robust to meaning-preserving
+rewording; a swap flip says the label changed when only the lab's *name*
+changed — evidence the model keys on its prior about the lab rather than on
+the text.
+
+**Limitations.** The check is *self-referential*: the same model generates
+the paraphrases and classifies them (see §16), so "meaning-preserving" is
+only as good as the model's own judgment — paraphrase fidelity is attested
+by the prompt, not verified, and flagged flips should be human-audited
+against `variants.jsonl` before the aggregates are read as evidence. At
+`k = 3`, per-item stability is coarse-grained (steps of 1/3).
+
+**Basis in the literature.**
+
+- *Testing output relations under input transformations when no oracle
+  exists* is **metamorphic testing** (Chen, Cheung & Yiu, 1998; surveyed by
+  Segura et al., 2016). This pipeline has no gold labels — exactly the
+  no-oracle setting the technique was built for.
+- *Label-preserving perturbations, including name substitutions,* follow the
+  **invariance tests** of CheckList (Ribeiro et al., 2020): replacing
+  surface forms that should not matter must not change the prediction.
+- *Prediction consistency under paraphrase* as a model-quality probe follows
+  Elazar et al. (2021).
+- *Metamorphic relations for LLM hallucination detection* follow **MetaQA**
+  (Yang et al., FSE 2025), which detects hallucinations via
+  paraphrase-based metamorphic relations without external resources.
+
+**References**
+
+- Chen, T. Y., Cheung, S. C., & Yiu, S. M. (1998). Metamorphic Testing: A
+  New Approach for Generating Next Test Cases. *Technical Report
+  HKUST-CS98-01*, Hong Kong University of Science and Technology.
+  <https://arxiv.org/abs/2002.12543>
+- Elazar, Y., Kassner, N., Ravfogel, S., Ravichander, A., Hovy, E.,
+  Schütze, H., & Goldberg, Y. (2021). Measuring and Improving Consistency
+  in Pretrained Language Models. *Transactions of the Association for
+  Computational Linguistics*, 9, 1012–1031.
+  <https://aclanthology.org/2021.tacl-1.60/>
+- Ribeiro, M. T., Wu, T., Guestrin, C., & Singh, S. (2020). Beyond
+  Accuracy: Behavioral Testing of NLP Models with CheckList. *ACL 2020*.
+  <https://aclanthology.org/2020.acl-main.442/>
+- Segura, S., Fraser, G., Sanchez, A. B., & Ruiz-Cortés, A. (2016). A
+  Survey on Metamorphic Testing. *IEEE Transactions on Software
+  Engineering*, 42(9), 805–824. <https://doi.org/10.1109/TSE.2016.2532875>
+- Yang, B., et al. (2025). Hallucination Detection in Large Language Models
+  with Metamorphic Relations (MetaQA). *FSE 2025*.
+  <https://conf.researchr.org/details/fse-2025/fse-2025-research-papers/48/Hallucination-Detection-in-Large-Language-Models-with-Metamorphic-Relations>
+
+**Output files**, inside the evaluated run's snapshot
+(`<run_dir>/metamorphic/`):
+
+- `variants.jsonl` — one row per variant (resumable audit trail):
+  `org, source_type, qid, category, variant, variant_kind
+  ("paraphrase" | "lab_swap"), variant_idx, original_label`, plus on success
+  `question, answer, abstain, weights, reasoning, label,
+  label_matches_original` (and `swap_to` for swaps), or on failure an
+  `error` field (`"paraphrase_failed" | "no_swap_target" |
+  "chunks_not_found"`).
+- `stability.json` — `{"summary": {...}, "per_item": [...]}`; each per-item
+  record carries `org, source_type, qid, category, original_label,
+  n_paraphrases, n_paraphrases_ok, label_stability, unstable, swap_to,
+  swap_label, swap_label_changed` (+ `grounding_bucket` when present).
+
+The remaining check:
+
 4. **Embedding agreement** (`il_rag/embedding_agreement.py`). A **non-LLM second
    judge**: embed each committed answer and the run's 7 reference answers for its
    category, rank the references by cosine similarity, and check whether the
