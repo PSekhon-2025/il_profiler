@@ -17,8 +17,9 @@ Two opt-in extensions (defaults preserve the original behavior exactly):
   - `require_quotes=True` asks the model to also return the verbatim excerpt
     spans its conclusion rests on. Each quote is verified IN CODE (substring
     check after whitespace normalization) — the model attests, the code
-    audits. The taxonomy separation above is untouched: quotes support the
-    ANSWER, never a logic choice.
+    audits, following GopherCite (Menick et al., 2022). The taxonomy
+    separation above is untouched: quotes support the ANSWER, never a logic
+    choice. Full literature basis and references: ARCHITECTURE.md §9.2.
 """
 import re
 from dataclasses import dataclass
@@ -74,12 +75,16 @@ def _norm_ws(s: str) -> str:
 def _verify_quotes(quotes, chunks: list[Chunk]) -> tuple[list[dict], bool]:
     """Check each claimed quote against the excerpts it could have come from.
 
+        verified(q)     = norm(q) ≠ "" ∧ ∃ c ∈ chunks : norm(q) ⊑ norm(c)
+        quotes_verified = |Q| > 0 ∧ ∀ q ∈ Q : verified(q)
+
     Matching is whitespace-normalized and case-insensitive but otherwise
     verbatim. A quote citing the wrong excerpt number still verifies if the
     span exists in ANY excerpt — the auditable claim is "this text is in the
     sources", not the model's bookkeeping of indices. Returns the normalized
     quote records (each with its own verified flag) and their conjunction;
-    an empty or unusable quote list is unverified by definition.
+    an empty or unusable quote list is unverified by definition (the |Q| > 0
+    guard blocks the vacuous truth of an empty conjunction).
     """
     norm_chunks = [_norm_ws(c.text) for c in chunks]
     out = []

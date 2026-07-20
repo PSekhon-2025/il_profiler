@@ -929,6 +929,96 @@ with tab_halluc:
 
         # ---------------- 2 · Quote verification ----------------
         st.subheader("2 · Quote verification")
+        with st.expander("ℹ️ How quotes are verified", expanded=False):
+            st.markdown(
+                "The model **attests**, the code **audits**: nothing the model "
+                "says about its own quotes is trusted — every claimed span is "
+                "re-checked in pure code (`il_rag/rag_qa.py`), adding zero API "
+                "calls beyond the answer call itself. The same notation is "
+                "used in ARCHITECTURE.md §9.2 and the README."
+            )
+            st.markdown(
+                "**Step 1 — the contract.** Alongside its answer, the model "
+                "must return 1–3 spans *\"copied character-for-character from "
+                "the numbered excerpt it cites; never paraphrase inside a "
+                "quote\"* (verbatim prompt rule). If the excerpts can't answer "
+                "the question, it must say so and return an **empty** quote "
+                "list."
+            )
+            st.markdown(
+                "**Step 2 — normalization.** Before comparing, both the quote "
+                "and every retrieved chunk are normalized: collapse every "
+                "whitespace run to a single space, strip the ends, lowercase. "
+                "**Punctuation is not touched** — matching is tolerant to "
+                "whitespace/case copying artifacts but otherwise verbatim:"
+            )
+            st.latex(
+                r"\mathrm{norm}(s)=\mathrm{lowercase}(\mathrm{collapse\_ws}(s))"
+            )
+            st.markdown(
+                "**Step 3 — per-quote check.** A quote $q$ verifies iff its "
+                "normalized form is non-empty and appears as a substring "
+                "($\\sqsubseteq$) of **any** normalized retrieved chunk in "
+                "$R$:"
+            )
+            st.latex(
+                r"\mathrm{verified}(q)=\big(\mathrm{norm}(q)\neq\text{``''}\big)"
+                r"\ \wedge\ \exists\,c\in R:\ \mathrm{norm}(q)\sqsubseteq\mathrm{norm}(c)"
+            )
+            st.markdown(
+                "The cited excerpt *number* is displayed but deliberately "
+                "**not** used for matching: the auditable claim is \"this "
+                "text is in the sources\", not the model's index bookkeeping "
+                "— a right span with a wrong number is sloppy citing, not "
+                "fabrication."
+            )
+            st.markdown(
+                "**Step 4 — row verdict.** The row's `quotes_verified` is the "
+                "conjunction over its quote set $Q$, guarded by $|Q|>0$:"
+            )
+            st.latex(
+                r"\mathrm{quotes\_verified}=\big(|Q|>0\big)\ \wedge\ "
+                r"\bigwedge_{q\in Q}\mathrm{verified}(q)"
+            )
+            st.markdown(
+                "The guard exists because a conjunction over an empty set is "
+                "vacuously true — an empty or unusable quote list is "
+                "**unverified by definition**.\n\n"
+                "**Design decisions**\n"
+                "- *Fabricated ≠ no quotes.* The ❌ metric counts only rows "
+                "that **did** cite quotes of which at least one span is not in "
+                "the sources — possible fabricated support. Rows with an "
+                "empty list (typically honest abstentions, or JSON parse "
+                "fallbacks) are counted separately under ∅ — abstaining is "
+                "not fabrication.\n"
+                "- *Parse failure degrades, never crashes.* If the model's "
+                "JSON doesn't parse, the call is retried once at a doubled "
+                "token budget; if it still fails, the raw text is kept as the "
+                "answer with an empty quote list (`quotes_verified = False`), "
+                "so the run continues and the row stays auditable.\n"
+                "- *No tunable constant.* Unlike grounding's $\\tau$, this "
+                "check has no threshold — a span either occurs verbatim "
+                "(after normalization) or it doesn't.\n\n"
+                "**Limitations** — verbatim substring matching cannot credit "
+                "a *paraphrased-but-faithful* quote, so a ❌ means \"not "
+                "verbatim in the sources\", which is not identical to \"the "
+                "answer is wrong\" (the check errs toward false alarms, never "
+                "toward missed fabrications). Conversely a ✅ proves the span "
+                "exists in the sources — not that the conclusion actually "
+                "follows from it (attribution, not entailment).\n\n"
+                "**Basis in the literature** — having the model support "
+                "answers with verbatim quotes that are then mechanically "
+                "verified against sources follows GopherCite "
+                "([Menick et al., 2022](https://arxiv.org/abs/2203.11147)); "
+                "the property audited is *attribution to identified sources* "
+                "(AIS: [Rashkin et al., 2023]"
+                "(https://aclanthology.org/2023.cl-4.2/); "
+                "[Bohnet et al., 2022](https://arxiv.org/abs/2212.08037)); "
+                "citation-quality evaluation of LLM output follows ALCE "
+                "([Gao et al., 2023]"
+                "(https://aclanthology.org/2023.emnlp-main.398/)). Full "
+                "reference list in ARCHITECTURE.md §9.2."
+            )
         if not has_quotes:
             st.caption("Not enabled for this run — check **Quote-grounded "
                        "answers** on the Run tab.")

@@ -189,6 +189,46 @@ grounding is auditable per question. The answering model still never sees the
 logics taxonomy — quotes support the answer, never a logic choice. The
 free-form path is untouched when the flag is off.
 
+**How verification works** (full derivation in ARCHITECTURE.md §9.2; the
+GUI's Hallucination tab has the same logic in an expander):
+
+```
+norm(s)         = lowercase(collapse_ws(s))       whitespace-tolerant, case-
+                                                  insensitive, punctuation verbatim
+verified(q)     = norm(q) ≠ "" ∧ ∃ chunk c : norm(q) ⊑ norm(c)   (⊑ = substring)
+quotes_verified = |Q| > 0 ∧ ∀ q ∈ Q : verified(q)
+```
+
+The cited excerpt *number* is displayed but not used for matching — the
+auditable claim is "this text is in the sources," not the model's index
+bookkeeping. The `|Q| > 0` guard makes an empty quote list unverified by
+definition (a conjunction over an empty set would be vacuously true). There
+is no tunable threshold: a span either occurs verbatim after normalization
+or it doesn't.
+
+*Worked example:* if a chunk contains `"The  charter\ncommits to Broadly
+distributed benefits"`, the quoted span `"charter commits to broadly
+distributed benefits"` **verifies** (double space, newline, and capital B
+are absorbed by normalization), while `"the charter guarantees benefits"`
+**fails** — a paraphrase, not a verbatim span. (This is exactly the case
+pinned by `tests/test_rag_qa.py::test_quotes_verified_verbatim`.)
+
+The report distinguishes two failure shapes — abstaining is not fabrication:
+
+| report bucket | meaning |
+|---|---|
+| ❌ unverified quotes ("fabricated") | the model **did** cite quotes and at least one span is not in the sources — possible fabricated support |
+| ∅ no quotes returned | empty quote list — typically an honest abstention, or a JSON parse fallback (retried once at doubled tokens, then degraded with `quotes_verified = False`) |
+
+Literature basis: verbatim-quote support with mechanical verification
+follows GopherCite ([Menick et al., 2022](https://arxiv.org/abs/2203.11147));
+the audited property is Attribution to Identified Sources
+([Rashkin et al., 2023](https://aclanthology.org/2023.cl-4.2/);
+[Bohnet et al., 2022](https://arxiv.org/abs/2212.08037)); citation-quality
+evaluation follows ALCE
+([Gao et al., 2023](https://aclanthology.org/2023.emnlp-main.398/)). Full
+reference list in ARCHITECTURE.md §9.2.
+
 ### 3. Metamorphic label-stability eval — `scripts/03_run_metamorphic_eval.py`
 
 ```bash

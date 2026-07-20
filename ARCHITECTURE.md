@@ -360,12 +360,127 @@ metrics rather than a novel one; each design element has a direct precedent:
 **Output fields** added to each per-question row: `retrieval_grounding_score`,
 `retrieval_cosine_top`, `grounding_bucket`.
 
+### 9.2 Quote verification (`il_rag/rag_qa.py`, `--quotes` on a run)
+
+The answer model must return, alongside its answer, the verbatim excerpt
+spans its conclusion rests on; each span is then re-checked **in code**. The
+model attests, the code audits — nothing the model says about its own quotes
+is trusted, and verification adds zero API calls beyond the answer call
+itself. The notation below (`norm(·)`, `verified(q)`, `Q`) is the same one
+used in the GUI's "How quotes are verified" expander and in `rag_qa.py`'s
+docstrings.
+
+**The contract.** The quote-mode prompt requires strict JSON:
+
+```
+{"answer": "...", "quotes": [{"excerpt": <i>, "quote": "<span>"}]}
+
+- 1 to 3 entries: the specific spans the conclusion rests on
+- each span "copied character-for-character from the numbered excerpt
+  it cites; never paraphrase inside a quote"
+- if the excerpts cannot answer, say so and return an empty quotes list
+```
+
+**Normalization.** Both the quote and every retrieved chunk are normalized
+before comparison — whitespace-tolerant and case-insensitive, but otherwise
+verbatim (punctuation is *not* stripped):
+
+```
+norm(s) = lowercase(collapse_ws(s))     collapse_ws: every whitespace run → " ", ends stripped
+```
+
+**Per-quote check.** A quote verifies iff its normalized form is non-empty
+and occurs as a substring (⊑) of *any* normalized retrieved chunk:
+
+```
+verified(q) = norm(q) ≠ "" ∧ ∃ c ∈ R : norm(q) ⊑ norm(c)
+```
+
+The cited excerpt index is persisted for display but deliberately **not**
+used for matching: the auditable claim is "this text is in the sources," not
+the model's index bookkeeping — a correct span with a wrong number is sloppy
+citing, not fabrication.
+
+**Row verdict.** The row's `quotes_verified` is a guarded conjunction over
+its quote set `Q`:
+
+```
+quotes_verified = |Q| > 0 ∧ ∀ q ∈ Q : verified(q)
+```
+
+The `|Q| > 0` guard exists because a conjunction over an empty set is
+vacuously true — an empty or unusable quote list is unverified *by
+definition*.
+
+**Edge cases.** If the model's JSON does not parse, the call is retried once
+at a doubled token budget (3072 → 6144, temperature 0); if it still fails,
+the raw text is kept as the answer with `quotes = []` and
+`quotes_verified = False` — the run degrades gracefully instead of dying,
+and the row stays auditable. Non-list `quotes` payloads are treated as
+empty; non-dict entries are skipped.
+
+**Design rationale.** *Any-excerpt* matching beats index-strict matching
+because the failure being hunted is fabricated text, not miscounted
+excerpts. Whitespace/case normalization absorbs the copying artifacts models
+actually produce, while keeping punctuation verbatim keeps the check strict
+on content. And the report separates **fabricated** (non-empty quote list,
+at least one span not in the sources) from **no quotes returned** (empty
+list — typically an honest abstention or a parse fallback): abstaining is
+not fabrication.
+
+**Limitations.** Verbatim substring matching cannot credit a
+paraphrased-but-faithful quote, so a failed quote means "not verbatim in the
+sources," which is not identical to "the answer is wrong" — the check errs
+toward false alarms, never toward missed fabrications. Conversely, a
+verified quote proves the span exists in the sources, not that the
+conclusion follows from it (this is attribution, not entailment). Unlike
+grounding's `τ`, there is no tunable constant: a span either occurs verbatim
+after normalization or it doesn't.
+
+**Basis in the literature.**
+
+- *Answering with verbatim quotes that are then mechanically verified
+  against the sources* follows **GopherCite** (Menick et al., 2022), where
+  supporting evidence is a quote checked to appear verbatim in the source
+  document. (GopherCite verifies exact strings; this check adds only
+  whitespace/case normalization.)
+- *The property being audited* is **Attributable to Identified Sources
+  (AIS)** as formalized by Rashkin et al. (2023) and operationalized for QA
+  by Bohnet et al. (2022): can the produced text be supported by the cited
+  source?
+- *Evaluating citation quality of LLM output* follows **ALCE** (Gao et al.,
+  2023), which measures whether generated citations actually support the
+  generated statements.
+- *Fabricated supporting evidence* is a recognized hallucination mode in the
+  survey of Ji et al. (2023) — see the reference in §9.1.
+
+**References**
+
+- Bohnet, B., Tran, V. Q., Verga, P., Aharoni, R., Andor, D., Baldini
+  Soares, L., Ciaramita, M., Eisenstein, J., Ganchev, K., Herzig, J., Hui,
+  K., Kwiatkowski, T., Ma, J., Ni, J., Sestorain Saralegui, L., Schuster,
+  T., Cohen, W. W., Collins, M., Das, D., Metzler, D., Petrov, S., &
+  Webster, K. (2022). Attributed Question Answering: Evaluation and
+  Modeling for Attributed Large Language Models. *arXiv:2212.08037*.
+  <https://arxiv.org/abs/2212.08037>
+- Gao, T., Yen, H., Yu, J., & Chen, D. (2023). Enabling Large Language
+  Models to Generate Text with Citations. *EMNLP 2023*.
+  <https://aclanthology.org/2023.emnlp-main.398/>
+- Menick, J., Trebacz, M., Mikulik, V., Aslanides, J., Song, F., Chadwick,
+  M., Glaese, M., Young, S., Campbell-Gillingham, L., Irving, G., &
+  McAleese, N. (2022). Teaching Language Models to Support Answers with
+  Verified Quotes. *arXiv:2203.11147*. <https://arxiv.org/abs/2203.11147>
+- Rashkin, H., Nikolaev, V., Lamm, M., Aroyo, L., Collins, M., Das, D.,
+  Petrov, S., Tomar, G. S., Turc, I., & Reitter, D. (2023). Measuring
+  Attribution in Natural Language Generation Models. *Computational
+  Linguistics*, 49(4). <https://aclanthology.org/2023.cl-4.2/>
+
+**Output fields** added to each per-question row: `quotes` (each entry
+`{"excerpt": int, "quote": str, "verified": bool}`) and `quotes_verified`
+(their guarded conjunction).
+
 The remaining checks:
 
-2. **Quote verification** (`il_rag/rag_qa.py`, `--quotes` on a run). The answer
-   model must return the verbatim excerpt spans its conclusion rests on; the
-   code checks each span is actually present in the retrieved text (normalized
-   substring match). The model attests, the code audits.
 3. **Metamorphic label stability** (`il_rag/metamorphic.py`). For each answered
    item it makes *k* meaning-preserving paraphrases of the evidence (LLM) and one
    **lab-name swap** (deterministic regex), re-runs the production answer→match
