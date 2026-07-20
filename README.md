@@ -116,7 +116,7 @@ run at temperature 0.
 
 ## Hallucination & grounding checks (opt-in)
 
-Three additive checks, all black-box / API-only (no logits, weights, or
+Four additive checks, all black-box / API-only (no logits, weights, or
 attention — nothing the Together API doesn't expose). **All are off by
 default; a default run produces byte-identical output to before.**
 
@@ -137,9 +137,43 @@ three-way `grounding_bucket`:
 | `abstained` | retrieval looked plausible but the matcher abstained |
 | `committed` | retrieval looked plausible and the answer was graded into logic weights |
 
+**How the score is computed** (full derivation in ARCHITECTURE.md §9.1; the
+GUI's Hallucination tab has the same math in an expander):
+
+```
+T(x)          = content tokens of x: lowercased alphanumeric tokens,
+                minus stopwords, minus tokens ≤ 2 chars
+overlap(q, c) = |T(q) ∩ T(c)| / |T(q)|          per-chunk, in [0, 1]
+g(q)          = max over retrieved chunks c of overlap(q, c)
+
+bucket(q)     = retrieval_missed   if g(q) < τ
+                abstained          if g(q) ≥ τ and the matcher abstained
+                committed          otherwise
+```
+
+`τ = GROUNDING_LOW_THRESHOLD` (currently **0.2**, set in `il_rag/config.py` —
+a per-corpus heuristic, not a learned parameter). The max (not mean) over
+chunks means one genuinely relevant chunk is enough to ground an answer.
+
+*Worked example:* for the question "How does the lab describe its safety
+mission?", stopword/length filtering leaves the content tokens
+`{lab, describe, safety, mission}` (4 tokens; "how", "does", "the", "its" are
+stopwords). If the best retrieved chunk contains `lab`, `safety`, and
+`mission` but not `describe`, then `overlap = 3/4 = 0.75 ≥ 0.2` → the row is
+`committed` (or `abstained` if the matcher abstained). A chunk containing
+none of the four tokens would score `0/4 = 0 < 0.2` → `retrieval_missed`.
+
 The report adds a per-bucket breakdown (size, abstention rate, mean top-logic
 weight). There are no gold labels in this pipeline, so buckets separate
 *failure modes*, not accuracy.
+
+Literature basis: the score is a set-based variant of ROUGE-1 recall
+([Lin, 2004](https://aclanthology.org/W04-1013/)); its use as a groundedness
+signal follows Knowledge F1
+([Shuster et al., 2021](https://aclanthology.org/2021.findings-emnlp.320/));
+the bucketing mirrors the "Missing Content" failure point of
+[Barnett et al., 2024](https://arxiv.org/abs/2401.05856). Full reference list
+in ARCHITECTURE.md §9.1.
 
 ### 2. Quote-grounded answers — `--quotes`
 

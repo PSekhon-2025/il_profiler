@@ -796,6 +796,90 @@ with tab_halluc:
 
         # ---------------- 1 · Retrieval grounding ----------------
         st.subheader("1 · Retrieval grounding")
+        with st.expander("ℹ️ How this score is computed", expanded=False):
+            st.markdown(
+                "Everything below is pure computation over the chunks the "
+                "retriever already returned (`il_rag/grounding.py`) — no LLM "
+                "call, zero extra API cost. The same notation is used in "
+                "ARCHITECTURE.md §9.1 and the README."
+            )
+            st.markdown(
+                "**Step 1 — content tokens.** Lowercase the text, split into "
+                "alphanumeric tokens, and drop a small English stopword list "
+                "plus tokens of ≤ 2 characters, so function words like "
+                "*the / of / and* cannot inflate the overlap:"
+            )
+            st.latex(
+                r"T(x)=\{\,t \in \mathrm{tokens}(\mathrm{lower}(x)) \mid "
+                r"t \notin \mathrm{stopwords},\ |t|>2\,\}"
+            )
+            st.markdown(
+                "**Step 2 — per-chunk lexical overlap** (ROUGE-1-recall-style "
+                "set overlap): the fraction of the question's content tokens "
+                "that appear in the chunk, always in $[0,1]$ "
+                "(defined as $0$ when $T(q)$ is empty):"
+            )
+            st.latex(
+                r"\mathrm{overlap}(q,c)=\frac{|\,T(q)\cap T(c)\,|}{|\,T(q)\,|}"
+            )
+            st.markdown(
+                "**Step 3 — grounding score**: the **max** overlap across the "
+                "retrieved chunks $R(q)$. Max, not mean — one genuinely "
+                "relevant chunk is enough to ground an answer, so a strong hit "
+                "should not be diluted by weak siblings:"
+            )
+            st.latex(
+                r"g(q)=\max_{c\,\in\,R(q)} \mathrm{overlap}(q,c)"
+            )
+            st.markdown(
+                "**Step 4 — bucketing** against the threshold "
+                f"$\\tau = {GROUNDING_LOW_THRESHOLD}$ "
+                "(`GROUNDING_LOW_THRESHOLD` in `il_rag/config.py`):"
+            )
+            st.latex(
+                r"\mathrm{bucket}(q)=\begin{cases}"
+                r"\texttt{retrieval\_missed} & g(q)<\tau\\[2pt]"
+                r"\texttt{abstained} & g(q)\ge\tau \text{ and the matcher abstained}\\[2pt]"
+                r"\texttt{committed} & \text{otherwise}"
+                r"\end{cases}"
+            )
+            st.markdown(
+                "`retrieval_missed` deliberately takes precedence over "
+                "`abstained`: when retrieval never surfaced relevant text, "
+                "abstaining was the *right* response, and the item's failure "
+                "belongs to retrieval — not to the model's grounding.\n\n"
+                "**Design decisions**\n"
+                "- *Why threshold the lexical score and not the cosine?* The "
+                "retriever's best cosine is kept as the `cosine_top` subscore, "
+                "$\\max_{c} \\mathrm{clip}(\\cos_c, 0, 1)$, but never "
+                "thresholded: e5 embeddings compress cosine into a narrow "
+                "high band even for weak matches, so token overlap is the "
+                "discriminative, interpretable signal. Cosine remains useful "
+                "as a diagnostic — e.g. a low-$g$, high-cosine row hints at a "
+                "paraphrased (not missing) match.\n"
+                f"- *Where does $\\tau = {GROUNDING_LOW_THRESHOLD}$ come "
+                "from?* It is a per-corpus heuristic set in `config.py`, not "
+                "a learned or label-calibrated parameter; tune it against the "
+                "histogram below.\n"
+                "- *Why no accuracy column?* There are no gold labels in this "
+                "pipeline, so each bucket reports its size, its abstention "
+                "rate, and the mean top-logic weight of its committed answers "
+                "($\\mathrm{mean}\\ \\max_k w_k$ — a proxy for how decisively "
+                "the matcher graded them). The buckets separate *failure "
+                "modes*, not correctness.\n\n"
+                "**Basis in the literature** — the overlap is a set-based "
+                "variant of ROUGE-1 recall "
+                "([Lin, 2004](https://aclanthology.org/W04-1013/)); using "
+                "lexical overlap with retrieved text as a groundedness signal "
+                "follows Knowledge F1 ([Shuster et al., 2021]"
+                "(https://aclanthology.org/2021.findings-emnlp.320/)); the "
+                "retrieval-failure vs. model-failure split mirrors the "
+                "\"Missing Content\" failure point of "
+                "[Barnett et al., 2024](https://arxiv.org/abs/2401.05856); "
+                "cosine is left unthresholded because of embedding anisotropy "
+                "([Ethayarajh, 2019](https://aclanthology.org/D19-1006/)). "
+                "Full reference list in ARCHITECTURE.md §9.1."
+            )
         if not has_grounding:
             st.caption("Not scored for this run — check **Grounding pre-check** "
                        "on the Run tab (adds no API calls).")

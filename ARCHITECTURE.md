@@ -231,11 +231,137 @@ All four are **opt-in and post-hoc** — a default run is byte-identical without
 them, and they operate on a saved run. They live on the GUI's **Hallucination**
 tab and as `scripts/03`–`04`.
 
-1. **Retrieval grounding** (`il_rag/grounding.py`, `--grounding` on a run).
-   No LLM. Scores how much of the question's content vocabulary appears in the
-   retrieved chunks (ROUGE-1-recall-style), and buckets each row into
-   `retrieval_missed` / `abstained` / `committed`. Separates "the model
-   hallucinated over good evidence" from "retrieval never found evidence."
+### 9.1 Retrieval grounding (`il_rag/grounding.py`, `--grounding` on a run)
+
+No LLM — pure computation over the already-retrieved chunks, so enabling it
+adds zero API cost. It separates "the model hallucinated over good evidence"
+from "retrieval never found evidence." The notation below (`T(·)`, `overlap`,
+`g`, `τ`) is the same one used in the GUI's "How this score is computed"
+expander and in `grounding.py`'s docstrings.
+
+**Content tokens.** Lowercased alphanumeric tokens, minus a ~70-word English
+stopword list, minus tokens of ≤ 2 characters (so function words cannot
+inflate overlap):
+
+```
+T(x) = { t ∈ tokens(lower(x)) : t ∉ stopwords, |t| > 2 }
+```
+
+**Per-chunk lexical overlap** — ROUGE-1-recall-style set overlap: the fraction
+of the question's content tokens present in the chunk, in [0, 1] (defined as 0
+when `T(q)` is empty):
+
+```
+overlap(q, c) = |T(q) ∩ T(c)| / |T(q)|
+```
+
+**Grounding score and cosine subscore** over the retrieved set `R(q)`:
+
+```
+g(q)          = max_{c ∈ R(q)} overlap(q, c)        → retrieval_grounding_score
+cosine_top(q) = max_{c ∈ R(q)} clip(score_c, 0, 1)  → retrieval_cosine_top
+```
+
+Max, not mean: one genuinely relevant chunk is enough to ground an answer, so
+a strong hit shouldn't be diluted by weak siblings.
+
+**Bucket rule**, with `τ = GROUNDING_LOW_THRESHOLD` (0.2 in `config.py`):
+
+```
+bucket(q) = retrieval_missed   if g(q) < τ
+            abstained          if g(q) ≥ τ and the matcher abstained
+            committed          otherwise
+```
+
+`retrieval_missed` takes precedence over `abstained`: when retrieval failed,
+abstaining was the *right* response, so the item's failure belongs to
+retrieval, not to the model's grounding.
+
+**Per-bucket summary.** There are no gold labels in this pipeline, so instead
+of accuracy each bucket `b` reports:
+
+```
+n_b             = |{rows in b}|
+abstain_rate_b  = n_abstained_in_b / n_b
+mean_top_weight = mean over committed rows in b of max_k weights[k]
+```
+
+`mean_top_weight` is a proxy for how decisively the matcher graded the
+bucket's committed answers. The buckets separate *failure modes*, not
+correctness.
+
+**Design rationale.** The thresholded signal is *lexical*, not cosine: e5
+embeddings compress cosine into a narrow high band even for weak matches, so
+token overlap is the discriminative, interpretable signal; `cosine_top` is
+kept as an unthresholded diagnostic subscore. `τ` is a per-corpus heuristic,
+not a learned or label-calibrated parameter — tune it against the score
+histogram on the Hallucination tab.
+
+**Limitations.** Pure lexical overlap is blind to synonymy and paraphrase: a
+chunk that answers the question in different words can score low. That is
+exactly why `cosine_top` is retained (a low-`g`, high-cosine row hints at a
+paraphrased rather than missing match). And because `τ` is uncalibrated, the
+`retrieval_missed` bucket is a *flag for review*, not a verdict.
+
+**Basis in the literature.** The score is a composition of established
+metrics rather than a novel one; each design element has a direct precedent:
+
+- *The overlap formula* is a set-based variant of **ROUGE-1 recall**
+  (Lin, 2004): unigram recall of the question's content tokens against a
+  chunk, computed over deduplicated token *sets* rather than token counts.
+  Token-level overlap is likewise the standard lexical-match measure in
+  extractive QA evaluation (Rajpurkar et al., 2016).
+- *Using lexical overlap with retrieved text as a groundedness signal*
+  follows **Knowledge F1** (Shuster et al., 2021), which measures word
+  overlap between generated text and the retrieved knowledge to quantify
+  grounding vs. hallucination. (We use recall of the *question*, not F1 of
+  the answer, because the object audited here is retrieval coverage.)
+- *Stopword removal and bag-of-words lexical matching* are standard IR
+  preprocessing (Manning, Raghavan & Schütze, 2008).
+- *The `retrieval_missed` vs. model-failure split* mirrors the RAG
+  failure-point taxonomy of Barnett et al. (2024), whose first failure point
+  — **"Missing Content"** — is exactly this case: the retrieved documents do
+  not contain the answer, so whatever the model generates next is
+  unsupported. It also reflects the source-error vs. generation-error
+  distinction in the hallucination survey of Ji et al. (2023).
+- *Not thresholding the cosine* is motivated by embedding **anisotropy**:
+  contextual embedding vectors occupy a narrow cone, so even unrelated texts
+  receive high cosine similarity (Ethayarajh, 2019). The retriever's e5
+  model (Wang et al., 2022) shows this band compression on this corpus,
+  which is why cosine is retained only as a diagnostic subscore.
+
+**References**
+
+- Barnett, S., Kurniawan, S., Thudumu, S., Brannelly, Z., & Abdelrazek, M.
+  (2024). Seven Failure Points When Engineering a Retrieval Augmented
+  Generation System. *CAIN 2024*. <https://arxiv.org/abs/2401.05856>
+- Ethayarajh, K. (2019). How Contextual are Contextualized Word
+  Representations? Comparing the Geometry of BERT, ELMo, and GPT-2
+  Embeddings. *EMNLP 2019*. <https://aclanthology.org/D19-1006/>
+- Ji, Z., Lee, N., Frieske, R., Yu, T., Su, D., Xu, Y., Ishii, E., Bang, Y.,
+  Madotto, A., & Fung, P. (2023). Survey of Hallucination in Natural
+  Language Generation. *ACM Computing Surveys*, 55(12).
+  <https://arxiv.org/abs/2202.03629>
+- Lin, C.-Y. (2004). ROUGE: A Package for Automatic Evaluation of Summaries.
+  *Text Summarization Branches Out* (ACL Workshop).
+  <https://aclanthology.org/W04-1013/>
+- Manning, C. D., Raghavan, P., & Schütze, H. (2008). *Introduction to
+  Information Retrieval*. Cambridge University Press.
+- Rajpurkar, P., Zhang, J., Lopyrev, K., & Liang, P. (2016). SQuAD: 100,000+
+  Questions for Machine Comprehension of Text. *EMNLP 2016*.
+  <https://aclanthology.org/D16-1264/>
+- Shuster, K., Poff, S., Chen, M., Kiela, D., & Weston, J. (2021). Retrieval
+  Augmentation Reduces Hallucination in Conversation. *Findings of EMNLP
+  2021*. <https://aclanthology.org/2021.findings-emnlp.320/>
+- Wang, L., Yang, N., Huang, X., Jiao, B., Yang, L., Jiang, D., Majumder,
+  R., & Wei, F. (2022). Text Embeddings by Weakly-Supervised Contrastive
+  Pre-training. *arXiv:2212.03533*. <https://arxiv.org/abs/2212.03533>
+
+**Output fields** added to each per-question row: `retrieval_grounding_score`,
+`retrieval_cosine_top`, `grounding_bucket`.
+
+The remaining checks:
+
 2. **Quote verification** (`il_rag/rag_qa.py`, `--quotes` on a run). The answer
    model must return the verbatim excerpt spans its conclusion rests on; the
    code checks each span is actually present in the retrieved text (normalized

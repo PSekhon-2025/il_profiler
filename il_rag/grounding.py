@@ -13,10 +13,12 @@ every question into:
                     answer that was graded into logic weights
 
 The thresholded signal is LEXICAL: the fraction of the question's content
-tokens that appear in the best retrieved chunk (ROUGE-1-recall-style set
-overlap). The retriever's cosine score is kept as a subscore but not
-thresholded — e5 embeddings compress cosine into a narrow high band even for
-weak matches, so token overlap is the discriminative, interpretable signal.
+tokens that appear in the best retrieved chunk — a set-based variant of
+ROUGE-1 recall (Lin, 2004). The retriever's cosine score is kept as a
+subscore but not thresholded — e5 embeddings compress cosine into a narrow
+high band even for weak matches (embedding anisotropy: Ethayarajh, 2019), so
+token overlap is the discriminative, interpretable signal. Full literature
+basis and references: ARCHITECTURE.md §9.1.
 
 Everything here is pure computation over already-retrieved chunks; enabling it
 adds zero API cost to a run.
@@ -53,7 +55,10 @@ def _content_tokens(text: str) -> set[str]:
 
 
 def lexical_overlap(question: str, chunk_text: str) -> float:
-    """Fraction of the question's content tokens present in the chunk, in [0, 1]."""
+    """Fraction of the question's content tokens present in the chunk, in [0, 1].
+
+    overlap(q, c) = |T(q) ∩ T(c)| / |T(q)|   (0 if T(q) is empty)
+    """
     q = _content_tokens(question)
     if not q:
         return 0.0
@@ -63,7 +68,11 @@ def lexical_overlap(question: str, chunk_text: str) -> float:
 def grounding_scores(question: str, chunks) -> dict:
     """Score how well the retrieved set covers the question.
 
-    Returns {"score": <max lexical overlap>, "cosine_top": <max cosine>}.
+    Returns {"score": <max lexical overlap>, "cosine_top": <max cosine>}:
+
+        g(q)          = max_{c ∈ chunks} overlap(q, c)
+        cosine_top(q) = max_{c ∈ chunks} clip(score_c, 0, 1)
+
     Max (not mean) over chunks: one genuinely relevant chunk is enough to
     ground an answer, so a strong hit shouldn't be diluted by weak siblings.
     """
