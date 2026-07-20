@@ -21,10 +21,13 @@ Areas:
                   banners when a detection fires.
   Compare       — diff two run snapshots.
 """
+import io
 import json
 import os
 import subprocess
 import sys
+import zipfile
+from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
@@ -253,6 +256,225 @@ def load_embedding_rows(run_id: str | None) -> pd.DataFrame | None:
                 except json.JSONDecodeError:
                     continue
     return pd.DataFrame(rows) if rows else None
+
+
+# ---------------------------------------------------------------------------
+# Hallucination export: one "decision + underlying data" table per check
+# ---------------------------------------------------------------------------
+# Every check reduces its inputs to a verdict per item; these builders lay that
+# verdict beside the raw signals that produced it, so an auditor can re-derive
+# the outcome offline. Decision columns are prefixed `decision_` throughout.
+def _series(df: pd.DataFrame, name: str) -> pd.Series:
+    """The named column, or an all-None column aligned to df (missing checks)."""
+    if name in df.columns:
+        return df[name]
+    return pd.Series([None] * len(df), index=df.index, dtype="object")
+
+
+def _top_logic(weights) -> tuple:
+    if not isinstance(weights, dict) or not weights:
+        return (None, None)
+    k = max(weights, key=weights.get)
+    return (k, round(float(weights[k]), 4))
+
+
+def _join_ids(x) -> str:
+    return "|".join(map(str, x)) if isinstance(x, list) else ("" if x is None else str(x))
+
+
+def build_grounding_export(dfh: pd.DataFrame) -> pd.DataFrame | None:
+    """Check 1 — one row per bucketed question: the bucket + its overlap score."""
+    if "grounding_bucket" not in dfh.columns or not dfh["grounding_bucket"].notna().any():
+        return None
+    g = dfh[dfh["grounding_bucket"].notna()].copy()
+    tops = [_top_logic(w) for w in g["weights"]]
+    return pd.DataFrame({
+        "org": g["org"], "source_type": g["source_type"], "qid": g["qid"],
+        "category": _series(g, "category"), "variant": _series(g, "variant"),
+        "question": g["question"],
+        "retrieval_grounding_score": g["retrieval_grounding_score"],
+        "retrieval_cosine_top": _series(g, "retrieval_cosine_top"),
+        "grounding_threshold": GROUNDING_LOW_THRESHOLD,
+        "abstain": g["abstain"],
+        "decision_grounding_bucket": g["grounding_bucket"],
+        "top_logic": [t[0] for t in tops],
+        "top_logic_weight": [t[1] for t in tops],
+        "retrieved_ids": g["retrieved_ids"].apply(_join_ids),
+    })
+
+
+def build_quotes_exports(dfh: pd.DataFrame):
+    """Check 2 — a per-answer verdict table and a per-span verification table."""
+    if "quotes_verified" not in dfh.columns or not dfh["quotes_verified"].notna().any():
+        return None, None
+    q = dfh[dfh["quotes_verified"].notna()].copy()
+    rows, spans = [], []
+    for _, r in q.iterrows():
+        quotes = r["quotes"] if isinstance(r["quotes"], list) else []
+        verified = bool(r["quotes_verified"])
+        verdict = ("no_quotes" if not quotes else "verified" if verified
+                   else "unverified")
+        rows.append({
+            "org": r["org"], "source_type": r["source_type"], "qid": r["qid"],
+            "category": r.get("category"), "question": r["question"],
+            "answer": r["answer"], "n_quotes": len(quotes),
+            "decision_quotes_verified": verified,
+            "decision_verdict": verdict,
+            "quotes_json": json.dumps(quotes, ensure_ascii=False),
+        })
+        for qq in quotes:
+            spans.append({
+                "org": r["org"], "source_type": r["source_type"], "qid": r["qid"],
+                "excerpt": qq.get("excerpt"), "quote": qq.get("quote"),
+                "decision_span_verified": qq.get("verified"),
+            })
+    return pd.DataFrame(rows), (pd.DataFrame(spans) if spans else None)
+
+
+def build_metamorphic_exports(stab: dict | None, variants: pd.DataFrame | None):
+    """Check 3 — per-item stability verdicts and the per-variant audit trail."""
+    items = None
+    if stab and stab.get("per_item"):
+        items = pd.DataFrame(stab["per_item"])
+        items["stability_threshold"] = METAMORPHIC_STABILITY_THRESHOLD
+        items = items.rename(columns={
+            "unstable": "decision_unstable",
+            "swap_label_changed": "decision_swap_label_changed",
+        })
+    var = None
+    if variants is not None and not variants.empty:
+        keep = ["org", "source_type", "qid", "category", "variant",
+                "variant_kind", "variant_idx", "original_label", "swap_to",
+                "question", "answer", "abstain", "reasoning", "label",
+                "label_matches_original", "error"]
+        var = variants[[c for c in keep if c in variants.columns]].rename(
+            columns={"label_matches_original": "decision_label_matches_original"})
+    return items, var
+
+
+def build_embedding_export(erows: pd.DataFrame | None) -> pd.DataFrame | None:
+    """Check 4 — per-answer agreement verdict + the 7 per-logic cosines/shares."""
+    if erows is None or erows.empty:
+        return None
+    e = erows.copy()
+    out = pd.DataFrame({
+        "org": e["org"], "source_type": e["source_type"], "qid": e["qid"],
+        "matcher_top": e["matcher_top"],
+        "matcher_top_weight": _series(e, "matcher_top_weight"),
+        "embedding_nearest": e["embedding_nearest"],
+        "decision_agree": e["agree"],
+        "margin": e["margin"],
+        "share_on_matcher_top": _series(e, "share_on_matcher_top"),
+        "overlap": _series(e, "overlap"),
+    })
+    for logic in LOGICS:
+        out[f"sim_{logic}"] = e["similarities"].apply(
+            lambda d, k=logic: d.get(k) if isinstance(d, dict) else None)
+        if "embedding_shares" in e.columns:
+            out[f"share_{logic}"] = e["embedding_shares"].apply(
+                lambda d, k=logic: d.get(k) if isinstance(d, dict) else None)
+    return out
+
+
+def build_detection_bundle(run_id: str, dfh: pd.DataFrame,
+                           stab: dict | None, emb: dict | None):
+    """Assemble every check's decision table for a run.
+
+    Returns (members, ran) where `members` is an ordered list of
+    (filename, bytes) — the per-check decision CSVs plus the raw source files
+    they derive from — and `ran` names the checks that actually produced data.
+    """
+    def csv_bytes(df: pd.DataFrame) -> bytes:
+        return df.to_csv(index=False).encode("utf-8")
+
+    members: list[tuple[str, bytes]] = []
+    ran: list[str] = []
+
+    grounding = build_grounding_export(dfh)
+    if grounding is not None:
+        members.append(("1_retrieval_grounding.csv", csv_bytes(grounding)))
+        ran.append("retrieval grounding")
+
+    q_rows, q_spans = build_quotes_exports(dfh)
+    if q_rows is not None:
+        members.append(("2_quote_verification.csv", csv_bytes(q_rows)))
+        if q_spans is not None:
+            members.append(("2_quote_verification_spans.csv", csv_bytes(q_spans)))
+        ran.append("quote verification")
+
+    mm_items, mm_var = build_metamorphic_exports(stab, load_variants(run_id))
+    if mm_items is not None:
+        members.append(("3_metamorphic_items.csv", csv_bytes(mm_items)))
+        if mm_var is not None:
+            members.append(("3_metamorphic_variants.csv", csv_bytes(mm_var)))
+        ran.append("metamorphic stability")
+
+    emb_rows = build_embedding_export(load_embedding_rows(run_id))
+    if emb_rows is not None:
+        members.append(("4_embedding_agreement.csv", csv_bytes(emb_rows)))
+        ran.append("embedding agreement")
+
+    # Raw source artifacts, verbatim, so nothing in the export is lossy.
+    rd = runs.run_dir(run_id)
+    for rel in ("per_question.jsonl", "meta.json",
+                "metamorphic/stability.json", "metamorphic/variants.jsonl",
+                "embedding_agreement/summary.json",
+                "embedding_agreement/similarities.jsonl"):
+        p = rd / rel
+        if p.exists():
+            members.append((f"raw/{rel}", p.read_bytes()))
+
+    members.insert(0, ("README.txt", _bundle_readme(run_id, ran).encode("utf-8")))
+    return members, ran
+
+
+def _bundle_readme(run_id: str, ran: list[str]) -> str:
+    meta = runs.read_meta(run_id)
+    return (
+        "IL Profiler — hallucination & grounding detection export\n"
+        "========================================================\n\n"
+        f"Run:        {run_id}"
+        + (f"  ({meta.get('label')})" if meta.get('label') else "") + "\n"
+        f"Generated:  {datetime.now().isoformat(timespec='seconds')}\n"
+        f"Checks with data in this export: "
+        f"{', '.join(ran) if ran else '(none — no checks have run for this run)'}\n\n"
+        "Each CSV is one decision per row: the `decision_*` column is the\n"
+        "check's verdict, and the remaining columns are the underlying data\n"
+        "used to reach it, so any outcome can be re-derived offline.\n\n"
+        "Files\n"
+        "-----\n"
+        "1_retrieval_grounding.csv        per question: grounding bucket "
+        "(decision) + question<->chunk overlap score, cosine, threshold,\n"
+        f"                                 abstain flag. Threshold tau = "
+        f"{GROUNDING_LOW_THRESHOLD}.\n"
+        "2_quote_verification.csv         per answer: quotes_verified + verdict "
+        "(verified / unverified / no_quotes) + the cited spans.\n"
+        "2_quote_verification_spans.csv   per cited span: whether that exact "
+        "span was found verbatim in the retrieved sources.\n"
+        "3_metamorphic_items.csv          per item: unstable + swap-flip "
+        "decisions with label_stability and the original/swapped labels.\n"
+        f"                                 Stability threshold theta = "
+        f"{METAMORPHIC_STABILITY_THRESHOLD}.\n"
+        "3_metamorphic_variants.csv       per paraphrase / lab-swap variant: "
+        "its label and whether it matched the original (the audit trail).\n"
+        "4_embedding_agreement.csv        per answer: agree (decision) + the "
+        "matcher's top logic, the embedding-nearest logic, the margin, and\n"
+        "                                 the 7 per-logic cosine similarities "
+        "and closeness shares.\n"
+        "raw/                             the untouched source artifacts these "
+        "tables are derived from (per_question.jsonl, meta.json, and any\n"
+        "                                 metamorphic / embedding outputs).\n\n"
+        "Only checks that have actually run for this snapshot appear above.\n"
+        "See ARCHITECTURE.md sections 9.1-9.4 for the full method of each check.\n"
+    )
+
+
+def zip_members(members: list[tuple[str, bytes]]) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name, data in members:
+            zf.writestr(name, data)
+    return buf.getvalue()
 
 
 def run_selectbox(label: str, key: str, default_run_id: str | None = None) -> str | None:
@@ -794,6 +1016,37 @@ with tab_halluc:
         else:
             st.success("✅ No hallucination signals fired on the checks that ran "
                        "for this snapshot.")
+
+        # --- Download every check's decisions + underlying data ---
+        with st.expander("⬇️ Download all detection results "
+                         "(every decision + the data behind it)", expanded=False):
+            members, ran = build_detection_bundle(hal_run, dfh, stab, emb)
+            csv_members = [(n, b) for n, b in members
+                           if n.endswith(".csv")]
+            if not csv_members:
+                st.caption(
+                    "No checks have produced results for this snapshot yet. "
+                    "Enable **--grounding** / **--quotes** on the Run tab, or "
+                    "launch the metamorphic eval / embedding agreement below, "
+                    "then come back here.")
+            else:
+                st.caption(
+                    "One row per decision across the "
+                    f"{len(ran)} check(s) that ran ({', '.join(ran)}). Each "
+                    "table's `decision_*` column is the verdict; the other "
+                    "columns are the data used to reach it. The ZIP also bundles "
+                    "the raw source files under `raw/` and a README.")
+                st.download_button(
+                    "⬇️ Download everything (.zip)",
+                    zip_members(members),
+                    file_name=f"hallucination_results_{hal_run}.zip",
+                    mime="application/zip", type="primary", key="dl_all_zip")
+                st.caption("Or grab an individual check's decision table:")
+                cols = st.columns(min(len(csv_members), 3))
+                for i, (name, data) in enumerate(csv_members):
+                    cols[i % len(cols)].download_button(
+                        name, data, file_name=f"{name[:-4]}_{hal_run}.csv",
+                        mime="text/csv", key=f"dl_csv_{name}")
 
         BUCKET_ORDER = ["committed", "abstained", "retrieval_missed"]
         BUCKET_COLORS = ["#54A24B", "#F58518", "#E45756"]
