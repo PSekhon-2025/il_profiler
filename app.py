@@ -21,10 +21,13 @@ Areas:
                   banners when a detection fires.
   Compare       — diff two run snapshots.
 """
+import io
 import json
 import os
 import subprocess
 import sys
+import zipfile
+from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
@@ -38,6 +41,10 @@ from il_rag.config import (
     CHROMA_DIR,
     COLLECTION_NAME,
     GROUNDING_LOW_THRESHOLD,
+    LAB_SWAP,
+    METAMORPHIC_PARAPHRASES,
+    METAMORPHIC_PARAPHRASE_TEMPERATURE,
+    METAMORPHIC_STABILITY_THRESHOLD,
     ORGS,
     SOURCE_TYPES,
 )
@@ -249,6 +256,225 @@ def load_embedding_rows(run_id: str | None) -> pd.DataFrame | None:
                 except json.JSONDecodeError:
                     continue
     return pd.DataFrame(rows) if rows else None
+
+
+# ---------------------------------------------------------------------------
+# Hallucination export: one "decision + underlying data" table per check
+# ---------------------------------------------------------------------------
+# Every check reduces its inputs to a verdict per item; these builders lay that
+# verdict beside the raw signals that produced it, so an auditor can re-derive
+# the outcome offline. Decision columns are prefixed `decision_` throughout.
+def _series(df: pd.DataFrame, name: str) -> pd.Series:
+    """The named column, or an all-None column aligned to df (missing checks)."""
+    if name in df.columns:
+        return df[name]
+    return pd.Series([None] * len(df), index=df.index, dtype="object")
+
+
+def _top_logic(weights) -> tuple:
+    if not isinstance(weights, dict) or not weights:
+        return (None, None)
+    k = max(weights, key=weights.get)
+    return (k, round(float(weights[k]), 4))
+
+
+def _join_ids(x) -> str:
+    return "|".join(map(str, x)) if isinstance(x, list) else ("" if x is None else str(x))
+
+
+def build_grounding_export(dfh: pd.DataFrame) -> pd.DataFrame | None:
+    """Check 1 — one row per bucketed question: the bucket + its overlap score."""
+    if "grounding_bucket" not in dfh.columns or not dfh["grounding_bucket"].notna().any():
+        return None
+    g = dfh[dfh["grounding_bucket"].notna()].copy()
+    tops = [_top_logic(w) for w in g["weights"]]
+    return pd.DataFrame({
+        "org": g["org"], "source_type": g["source_type"], "qid": g["qid"],
+        "category": _series(g, "category"), "variant": _series(g, "variant"),
+        "question": g["question"],
+        "retrieval_grounding_score": g["retrieval_grounding_score"],
+        "retrieval_cosine_top": _series(g, "retrieval_cosine_top"),
+        "grounding_threshold": GROUNDING_LOW_THRESHOLD,
+        "abstain": g["abstain"],
+        "decision_grounding_bucket": g["grounding_bucket"],
+        "top_logic": [t[0] for t in tops],
+        "top_logic_weight": [t[1] for t in tops],
+        "retrieved_ids": g["retrieved_ids"].apply(_join_ids),
+    })
+
+
+def build_quotes_exports(dfh: pd.DataFrame):
+    """Check 2 — a per-answer verdict table and a per-span verification table."""
+    if "quotes_verified" not in dfh.columns or not dfh["quotes_verified"].notna().any():
+        return None, None
+    q = dfh[dfh["quotes_verified"].notna()].copy()
+    rows, spans = [], []
+    for _, r in q.iterrows():
+        quotes = r["quotes"] if isinstance(r["quotes"], list) else []
+        verified = bool(r["quotes_verified"])
+        verdict = ("no_quotes" if not quotes else "verified" if verified
+                   else "unverified")
+        rows.append({
+            "org": r["org"], "source_type": r["source_type"], "qid": r["qid"],
+            "category": r.get("category"), "question": r["question"],
+            "answer": r["answer"], "n_quotes": len(quotes),
+            "decision_quotes_verified": verified,
+            "decision_verdict": verdict,
+            "quotes_json": json.dumps(quotes, ensure_ascii=False),
+        })
+        for qq in quotes:
+            spans.append({
+                "org": r["org"], "source_type": r["source_type"], "qid": r["qid"],
+                "excerpt": qq.get("excerpt"), "quote": qq.get("quote"),
+                "decision_span_verified": qq.get("verified"),
+            })
+    return pd.DataFrame(rows), (pd.DataFrame(spans) if spans else None)
+
+
+def build_metamorphic_exports(stab: dict | None, variants: pd.DataFrame | None):
+    """Check 3 — per-item stability verdicts and the per-variant audit trail."""
+    items = None
+    if stab and stab.get("per_item"):
+        items = pd.DataFrame(stab["per_item"])
+        items["stability_threshold"] = METAMORPHIC_STABILITY_THRESHOLD
+        items = items.rename(columns={
+            "unstable": "decision_unstable",
+            "swap_label_changed": "decision_swap_label_changed",
+        })
+    var = None
+    if variants is not None and not variants.empty:
+        keep = ["org", "source_type", "qid", "category", "variant",
+                "variant_kind", "variant_idx", "original_label", "swap_to",
+                "question", "answer", "abstain", "reasoning", "label",
+                "label_matches_original", "error"]
+        var = variants[[c for c in keep if c in variants.columns]].rename(
+            columns={"label_matches_original": "decision_label_matches_original"})
+    return items, var
+
+
+def build_embedding_export(erows: pd.DataFrame | None) -> pd.DataFrame | None:
+    """Check 4 — per-answer agreement verdict + the 7 per-logic cosines/shares."""
+    if erows is None or erows.empty:
+        return None
+    e = erows.copy()
+    out = pd.DataFrame({
+        "org": e["org"], "source_type": e["source_type"], "qid": e["qid"],
+        "matcher_top": e["matcher_top"],
+        "matcher_top_weight": _series(e, "matcher_top_weight"),
+        "embedding_nearest": e["embedding_nearest"],
+        "decision_agree": e["agree"],
+        "margin": e["margin"],
+        "share_on_matcher_top": _series(e, "share_on_matcher_top"),
+        "overlap": _series(e, "overlap"),
+    })
+    for logic in LOGICS:
+        out[f"sim_{logic}"] = e["similarities"].apply(
+            lambda d, k=logic: d.get(k) if isinstance(d, dict) else None)
+        if "embedding_shares" in e.columns:
+            out[f"share_{logic}"] = e["embedding_shares"].apply(
+                lambda d, k=logic: d.get(k) if isinstance(d, dict) else None)
+    return out
+
+
+def build_detection_bundle(run_id: str, dfh: pd.DataFrame,
+                           stab: dict | None, emb: dict | None):
+    """Assemble every check's decision table for a run.
+
+    Returns (members, ran) where `members` is an ordered list of
+    (filename, bytes) — the per-check decision CSVs plus the raw source files
+    they derive from — and `ran` names the checks that actually produced data.
+    """
+    def csv_bytes(df: pd.DataFrame) -> bytes:
+        return df.to_csv(index=False).encode("utf-8")
+
+    members: list[tuple[str, bytes]] = []
+    ran: list[str] = []
+
+    grounding = build_grounding_export(dfh)
+    if grounding is not None:
+        members.append(("1_retrieval_grounding.csv", csv_bytes(grounding)))
+        ran.append("retrieval grounding")
+
+    q_rows, q_spans = build_quotes_exports(dfh)
+    if q_rows is not None:
+        members.append(("2_quote_verification.csv", csv_bytes(q_rows)))
+        if q_spans is not None:
+            members.append(("2_quote_verification_spans.csv", csv_bytes(q_spans)))
+        ran.append("quote verification")
+
+    mm_items, mm_var = build_metamorphic_exports(stab, load_variants(run_id))
+    if mm_items is not None:
+        members.append(("3_metamorphic_items.csv", csv_bytes(mm_items)))
+        if mm_var is not None:
+            members.append(("3_metamorphic_variants.csv", csv_bytes(mm_var)))
+        ran.append("metamorphic stability")
+
+    emb_rows = build_embedding_export(load_embedding_rows(run_id))
+    if emb_rows is not None:
+        members.append(("4_embedding_agreement.csv", csv_bytes(emb_rows)))
+        ran.append("embedding agreement")
+
+    # Raw source artifacts, verbatim, so nothing in the export is lossy.
+    rd = runs.run_dir(run_id)
+    for rel in ("per_question.jsonl", "meta.json",
+                "metamorphic/stability.json", "metamorphic/variants.jsonl",
+                "embedding_agreement/summary.json",
+                "embedding_agreement/similarities.jsonl"):
+        p = rd / rel
+        if p.exists():
+            members.append((f"raw/{rel}", p.read_bytes()))
+
+    members.insert(0, ("README.txt", _bundle_readme(run_id, ran).encode("utf-8")))
+    return members, ran
+
+
+def _bundle_readme(run_id: str, ran: list[str]) -> str:
+    meta = runs.read_meta(run_id)
+    return (
+        "IL Profiler — hallucination & grounding detection export\n"
+        "========================================================\n\n"
+        f"Run:        {run_id}"
+        + (f"  ({meta.get('label')})" if meta.get('label') else "") + "\n"
+        f"Generated:  {datetime.now().isoformat(timespec='seconds')}\n"
+        f"Checks with data in this export: "
+        f"{', '.join(ran) if ran else '(none — no checks have run for this run)'}\n\n"
+        "Each CSV is one decision per row: the `decision_*` column is the\n"
+        "check's verdict, and the remaining columns are the underlying data\n"
+        "used to reach it, so any outcome can be re-derived offline.\n\n"
+        "Files\n"
+        "-----\n"
+        "1_retrieval_grounding.csv        per question: grounding bucket "
+        "(decision) + question<->chunk overlap score, cosine, threshold,\n"
+        f"                                 abstain flag. Threshold tau = "
+        f"{GROUNDING_LOW_THRESHOLD}.\n"
+        "2_quote_verification.csv         per answer: quotes_verified + verdict "
+        "(verified / unverified / no_quotes) + the cited spans.\n"
+        "2_quote_verification_spans.csv   per cited span: whether that exact "
+        "span was found verbatim in the retrieved sources.\n"
+        "3_metamorphic_items.csv          per item: unstable + swap-flip "
+        "decisions with label_stability and the original/swapped labels.\n"
+        f"                                 Stability threshold theta = "
+        f"{METAMORPHIC_STABILITY_THRESHOLD}.\n"
+        "3_metamorphic_variants.csv       per paraphrase / lab-swap variant: "
+        "its label and whether it matched the original (the audit trail).\n"
+        "4_embedding_agreement.csv        per answer: agree (decision) + the "
+        "matcher's top logic, the embedding-nearest logic, the margin, and\n"
+        "                                 the 7 per-logic cosine similarities "
+        "and closeness shares.\n"
+        "raw/                             the untouched source artifacts these "
+        "tables are derived from (per_question.jsonl, meta.json, and any\n"
+        "                                 metamorphic / embedding outputs).\n\n"
+        "Only checks that have actually run for this snapshot appear above.\n"
+        "See ARCHITECTURE.md sections 9.1-9.4 for the full method of each check.\n"
+    )
+
+
+def zip_members(members: list[tuple[str, bytes]]) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name, data in members:
+            zf.writestr(name, data)
+    return buf.getvalue()
 
 
 def run_selectbox(label: str, key: str, default_run_id: str | None = None) -> str | None:
@@ -791,11 +1017,126 @@ with tab_halluc:
             st.success("✅ No hallucination signals fired on the checks that ran "
                        "for this snapshot.")
 
+        # --- Download every check's decisions + underlying data ---
+        with st.expander("⬇️ Download all detection results "
+                         "(every decision + the data behind it)", expanded=False):
+            members, ran = build_detection_bundle(hal_run, dfh, stab, emb)
+            csv_members = [(n, b) for n, b in members
+                           if n.endswith(".csv")]
+            if not csv_members:
+                st.caption(
+                    "No checks have produced results for this snapshot yet. "
+                    "Enable **--grounding** / **--quotes** on the Run tab, or "
+                    "launch the metamorphic eval / embedding agreement below, "
+                    "then come back here.")
+            else:
+                st.caption(
+                    "One row per decision across the "
+                    f"{len(ran)} check(s) that ran ({', '.join(ran)}). Each "
+                    "table's `decision_*` column is the verdict; the other "
+                    "columns are the data used to reach it. The ZIP also bundles "
+                    "the raw source files under `raw/` and a README.")
+                st.download_button(
+                    "⬇️ Download everything (.zip)",
+                    zip_members(members),
+                    file_name=f"hallucination_results_{hal_run}.zip",
+                    mime="application/zip", type="primary", key="dl_all_zip")
+                st.caption("Or grab an individual check's decision table:")
+                cols = st.columns(min(len(csv_members), 3))
+                for i, (name, data) in enumerate(csv_members):
+                    cols[i % len(cols)].download_button(
+                        name, data, file_name=f"{name[:-4]}_{hal_run}.csv",
+                        mime="text/csv", key=f"dl_csv_{name}")
+
         BUCKET_ORDER = ["committed", "abstained", "retrieval_missed"]
         BUCKET_COLORS = ["#54A24B", "#F58518", "#E45756"]
 
         # ---------------- 1 · Retrieval grounding ----------------
         st.subheader("1 · Retrieval grounding")
+        with st.expander("ℹ️ How this score is computed", expanded=False):
+            st.markdown(
+                "Everything below is pure computation over the chunks the "
+                "retriever already returned (`il_rag/grounding.py`) — no LLM "
+                "call, zero extra API cost. The same notation is used in "
+                "ARCHITECTURE.md §9.1 and the README."
+            )
+            st.markdown(
+                "**Step 1 — content tokens.** Lowercase the text, split into "
+                "alphanumeric tokens, and drop a small English stopword list "
+                "plus tokens of ≤ 2 characters, so function words like "
+                "*the / of / and* cannot inflate the overlap:"
+            )
+            st.latex(
+                r"T(x)=\{\,t \in \mathrm{tokens}(\mathrm{lower}(x)) \mid "
+                r"t \notin \mathrm{stopwords},\ |t|>2\,\}"
+            )
+            st.markdown(
+                "**Step 2 — per-chunk lexical overlap** (ROUGE-1-recall-style "
+                "set overlap): the fraction of the question's content tokens "
+                "that appear in the chunk, always in $[0,1]$ "
+                "(defined as $0$ when $T(q)$ is empty):"
+            )
+            st.latex(
+                r"\mathrm{overlap}(q,c)=\frac{|\,T(q)\cap T(c)\,|}{|\,T(q)\,|}"
+            )
+            st.markdown(
+                "**Step 3 — grounding score**: the **max** overlap across the "
+                "retrieved chunks $R(q)$. Max, not mean — one genuinely "
+                "relevant chunk is enough to ground an answer, so a strong hit "
+                "should not be diluted by weak siblings:"
+            )
+            st.latex(
+                r"g(q)=\max_{c\,\in\,R(q)} \mathrm{overlap}(q,c)"
+            )
+            st.markdown(
+                "**Step 4 — bucketing** against the threshold "
+                f"$\\tau = {GROUNDING_LOW_THRESHOLD}$ "
+                "(`GROUNDING_LOW_THRESHOLD` in `il_rag/config.py`):"
+            )
+            st.latex(
+                r"\mathrm{bucket}(q)=\begin{cases}"
+                r"\texttt{retrieval\_missed} & g(q)<\tau\\[2pt]"
+                r"\texttt{abstained} & g(q)\ge\tau \text{ and the matcher abstained}\\[2pt]"
+                r"\texttt{committed} & \text{otherwise}"
+                r"\end{cases}"
+            )
+            st.markdown(
+                "`retrieval_missed` deliberately takes precedence over "
+                "`abstained`: when retrieval never surfaced relevant text, "
+                "abstaining was the *right* response, and the item's failure "
+                "belongs to retrieval — not to the model's grounding.\n\n"
+                "**Design decisions**\n"
+                "- *Why threshold the lexical score and not the cosine?* The "
+                "retriever's best cosine is kept as the `cosine_top` subscore, "
+                "$\\max_{c} \\mathrm{clip}(\\cos_c, 0, 1)$, but never "
+                "thresholded: e5 embeddings compress cosine into a narrow "
+                "high band even for weak matches, so token overlap is the "
+                "discriminative, interpretable signal. Cosine remains useful "
+                "as a diagnostic — e.g. a low-$g$, high-cosine row hints at a "
+                "paraphrased (not missing) match.\n"
+                f"- *Where does $\\tau = {GROUNDING_LOW_THRESHOLD}$ come "
+                "from?* It is a per-corpus heuristic set in `config.py`, not "
+                "a learned or label-calibrated parameter; tune it against the "
+                "histogram below.\n"
+                "- *Why no accuracy column?* There are no gold labels in this "
+                "pipeline, so each bucket reports its size, its abstention "
+                "rate, and the mean top-logic weight of its committed answers "
+                "($\\mathrm{mean}\\ \\max_k w_k$ — a proxy for how decisively "
+                "the matcher graded them). The buckets separate *failure "
+                "modes*, not correctness.\n\n"
+                "**Basis in the literature** — the overlap is a set-based "
+                "variant of ROUGE-1 recall "
+                "([Lin, 2004](https://aclanthology.org/W04-1013/)); using "
+                "lexical overlap with retrieved text as a groundedness signal "
+                "follows Knowledge F1 ([Shuster et al., 2021]"
+                "(https://aclanthology.org/2021.findings-emnlp.320/)); the "
+                "retrieval-failure vs. model-failure split mirrors the "
+                "\"Missing Content\" failure point of "
+                "[Barnett et al., 2024](https://arxiv.org/abs/2401.05856); "
+                "cosine is left unthresholded because of embedding anisotropy "
+                "([Ethayarajh, 2019](https://aclanthology.org/D19-1006/)). "
+                "Full reference list in ARCHITECTURE.md §9.1."
+            )
         if not has_grounding:
             st.caption("Not scored for this run — check **Grounding pre-check** "
                        "on the Run tab (adds no API calls).")
@@ -845,6 +1186,96 @@ with tab_halluc:
 
         # ---------------- 2 · Quote verification ----------------
         st.subheader("2 · Quote verification")
+        with st.expander("ℹ️ How quotes are verified", expanded=False):
+            st.markdown(
+                "The model **attests**, the code **audits**: nothing the model "
+                "says about its own quotes is trusted — every claimed span is "
+                "re-checked in pure code (`il_rag/rag_qa.py`), adding zero API "
+                "calls beyond the answer call itself. The same notation is "
+                "used in ARCHITECTURE.md §9.2 and the README."
+            )
+            st.markdown(
+                "**Step 1 — the contract.** Alongside its answer, the model "
+                "must return 1–3 spans *\"copied character-for-character from "
+                "the numbered excerpt it cites; never paraphrase inside a "
+                "quote\"* (verbatim prompt rule). If the excerpts can't answer "
+                "the question, it must say so and return an **empty** quote "
+                "list."
+            )
+            st.markdown(
+                "**Step 2 — normalization.** Before comparing, both the quote "
+                "and every retrieved chunk are normalized: collapse every "
+                "whitespace run to a single space, strip the ends, lowercase. "
+                "**Punctuation is not touched** — matching is tolerant to "
+                "whitespace/case copying artifacts but otherwise verbatim:"
+            )
+            st.latex(
+                r"\mathrm{norm}(s)=\mathrm{lowercase}(\mathrm{collapse\_ws}(s))"
+            )
+            st.markdown(
+                "**Step 3 — per-quote check.** A quote $q$ verifies iff its "
+                "normalized form is non-empty and appears as a substring "
+                "($\\sqsubseteq$) of **any** normalized retrieved chunk in "
+                "$R$:"
+            )
+            st.latex(
+                r"\mathrm{verified}(q)=\big(\mathrm{norm}(q)\neq\text{``''}\big)"
+                r"\ \wedge\ \exists\,c\in R:\ \mathrm{norm}(q)\sqsubseteq\mathrm{norm}(c)"
+            )
+            st.markdown(
+                "The cited excerpt *number* is displayed but deliberately "
+                "**not** used for matching: the auditable claim is \"this "
+                "text is in the sources\", not the model's index bookkeeping "
+                "— a right span with a wrong number is sloppy citing, not "
+                "fabrication."
+            )
+            st.markdown(
+                "**Step 4 — row verdict.** The row's `quotes_verified` is the "
+                "conjunction over its quote set $Q$, guarded by $|Q|>0$:"
+            )
+            st.latex(
+                r"\mathrm{quotes\_verified}=\big(|Q|>0\big)\ \wedge\ "
+                r"\bigwedge_{q\in Q}\mathrm{verified}(q)"
+            )
+            st.markdown(
+                "The guard exists because a conjunction over an empty set is "
+                "vacuously true — an empty or unusable quote list is "
+                "**unverified by definition**.\n\n"
+                "**Design decisions**\n"
+                "- *Fabricated ≠ no quotes.* The ❌ metric counts only rows "
+                "that **did** cite quotes of which at least one span is not in "
+                "the sources — possible fabricated support. Rows with an "
+                "empty list (typically honest abstentions, or JSON parse "
+                "fallbacks) are counted separately under ∅ — abstaining is "
+                "not fabrication.\n"
+                "- *Parse failure degrades, never crashes.* If the model's "
+                "JSON doesn't parse, the call is retried once at a doubled "
+                "token budget; if it still fails, the raw text is kept as the "
+                "answer with an empty quote list (`quotes_verified = False`), "
+                "so the run continues and the row stays auditable.\n"
+                "- *No tunable constant.* Unlike grounding's $\\tau$, this "
+                "check has no threshold — a span either occurs verbatim "
+                "(after normalization) or it doesn't.\n\n"
+                "**Limitations** — verbatim substring matching cannot credit "
+                "a *paraphrased-but-faithful* quote, so a ❌ means \"not "
+                "verbatim in the sources\", which is not identical to \"the "
+                "answer is wrong\" (the check errs toward false alarms, never "
+                "toward missed fabrications). Conversely a ✅ proves the span "
+                "exists in the sources — not that the conclusion actually "
+                "follows from it (attribution, not entailment).\n\n"
+                "**Basis in the literature** — having the model support "
+                "answers with verbatim quotes that are then mechanically "
+                "verified against sources follows GopherCite "
+                "([Menick et al., 2022](https://arxiv.org/abs/2203.11147)); "
+                "the property audited is *attribution to identified sources* "
+                "(AIS: [Rashkin et al., 2023]"
+                "(https://aclanthology.org/2023.cl-4.2/); "
+                "[Bohnet et al., 2022](https://arxiv.org/abs/2212.08037)); "
+                "citation-quality evaluation of LLM output follows ALCE "
+                "([Gao et al., 2023]"
+                "(https://aclanthology.org/2023.emnlp-main.398/)). Full "
+                "reference list in ARCHITECTURE.md §9.2."
+            )
         if not has_quotes:
             st.caption("Not enabled for this run — check **Quote-grounded "
                        "answers** on the Run tab.")
@@ -873,6 +1304,115 @@ with tab_halluc:
 
         # ---------------- 3 · Metamorphic label stability ----------------
         st.subheader("3 · Metamorphic label stability")
+        with st.expander("ℹ️ How stability is computed", expanded=False):
+            st.markdown(
+                "There are no gold labels in this pipeline, so correctness "
+                "can't be checked directly. Instead this check tests an "
+                "**invariance relation**: a label that is grounded in the "
+                "text should survive a meaning-preserving rewrite of that "
+                "text. The same notation is used in ARCHITECTURE.md §9.3 and "
+                "the README."
+            )
+            st.markdown(
+                "**Step 1 — the label.** Each answered item's label is the "
+                "matcher's abstention, or else the top-weight logic (ties "
+                "break deterministically by the fixed logic order). "
+                "*Abstain is a label, not a gap* — a paraphrase that abstains "
+                "matches only if the original also abstained:"
+            )
+            st.latex(
+                r"\mathrm{label}(v)=\begin{cases}"
+                r"\texttt{abstain} & \text{the matcher abstained}\\[2pt]"
+                r"\arg\max_{k}\, w_k & \text{otherwise}"
+                r"\end{cases}"
+            )
+            st.markdown(
+                "**Step 2 — the variants.** For each item, "
+                f"$k = {METAMORPHIC_PARAPHRASES}$ meaning-preserving "
+                "paraphrases of its retrieved chunks are generated by the "
+                "LLM under a strict preservation rule (*\"every fact, name, "
+                "number, date, and claim is preserved exactly while the "
+                "wording and sentence structure change substantially\"*), "
+                f"sampled at temperature {METAMORPHIC_PARAPHRASE_TEMPERATURE} "
+                "so the $k$ variants differ — plus **one lab-name swap**: a "
+                "deterministic, case-insensitive, word-boundaried regex that "
+                "replaces every alias of the lab "
+                f"({', '.join(f'{a} → {b}' for a, b in LAB_SWAP.items())}), "
+                "longest alias first, in the chunks *and* the question. No "
+                "LLM touches the swap, so the swap itself cannot drift the "
+                "text's meaning."
+            )
+            st.markdown(
+                "**Step 3 — re-run the production path.** Every variant goes "
+                "through the exact same answer → match pipeline as the "
+                "original run (same refetched chunks, temperature 0), so a "
+                "changed label is attributable to the text perturbation "
+                "alone."
+            )
+            st.markdown(
+                "**Step 4 — stability score.** With $P_{ok}$ the paraphrase "
+                "variants that ran without error and $\\mathrm{label}_0$ the "
+                "original run's label:"
+            )
+            st.latex(
+                r"\mathrm{label\_stability}="
+                r"\frac{|\{\,v\in P_{ok} : \mathrm{label}(v)=\mathrm{label}_0\,\}|}"
+                r"{|P_{ok}|}"
+            )
+            st.latex(
+                r"\mathrm{unstable}\iff\mathrm{label\_stability}<\theta"
+                r"\qquad\qquad"
+                r"\mathrm{swap\ flip}\iff\mathrm{label}(\mathrm{swap})\neq\mathrm{label}_0"
+            )
+            st.markdown(
+                f"with $\\theta = {METAMORPHIC_STABILITY_THRESHOLD}$ "
+                "(`METAMORPHIC_STABILITY_THRESHOLD` in `il_rag/config.py`). "
+                "The summary reports the mean stability over scored items, "
+                "the share of fully stable items, and "
+                "$\\mathrm{swap\\_flip\\_rate} = n_{\\text{changed}} / "
+                "n_{\\text{evaluated}}$.\n\n"
+                "**Design decisions**\n"
+                "- *Failed variants are excluded from denominators*, never "
+                "counted as flips — a paraphrase parse failure is evidence "
+                "of nothing about stability.\n"
+                f"- *$\\theta = {METAMORPHIC_STABILITY_THRESHOLD}$ is the "
+                "strictest setting*: any single paraphrase flip flags the "
+                "item. Relax it in `config.py` if paraphrase noise is high.\n"
+                "- *A paraphrase flip and a swap flip mean different "
+                "things.* A paraphrase flip says the label isn't robust to "
+                "rewording. A swap flip says the label changed when **only "
+                "the lab's name** changed — evidence the model keys on its "
+                "prior about the lab rather than on the text.\n"
+                "- When the run also has grounding scores (check 1), "
+                "stability is broken down by grounding bucket — the checks "
+                "cross-validate each other.\n\n"
+                "**Limitations** — the check is *self-referential*: the same "
+                "model generates the paraphrases and classifies them, so "
+                "\"meaning-preserving\" is only as good as the model's own "
+                "judgment — audit a sample of `variants.jsonl` by hand. "
+                "Paraphrase fidelity is attested by the prompt, not "
+                "verified. And at "
+                f"$k = {METAMORPHIC_PARAPHRASES}$ stability is "
+                "coarse-grained (steps of "
+                f"$1/{METAMORPHIC_PARAPHRASES}$).\n\n"
+                "**Basis in the literature** — testing output *relations* "
+                "under input transformations when no oracle exists is "
+                "metamorphic testing "
+                "([Chen et al., 1998](https://arxiv.org/abs/2002.12543); "
+                "survey: [Segura et al., 2016]"
+                "(https://doi.org/10.1109/TSE.2016.2532875)); "
+                "label-preserving perturbations incl. name substitutions "
+                "follow CheckList's invariance tests "
+                "([Ribeiro et al., 2020]"
+                "(https://aclanthology.org/2020.acl-main.442/)); prediction "
+                "consistency under paraphrase follows "
+                "([Elazar et al., 2021]"
+                "(https://aclanthology.org/2021.tacl-1.60/)); metamorphic "
+                "relations for LLM hallucination detection follow MetaQA "
+                "([Yang et al., FSE 2025]"
+                "(https://conf.researchr.org/details/fse-2025/fse-2025-research-papers/48/Hallucination-Detection-in-Large-Language-Models-with-Metamorphic-Relations)). "
+                "Full reference list in ARCHITECTURE.md §9.3."
+            )
         with st.expander("Run the metamorphic eval for this snapshot",
                          expanded=stab is None):
             st.caption(

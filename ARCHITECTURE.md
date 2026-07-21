@@ -231,20 +231,403 @@ All four are **opt-in and post-hoc** — a default run is byte-identical without
 them, and they operate on a saved run. They live on the GUI's **Hallucination**
 tab and as `scripts/03`–`04`.
 
-1. **Retrieval grounding** (`il_rag/grounding.py`, `--grounding` on a run).
-   No LLM. Scores how much of the question's content vocabulary appears in the
-   retrieved chunks (ROUGE-1-recall-style), and buckets each row into
-   `retrieval_missed` / `abstained` / `committed`. Separates "the model
-   hallucinated over good evidence" from "retrieval never found evidence."
-2. **Quote verification** (`il_rag/rag_qa.py`, `--quotes` on a run). The answer
-   model must return the verbatim excerpt spans its conclusion rests on; the
-   code checks each span is actually present in the retrieved text (normalized
-   substring match). The model attests, the code audits.
-3. **Metamorphic label stability** (`il_rag/metamorphic.py`). For each answered
-   item it makes *k* meaning-preserving paraphrases of the evidence (LLM) and one
-   **lab-name swap** (deterministic regex), re-runs the production answer→match
-   path, and checks whether the label survives. A paraphrase flip = unstable; a
-   swap flip suggests the label was keyed on the lab's *name*, not the text.
+### 9.1 Retrieval grounding (`il_rag/grounding.py`, `--grounding` on a run)
+
+No LLM — pure computation over the already-retrieved chunks, so enabling it
+adds zero API cost. It separates "the model hallucinated over good evidence"
+from "retrieval never found evidence." The notation below (`T(·)`, `overlap`,
+`g`, `τ`) is the same one used in the GUI's "How this score is computed"
+expander and in `grounding.py`'s docstrings.
+
+**Content tokens.** Lowercased alphanumeric tokens, minus a ~70-word English
+stopword list, minus tokens of ≤ 2 characters (so function words cannot
+inflate overlap):
+
+```
+T(x) = { t ∈ tokens(lower(x)) : t ∉ stopwords, |t| > 2 }
+```
+
+**Per-chunk lexical overlap** — ROUGE-1-recall-style set overlap: the fraction
+of the question's content tokens present in the chunk, in [0, 1] (defined as 0
+when `T(q)` is empty):
+
+```
+overlap(q, c) = |T(q) ∩ T(c)| / |T(q)|
+```
+
+**Grounding score and cosine subscore** over the retrieved set `R(q)`:
+
+```
+g(q)          = max_{c ∈ R(q)} overlap(q, c)        → retrieval_grounding_score
+cosine_top(q) = max_{c ∈ R(q)} clip(score_c, 0, 1)  → retrieval_cosine_top
+```
+
+Max, not mean: one genuinely relevant chunk is enough to ground an answer, so
+a strong hit shouldn't be diluted by weak siblings.
+
+**Bucket rule**, with `τ = GROUNDING_LOW_THRESHOLD` (0.2 in `config.py`):
+
+```
+bucket(q) = retrieval_missed   if g(q) < τ
+            abstained          if g(q) ≥ τ and the matcher abstained
+            committed          otherwise
+```
+
+`retrieval_missed` takes precedence over `abstained`: when retrieval failed,
+abstaining was the *right* response, so the item's failure belongs to
+retrieval, not to the model's grounding.
+
+**Per-bucket summary.** There are no gold labels in this pipeline, so instead
+of accuracy each bucket `b` reports:
+
+```
+n_b             = |{rows in b}|
+abstain_rate_b  = n_abstained_in_b / n_b
+mean_top_weight = mean over committed rows in b of max_k weights[k]
+```
+
+`mean_top_weight` is a proxy for how decisively the matcher graded the
+bucket's committed answers. The buckets separate *failure modes*, not
+correctness.
+
+**Design rationale.** The thresholded signal is *lexical*, not cosine: e5
+embeddings compress cosine into a narrow high band even for weak matches, so
+token overlap is the discriminative, interpretable signal; `cosine_top` is
+kept as an unthresholded diagnostic subscore. `τ` is a per-corpus heuristic,
+not a learned or label-calibrated parameter — tune it against the score
+histogram on the Hallucination tab.
+
+**Limitations.** Pure lexical overlap is blind to synonymy and paraphrase: a
+chunk that answers the question in different words can score low. That is
+exactly why `cosine_top` is retained (a low-`g`, high-cosine row hints at a
+paraphrased rather than missing match). And because `τ` is uncalibrated, the
+`retrieval_missed` bucket is a *flag for review*, not a verdict.
+
+**Basis in the literature.** The score is a composition of established
+metrics rather than a novel one; each design element has a direct precedent:
+
+- *The overlap formula* is a set-based variant of **ROUGE-1 recall**
+  (Lin, 2004): unigram recall of the question's content tokens against a
+  chunk, computed over deduplicated token *sets* rather than token counts.
+  Token-level overlap is likewise the standard lexical-match measure in
+  extractive QA evaluation (Rajpurkar et al., 2016).
+- *Using lexical overlap with retrieved text as a groundedness signal*
+  follows **Knowledge F1** (Shuster et al., 2021), which measures word
+  overlap between generated text and the retrieved knowledge to quantify
+  grounding vs. hallucination. (We use recall of the *question*, not F1 of
+  the answer, because the object audited here is retrieval coverage.)
+- *Stopword removal and bag-of-words lexical matching* are standard IR
+  preprocessing (Manning, Raghavan & Schütze, 2008).
+- *The `retrieval_missed` vs. model-failure split* mirrors the RAG
+  failure-point taxonomy of Barnett et al. (2024), whose first failure point
+  — **"Missing Content"** — is exactly this case: the retrieved documents do
+  not contain the answer, so whatever the model generates next is
+  unsupported. It also reflects the source-error vs. generation-error
+  distinction in the hallucination survey of Ji et al. (2023).
+- *Not thresholding the cosine* is motivated by embedding **anisotropy**:
+  contextual embedding vectors occupy a narrow cone, so even unrelated texts
+  receive high cosine similarity (Ethayarajh, 2019). The retriever's e5
+  model (Wang et al., 2022) shows this band compression on this corpus,
+  which is why cosine is retained only as a diagnostic subscore.
+
+**References**
+
+- Barnett, S., Kurniawan, S., Thudumu, S., Brannelly, Z., & Abdelrazek, M.
+  (2024). Seven Failure Points When Engineering a Retrieval Augmented
+  Generation System. *CAIN 2024*. <https://arxiv.org/abs/2401.05856>
+- Ethayarajh, K. (2019). How Contextual are Contextualized Word
+  Representations? Comparing the Geometry of BERT, ELMo, and GPT-2
+  Embeddings. *EMNLP 2019*. <https://aclanthology.org/D19-1006/>
+- Ji, Z., Lee, N., Frieske, R., Yu, T., Su, D., Xu, Y., Ishii, E., Bang, Y.,
+  Madotto, A., & Fung, P. (2023). Survey of Hallucination in Natural
+  Language Generation. *ACM Computing Surveys*, 55(12).
+  <https://arxiv.org/abs/2202.03629>
+- Lin, C.-Y. (2004). ROUGE: A Package for Automatic Evaluation of Summaries.
+  *Text Summarization Branches Out* (ACL Workshop).
+  <https://aclanthology.org/W04-1013/>
+- Manning, C. D., Raghavan, P., & Schütze, H. (2008). *Introduction to
+  Information Retrieval*. Cambridge University Press.
+- Rajpurkar, P., Zhang, J., Lopyrev, K., & Liang, P. (2016). SQuAD: 100,000+
+  Questions for Machine Comprehension of Text. *EMNLP 2016*.
+  <https://aclanthology.org/D16-1264/>
+- Shuster, K., Poff, S., Chen, M., Kiela, D., & Weston, J. (2021). Retrieval
+  Augmentation Reduces Hallucination in Conversation. *Findings of EMNLP
+  2021*. <https://aclanthology.org/2021.findings-emnlp.320/>
+- Wang, L., Yang, N., Huang, X., Jiao, B., Yang, L., Jiang, D., Majumder,
+  R., & Wei, F. (2022). Text Embeddings by Weakly-Supervised Contrastive
+  Pre-training. *arXiv:2212.03533*. <https://arxiv.org/abs/2212.03533>
+
+**Output fields** added to each per-question row: `retrieval_grounding_score`,
+`retrieval_cosine_top`, `grounding_bucket`.
+
+### 9.2 Quote verification (`il_rag/rag_qa.py`, `--quotes` on a run)
+
+The answer model must return, alongside its answer, the verbatim excerpt
+spans its conclusion rests on; each span is then re-checked **in code**. The
+model attests, the code audits — nothing the model says about its own quotes
+is trusted, and verification adds zero API calls beyond the answer call
+itself. The notation below (`norm(·)`, `verified(q)`, `Q`) is the same one
+used in the GUI's "How quotes are verified" expander and in `rag_qa.py`'s
+docstrings.
+
+**The contract.** The quote-mode prompt requires strict JSON:
+
+```
+{"answer": "...", "quotes": [{"excerpt": <i>, "quote": "<span>"}]}
+
+- 1 to 3 entries: the specific spans the conclusion rests on
+- each span "copied character-for-character from the numbered excerpt
+  it cites; never paraphrase inside a quote"
+- if the excerpts cannot answer, say so and return an empty quotes list
+```
+
+**Normalization.** Both the quote and every retrieved chunk are normalized
+before comparison — whitespace-tolerant and case-insensitive, but otherwise
+verbatim (punctuation is *not* stripped):
+
+```
+norm(s) = lowercase(collapse_ws(s))     collapse_ws: every whitespace run → " ", ends stripped
+```
+
+**Per-quote check.** A quote verifies iff its normalized form is non-empty
+and occurs as a substring (⊑) of *any* normalized retrieved chunk:
+
+```
+verified(q) = norm(q) ≠ "" ∧ ∃ c ∈ R : norm(q) ⊑ norm(c)
+```
+
+The cited excerpt index is persisted for display but deliberately **not**
+used for matching: the auditable claim is "this text is in the sources," not
+the model's index bookkeeping — a correct span with a wrong number is sloppy
+citing, not fabrication.
+
+**Row verdict.** The row's `quotes_verified` is a guarded conjunction over
+its quote set `Q`:
+
+```
+quotes_verified = |Q| > 0 ∧ ∀ q ∈ Q : verified(q)
+```
+
+The `|Q| > 0` guard exists because a conjunction over an empty set is
+vacuously true — an empty or unusable quote list is unverified *by
+definition*.
+
+**Edge cases.** If the model's JSON does not parse, the call is retried once
+at a doubled token budget (3072 → 6144, temperature 0); if it still fails,
+the raw text is kept as the answer with `quotes = []` and
+`quotes_verified = False` — the run degrades gracefully instead of dying,
+and the row stays auditable. Non-list `quotes` payloads are treated as
+empty; non-dict entries are skipped.
+
+**Design rationale.** *Any-excerpt* matching beats index-strict matching
+because the failure being hunted is fabricated text, not miscounted
+excerpts. Whitespace/case normalization absorbs the copying artifacts models
+actually produce, while keeping punctuation verbatim keeps the check strict
+on content. And the report separates **fabricated** (non-empty quote list,
+at least one span not in the sources) from **no quotes returned** (empty
+list — typically an honest abstention or a parse fallback): abstaining is
+not fabrication.
+
+**Limitations.** Verbatim substring matching cannot credit a
+paraphrased-but-faithful quote, so a failed quote means "not verbatim in the
+sources," which is not identical to "the answer is wrong" — the check errs
+toward false alarms, never toward missed fabrications. Conversely, a
+verified quote proves the span exists in the sources, not that the
+conclusion follows from it (this is attribution, not entailment). Unlike
+grounding's `τ`, there is no tunable constant: a span either occurs verbatim
+after normalization or it doesn't.
+
+**Basis in the literature.**
+
+- *Answering with verbatim quotes that are then mechanically verified
+  against the sources* follows **GopherCite** (Menick et al., 2022), where
+  supporting evidence is a quote checked to appear verbatim in the source
+  document. (GopherCite verifies exact strings; this check adds only
+  whitespace/case normalization.)
+- *The property being audited* is **Attributable to Identified Sources
+  (AIS)** as formalized by Rashkin et al. (2023) and operationalized for QA
+  by Bohnet et al. (2022): can the produced text be supported by the cited
+  source?
+- *Evaluating citation quality of LLM output* follows **ALCE** (Gao et al.,
+  2023), which measures whether generated citations actually support the
+  generated statements.
+- *Fabricated supporting evidence* is a recognized hallucination mode in the
+  survey of Ji et al. (2023) — see the reference in §9.1.
+
+**References**
+
+- Bohnet, B., Tran, V. Q., Verga, P., Aharoni, R., Andor, D., Baldini
+  Soares, L., Ciaramita, M., Eisenstein, J., Ganchev, K., Herzig, J., Hui,
+  K., Kwiatkowski, T., Ma, J., Ni, J., Sestorain Saralegui, L., Schuster,
+  T., Cohen, W. W., Collins, M., Das, D., Metzler, D., Petrov, S., &
+  Webster, K. (2022). Attributed Question Answering: Evaluation and
+  Modeling for Attributed Large Language Models. *arXiv:2212.08037*.
+  <https://arxiv.org/abs/2212.08037>
+- Gao, T., Yen, H., Yu, J., & Chen, D. (2023). Enabling Large Language
+  Models to Generate Text with Citations. *EMNLP 2023*.
+  <https://aclanthology.org/2023.emnlp-main.398/>
+- Menick, J., Trebacz, M., Mikulik, V., Aslanides, J., Song, F., Chadwick,
+  M., Glaese, M., Young, S., Campbell-Gillingham, L., Irving, G., &
+  McAleese, N. (2022). Teaching Language Models to Support Answers with
+  Verified Quotes. *arXiv:2203.11147*. <https://arxiv.org/abs/2203.11147>
+- Rashkin, H., Nikolaev, V., Lamm, M., Aroyo, L., Collins, M., Das, D.,
+  Petrov, S., Tomar, G. S., Turc, I., & Reitter, D. (2023). Measuring
+  Attribution in Natural Language Generation Models. *Computational
+  Linguistics*, 49(4). <https://aclanthology.org/2023.cl-4.2/>
+
+**Output fields** added to each per-question row: `quotes` (each entry
+`{"excerpt": int, "quote": str, "verified": bool}`) and `quotes_verified`
+(their guarded conjunction).
+
+### 9.3 Metamorphic label stability (`il_rag/metamorphic.py`, `scripts/03_run_metamorphic_eval.py`)
+
+There are no gold labels in this pipeline, so correctness cannot be checked
+directly. Instead this check tests an **invariance relation** — the
+metamorphic-testing move for the no-oracle setting: a label that is grounded
+in the text should survive a meaning-preserving rewrite of that text. The
+notation below (`label(v)`, `label₀`, `P_ok`, `θ`) is the same one used in
+the GUI's "How stability is computed" expander and in `metamorphic.py`'s
+docstrings.
+
+**The label.** Each item's label is the matcher's abstention, or else the
+top-weight logic; ties break deterministically by the fixed `LOGICS` order.
+Abstain is a first-class label — a paraphrase that abstains matches iff the
+original also abstained:
+
+```
+label(v) = "abstain"        if the matcher abstained
+           argmax_k w_k     otherwise   (ties → LOGICS order)
+```
+
+**The variants.** For each item of an existing run, the exact retrieved
+chunks are refetched by stored id and perturbed into:
+
+- `k = METAMORPHIC_PARAPHRASES` (3) **paraphrases** — one LLM call per
+  variant, under a strict preservation rule ("every fact, name, number,
+  date, and claim is preserved exactly while the wording and sentence
+  structure change substantially"), sampled at
+  `METAMORPHIC_PARAPHRASE_TEMPERATURE` (0.9) so the k variants differ;
+- one **lab-name swap** — a deterministic regex, no LLM:
+
+```
+swap(text) = re.sub(r"\b(alias₁|alias₂|…)\b", LAB_SWAP[org], text, IGNORECASE)
+```
+
+  Aliases are matched longest-first (so "Google DeepMind" is consumed whole),
+  word-boundaried ("OpenAIish" untouched), and the substitution is applied to
+  the chunks *and* the question. The swap map cycles
+  OpenAI → DeepMind → Anthropic → OpenAI (`LAB_SWAP` in `config.py`).
+
+**Re-running the production path.** Every variant flows through the same
+`answer_question` → `match_graded` pipeline as the original run, at
+temperature 0, on the same (perturbed) chunks — so a changed label is
+attributable to the text perturbation alone.
+
+**Stability score.** With `P_ok` the paraphrase variants that ran without
+error and `label₀` the original run's label:
+
+```
+label_stability = |{ v ∈ P_ok : label(v) = label₀ }| / |P_ok|    (None if P_ok empty)
+unstable        = label_stability < θ          θ = METAMORPHIC_STABILITY_THRESHOLD (1.0)
+swap_label_changed = label(swap) ≠ label₀      (on the error-free swap variant)
+```
+
+**Summary statistics** over the evaluated items:
+
+```
+mean_label_stability = mean of per-item stabilities (scored items only)
+pct_fully_stable     = share of scored items with label_stability ≥ 1.0
+swap_flip_rate       = n_swap_label_changed / n_swap_evaluated
+by_category          = mean stability per question category
+by_grounding_bucket  = mean stability per Feature-1 bucket (only when the
+                       source run carried grounding scores — the checks
+                       cross-validate each other)
+```
+
+**Edge cases.** A paraphrase whose JSON does not parse (or returns the wrong
+number of strings) is retried once at a larger token budget, then recorded
+as `error: "paraphrase_failed"`; rows whose chunks cannot be refetched are
+`"chunks_not_found"`; a lab without a swap target would be
+`"no_swap_target"`. **Failed variants are excluded from denominators, never
+counted as flips** — a parse failure is evidence of nothing about
+stability. Item sampling is deterministic per seed
+(`random.Random(seed).sample`), and the eval is resumable: completed
+error-free variants are kept, error rows are retried.
+
+**Design rationale.** Paraphrases are sampled at nonzero temperature so the
+k variants actually differ, while answering and matching stay at temperature
+0 like the production path — the *system under test* is unchanged, only the
+input moves. The swap is a regex precisely so that it cannot drift meaning:
+any label change under it isolates the effect of the lab's *name*. And
+`θ = 1.0` is the strictest default — any single paraphrase flip flags the
+item; the config comment says to relax it if paraphrase noise is high.
+
+**Interpretation.** A paraphrase flip and a swap flip mean different
+things: a paraphrase flip says the label is not robust to meaning-preserving
+rewording; a swap flip says the label changed when only the lab's *name*
+changed — evidence the model keys on its prior about the lab rather than on
+the text.
+
+**Limitations.** The check is *self-referential*: the same model generates
+the paraphrases and classifies them (see §16), so "meaning-preserving" is
+only as good as the model's own judgment — paraphrase fidelity is attested
+by the prompt, not verified, and flagged flips should be human-audited
+against `variants.jsonl` before the aggregates are read as evidence. At
+`k = 3`, per-item stability is coarse-grained (steps of 1/3).
+
+**Basis in the literature.**
+
+- *Testing output relations under input transformations when no oracle
+  exists* is **metamorphic testing** (Chen, Cheung & Yiu, 1998; surveyed by
+  Segura et al., 2016). This pipeline has no gold labels — exactly the
+  no-oracle setting the technique was built for.
+- *Label-preserving perturbations, including name substitutions,* follow the
+  **invariance tests** of CheckList (Ribeiro et al., 2020): replacing
+  surface forms that should not matter must not change the prediction.
+- *Prediction consistency under paraphrase* as a model-quality probe follows
+  Elazar et al. (2021).
+- *Metamorphic relations for LLM hallucination detection* follow **MetaQA**
+  (Yang et al., FSE 2025), which detects hallucinations via
+  paraphrase-based metamorphic relations without external resources.
+
+**References**
+
+- Chen, T. Y., Cheung, S. C., & Yiu, S. M. (1998). Metamorphic Testing: A
+  New Approach for Generating Next Test Cases. *Technical Report
+  HKUST-CS98-01*, Hong Kong University of Science and Technology.
+  <https://arxiv.org/abs/2002.12543>
+- Elazar, Y., Kassner, N., Ravfogel, S., Ravichander, A., Hovy, E.,
+  Schütze, H., & Goldberg, Y. (2021). Measuring and Improving Consistency
+  in Pretrained Language Models. *Transactions of the Association for
+  Computational Linguistics*, 9, 1012–1031.
+  <https://aclanthology.org/2021.tacl-1.60/>
+- Ribeiro, M. T., Wu, T., Guestrin, C., & Singh, S. (2020). Beyond
+  Accuracy: Behavioral Testing of NLP Models with CheckList. *ACL 2020*.
+  <https://aclanthology.org/2020.acl-main.442/>
+- Segura, S., Fraser, G., Sanchez, A. B., & Ruiz-Cortés, A. (2016). A
+  Survey on Metamorphic Testing. *IEEE Transactions on Software
+  Engineering*, 42(9), 805–824. <https://doi.org/10.1109/TSE.2016.2532875>
+- Yang, B., et al. (2025). Hallucination Detection in Large Language Models
+  with Metamorphic Relations (MetaQA). *FSE 2025*.
+  <https://conf.researchr.org/details/fse-2025/fse-2025-research-papers/48/Hallucination-Detection-in-Large-Language-Models-with-Metamorphic-Relations>
+
+**Output files**, inside the evaluated run's snapshot
+(`<run_dir>/metamorphic/`):
+
+- `variants.jsonl` — one row per variant (resumable audit trail):
+  `org, source_type, qid, category, variant, variant_kind
+  ("paraphrase" | "lab_swap"), variant_idx, original_label`, plus on success
+  `question, answer, abstain, weights, reasoning, label,
+  label_matches_original` (and `swap_to` for swaps), or on failure an
+  `error` field (`"paraphrase_failed" | "no_swap_target" |
+  "chunks_not_found"`).
+- `stability.json` — `{"summary": {...}, "per_item": [...]}`; each per-item
+  record carries `org, source_type, qid, category, original_label,
+  n_paraphrases, n_paraphrases_ok, label_stability, unstable, swap_to,
+  swap_label, swap_label_changed` (+ `grounding_bucket` when present).
+
+The remaining check:
+
 4. **Embedding agreement** (`il_rag/embedding_agreement.py`). A **non-LLM second
    judge**: embed each committed answer and the run's 7 reference answers for its
    category, rank the references by cosine similarity, and check whether the

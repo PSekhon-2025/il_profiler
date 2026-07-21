@@ -116,7 +116,7 @@ run at temperature 0.
 
 ## Hallucination & grounding checks (opt-in)
 
-Three additive checks, all black-box / API-only (no logits, weights, or
+Four additive checks, all black-box / API-only (no logits, weights, or
 attention — nothing the Together API doesn't expose). **All are off by
 default; a default run produces byte-identical output to before.**
 
@@ -137,9 +137,43 @@ three-way `grounding_bucket`:
 | `abstained` | retrieval looked plausible but the matcher abstained |
 | `committed` | retrieval looked plausible and the answer was graded into logic weights |
 
+**How the score is computed** (full derivation in ARCHITECTURE.md §9.1; the
+GUI's Hallucination tab has the same math in an expander):
+
+```
+T(x)          = content tokens of x: lowercased alphanumeric tokens,
+                minus stopwords, minus tokens ≤ 2 chars
+overlap(q, c) = |T(q) ∩ T(c)| / |T(q)|          per-chunk, in [0, 1]
+g(q)          = max over retrieved chunks c of overlap(q, c)
+
+bucket(q)     = retrieval_missed   if g(q) < τ
+                abstained          if g(q) ≥ τ and the matcher abstained
+                committed          otherwise
+```
+
+`τ = GROUNDING_LOW_THRESHOLD` (currently **0.2**, set in `il_rag/config.py` —
+a per-corpus heuristic, not a learned parameter). The max (not mean) over
+chunks means one genuinely relevant chunk is enough to ground an answer.
+
+*Worked example:* for the question "How does the lab describe its safety
+mission?", stopword/length filtering leaves the content tokens
+`{lab, describe, safety, mission}` (4 tokens; "how", "does", "the", "its" are
+stopwords). If the best retrieved chunk contains `lab`, `safety`, and
+`mission` but not `describe`, then `overlap = 3/4 = 0.75 ≥ 0.2` → the row is
+`committed` (or `abstained` if the matcher abstained). A chunk containing
+none of the four tokens would score `0/4 = 0 < 0.2` → `retrieval_missed`.
+
 The report adds a per-bucket breakdown (size, abstention rate, mean top-logic
 weight). There are no gold labels in this pipeline, so buckets separate
 *failure modes*, not accuracy.
+
+Literature basis: the score is a set-based variant of ROUGE-1 recall
+([Lin, 2004](https://aclanthology.org/W04-1013/)); its use as a groundedness
+signal follows Knowledge F1
+([Shuster et al., 2021](https://aclanthology.org/2021.findings-emnlp.320/));
+the bucketing mirrors the "Missing Content" failure point of
+[Barnett et al., 2024](https://arxiv.org/abs/2401.05856). Full reference list
+in ARCHITECTURE.md §9.1.
 
 ### 2. Quote-grounded answers — `--quotes`
 
@@ -154,6 +188,46 @@ as `quotes` (each with its own `verified` flag) and `quotes_verified`, so
 grounding is auditable per question. The answering model still never sees the
 logics taxonomy — quotes support the answer, never a logic choice. The
 free-form path is untouched when the flag is off.
+
+**How verification works** (full derivation in ARCHITECTURE.md §9.2; the
+GUI's Hallucination tab has the same logic in an expander):
+
+```
+norm(s)         = lowercase(collapse_ws(s))       whitespace-tolerant, case-
+                                                  insensitive, punctuation verbatim
+verified(q)     = norm(q) ≠ "" ∧ ∃ chunk c : norm(q) ⊑ norm(c)   (⊑ = substring)
+quotes_verified = |Q| > 0 ∧ ∀ q ∈ Q : verified(q)
+```
+
+The cited excerpt *number* is displayed but not used for matching — the
+auditable claim is "this text is in the sources," not the model's index
+bookkeeping. The `|Q| > 0` guard makes an empty quote list unverified by
+definition (a conjunction over an empty set would be vacuously true). There
+is no tunable threshold: a span either occurs verbatim after normalization
+or it doesn't.
+
+*Worked example:* if a chunk contains `"The  charter\ncommits to Broadly
+distributed benefits"`, the quoted span `"charter commits to broadly
+distributed benefits"` **verifies** (double space, newline, and capital B
+are absorbed by normalization), while `"the charter guarantees benefits"`
+**fails** — a paraphrase, not a verbatim span. (This is exactly the case
+pinned by `tests/test_rag_qa.py::test_quotes_verified_verbatim`.)
+
+The report distinguishes two failure shapes — abstaining is not fabrication:
+
+| report bucket | meaning |
+|---|---|
+| ❌ unverified quotes ("fabricated") | the model **did** cite quotes and at least one span is not in the sources — possible fabricated support |
+| ∅ no quotes returned | empty quote list — typically an honest abstention, or a JSON parse fallback (retried once at doubled tokens, then degraded with `quotes_verified = False`) |
+
+Literature basis: verbatim-quote support with mechanical verification
+follows GopherCite ([Menick et al., 2022](https://arxiv.org/abs/2203.11147));
+the audited property is Attribution to Identified Sources
+([Rashkin et al., 2023](https://aclanthology.org/2023.cl-4.2/);
+[Bohnet et al., 2022](https://arxiv.org/abs/2212.08037)); citation-quality
+evaluation follows ALCE
+([Gao et al., 2023](https://aclanthology.org/2023.emnlp-main.398/)). Full
+reference list in ARCHITECTURE.md §9.2.
 
 ### 3. Metamorphic label-stability eval — `scripts/03_run_metamorphic_eval.py`
 
@@ -178,6 +252,32 @@ compared with the original run's:
   grounded label should survive it too; a **flip** suggests the label was
   keyed on the model's prior about the named lab rather than on the text.
 
+**How the score is computed** (full derivation in ARCHITECTURE.md §9.3; the
+GUI's Hallucination tab has the same math in an expander):
+
+```
+label(v)        = "abstain" if the matcher abstained, else argmax_k w_k
+                  (ties break by the fixed LOGICS order; abstain is a label)
+label_stability = |{ v ∈ P_ok : label(v) = label₀ }| / |P_ok|
+                  P_ok = paraphrase variants that ran without error
+unstable        = label_stability < θ
+swap flip       = label(swap) ≠ label₀
+swap_flip_rate  = n_swap_label_changed / n_swap_evaluated
+```
+
+Failed variants (paraphrase parse failure, missing chunks) are excluded from
+denominators — never counted as flips. Config: `k` =
+`METAMORPHIC_PARAPHRASES` (3), `θ` = `METAMORPHIC_STABILITY_THRESHOLD`
+(1.0 — any single flip flags the item; relax if paraphrase noise is high),
+paraphrase temperature = `METAMORPHIC_PARAPHRASE_TEMPERATURE` (0.9, so the
+k variants differ; answering and matching stay at temperature 0).
+
+*Worked example* (the case pinned by
+`tests/test_metamorphic.py::test_compute_stability_paraphrases_and_swap`):
+an item labeled `State` gets 3 paraphrases; 2 keep the label, 1 flips →
+`label_stability = 2/3 ≈ 0.67 < θ = 1.0` → **unstable**. Its lab-swap
+variant comes back `Market` ≠ `State` → **swap flip**.
+
 Outputs land inside the evaluated run's snapshot
 (`data/profiles/runs/<run_id>/metamorphic/`): `variants.jsonl` (resumable
 audit trail) and `stability.json` (per-item records + aggregate summary,
@@ -191,6 +291,16 @@ bucket). The console report prints stability alongside the run's profiles.
 > that paraphrases genuinely preserve the decision content, and that flagged
 > flips aren't artifacts of a drifted paraphrase — before reading the
 > aggregate numbers as evidence.
+
+Literature basis: metamorphic testing for the no-oracle setting
+([Chen et al., 1998](https://arxiv.org/abs/2002.12543); survey:
+[Segura et al., 2016](https://doi.org/10.1109/TSE.2016.2532875));
+invariance tests under label-preserving perturbations incl. name swaps
+([Ribeiro et al., 2020](https://aclanthology.org/2020.acl-main.442/));
+consistency under paraphrase
+([Elazar et al., 2021](https://aclanthology.org/2021.tacl-1.60/)); MetaQA
+([Yang et al., FSE 2025](https://conf.researchr.org/details/fse-2025/fse-2025-research-papers/48/Hallucination-Detection-in-Large-Language-Models-with-Metamorphic-Relations)).
+Full reference list in ARCHITECTURE.md §9.3.
 
 ### 4. Embedding agreement — `scripts/04_run_embedding_agreement.py`
 
