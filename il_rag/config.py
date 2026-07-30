@@ -55,6 +55,38 @@ COLLECTION_NAME = "il_corpus"
 # in [0, 1]) falls below this are bucketed "retrieval_missed". Tune per corpus.
 GROUNDING_LOW_THRESHOLD = 0.2
 
+# Feature 5 (quote provenance & paraphrase grounding). Feature 2's verbatim
+# check has no tunable constant by design — a span either occurs after
+# normalization or it doesn't. The GRADED ladder built on top of it necessarily
+# does, because "close enough to be a copy" and "close enough to be a
+# paraphrase" are matters of degree. Feature 2's own verdict is untouched by
+# these; they only decide which non-verbatim tier a failed span lands in.
+#
+# Character-similarity ratio (difflib) above which a non-verbatim span counts as
+# a copy that drifted — curly quotes, an em-dash, a dropped comma — rather than
+# a rewrite. High by construction: this tier must not absorb real paraphrases.
+QUOTE_NEAR_VERBATIM_THRESHOLD = 0.90
+# Paraphrase tier. Lexical overlap is the PRIMARY signal for the same reason
+# grounding.py thresholds lexical rather than cosine: e5 compresses cosine into
+# a narrow high band, so a cosine cutoff is far less discriminative than it
+# looks. Measured on this stack against one passage: a faithful reword scored
+# 0.849 while a wholly unrelated claim about shareholder dividends scored
+# 0.807 — 0.04 apart. That band is too tight to gate on, so the cosine route is
+# deliberately set ABOVE both and fires only on near-identity.
+#
+# Being conservative here is close to free: a span that misses the paraphrase
+# tier is not lost, it falls through to `unsupported` and is then adjudicated
+# against the row's FULL evidence set. The threshold only decides which label a
+# grounded span earns (paraphrase_grounded vs misquote_but_true) and how wide
+# an evidence window the adjudicator sees — never whether it gets checked.
+# Both bars still want recalibrating against a real corpus run.
+QUOTE_PARAPHRASE_LEX_THRESHOLD = 0.55
+QUOTE_PARAPHRASE_COS_THRESHOLD = 0.90
+# Quoted prose fragments shorter than this are not treated as quote candidates:
+# one- and two-word quotations are overwhelmingly terms of art or scare quotes
+# ("alignment", "safety"), not claims about what a source says.
+QUOTE_MIN_SPAN_TOKENS = 3
+
 # Feature 3 (metamorphic label-stability eval).
 METAMORPHIC_PARAPHRASES = 3          # meaning-preserving paraphrases per item
 # label_stability below this flags an item unstable. 1.0 = any paraphrase that

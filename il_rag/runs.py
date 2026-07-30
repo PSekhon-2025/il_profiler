@@ -40,6 +40,12 @@ PROFILES_CSV_NAME = "profiles_matrix.csv"
 QUESTIONNAIRE_NAME = "questionnaire.json"
 META_NAME = "meta.json"
 
+# Feature 5 (quote provenance) writes into a subdirectory of the run, following
+# the metamorphic/ and embedding_agreement/ convention.
+QUOTE_PROVENANCE_DIR_NAME = "quote_provenance"
+QUOTE_SPANS_NAME = "spans.jsonl"
+QUOTE_SUMMARY_NAME = "summary.json"
+
 QUESTIONS_PER_ORG = len(CATEGORIES) * 3  # structural invariant (9 categories x 3)
 
 
@@ -59,6 +65,11 @@ def run_paths(run_id: str) -> dict[str, Path]:
         "profiles_csv": d / PROFILES_CSV_NAME,
         "questionnaire": d / QUESTIONNAIRE_NAME,
         "meta": d / META_NAME,
+        # Post-hoc check outputs (feature 5). Written by a separate stage over a
+        # finished run, so the directory may legitimately not exist.
+        "quote_provenance_dir": d / QUOTE_PROVENANCE_DIR_NAME,
+        "quote_spans": d / QUOTE_PROVENANCE_DIR_NAME / QUOTE_SPANS_NAME,
+        "quote_provenance_summary": d / QUOTE_PROVENANCE_DIR_NAME / QUOTE_SUMMARY_NAME,
     }
 
 

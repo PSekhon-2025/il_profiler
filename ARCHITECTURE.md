@@ -227,9 +227,14 @@ questionnaire that produced it**, and a `meta.json`.
 
 ## 9. Validation & hallucination checks
 
-All four are **opt-in and post-hoc** — a default run is byte-identical without
+All five are **opt-in and post-hoc** — a default run is byte-identical without
 them, and they operate on a saved run. They live on the GUI's **Hallucination**
-tab and as `scripts/03`–`04`.
+tab and as `scripts/03`–`04` and `scripts/06`.
+
+§9.5 is a refinement of §9.2 rather than an independent signal: §9.2 asks
+whether a quoted span is verbatim in the sources, §9.5 grades what a "no"
+actually means and adds an entailment axis. §9.5 reads §9.2's verdict and never
+rewrites it, so both can be reported side by side.
 
 ### 9.1 Retrieval grounding (`il_rag/grounding.py`, `--grounding` on a run)
 
@@ -437,6 +442,11 @@ conclusion follows from it (this is attribution, not entailment). Unlike
 grounding's `τ`, there is no tunable constant: a span either occurs verbatim
 after normalization or it doesn't.
 
+Both limitations are what **§9.5** exists to address: it grades the failed
+spans (drifted copy / paraphrase / figure of speech / fabrication) and adds
+the entailment axis this check lacks. §9.5 reads this check's verdict and
+never rewrites it, so the strict number above stays comparable across runs.
+
 **Basis in the literature.**
 
 - *Answering with verbatim quotes that are then mechanically verified
@@ -626,16 +636,222 @@ against `variants.jsonl` before the aggregates are read as evidence. At
   n_paraphrases, n_paraphrases_ok, label_stability, unstable, swap_to,
   swap_label, swap_label_changed` (+ `grounding_bucket` when present).
 
-The remaining check:
+### 9.4 Embedding agreement (`il_rag/embedding_agreement.py`, `scripts/04_run_embedding_agreement.py`)
 
-4. **Embedding agreement** (`il_rag/embedding_agreement.py`). A **non-LLM second
-   judge**: embed each committed answer and the run's 7 reference answers for its
-   category, rank the references by cosine similarity, and check whether the
-   nearest one's logic matches the LLM matcher's top logic. Deterministic.
-   *Interpretation:* absolute cosine values are not meaningful (e5 compresses
-   them into a narrow band); only the ranking and the agreement rate are. Low
-   agreement is a known property of whole-answer embeddings (topical vocabulary
-   dominates institutional stance), not evidence the matcher is wrong.
+A **non-LLM second judge**: embed each committed answer and the run's 7
+reference answers for its category, rank the references by cosine similarity,
+and check whether the nearest one's logic matches the LLM matcher's top logic.
+Deterministic. *Interpretation:* absolute cosine values are not meaningful (e5
+compresses them into a narrow band); only the ranking and the agreement rate
+are. Low agreement is a known property of whole-answer embeddings (topical
+vocabulary dominates institutional stance), not evidence the matcher is wrong.
+
+### 9.5 Quote provenance & paraphrase grounding (`il_rag/quote_provenance.py`, `scripts/06_run_quote_provenance.py`)
+
+§9.2 answers one question with one bit: is this span verbatim in the sources?
+Everything that is not a verbatim hit collapses into a single ❌, which
+conflates four different failures — a **copy that drifted** (a curly quote, an
+em-dash, an elided `…`), a **faithful paraphrase**, a **figure of speech**
+(scare quotes, terms of art, hypotheticals — quotation marks that never claimed
+anything about a source), and an actual **fabrication**. Only the last is a
+hallucination. This check separates them, and then asks a second question §9.2
+cannot ask at all:
+
+```
+PROVENANCE   does this TEXT exist in the sources?     (stages A-C, no LLM)
+VERACITY     is what it ASSERTS supported by them?    (stage D, one LLM call)
+```
+
+These are independent, so the verdict is a 2×2 rather than a line. Its most
+useful cell is `misquote_but_true`: the model manufactured a quotation, but the
+proposition underneath it does hold up against the evidence.
+
+This is a **post-hoc** stage over a saved run, like §9.3 and §9.4:
+`Retriever.get_by_ids` replays the exact evidence a row was answered from, so
+nothing in the answering path changes and thresholds can be retuned without
+re-running the profile pass. It reads §9.2's `quotes` and each row's `answer`,
+and **never rewrites §9.2's verdict**.
+
+**Stage A — extraction.** Candidates come from the model's structured `quotes`
+entries *and* from quotation marks in the answer prose. The prose spans matter
+for two reasons: §9.2 never audits them, and they are where the figures of
+speech live. Straight single quotes are deliberately not matched (apostrophes
+make them unparseable without a tokenizer); spans under
+`QUOTE_MIN_SPAN_TOKENS` content tokens are dropped, since one- and two-word
+quotations are overwhelmingly terms of art. A prose span duplicating a
+structured entry is counted once.
+
+**Stage B — intent triage** (no LLM). Deterministic cue rules over the ~70
+characters before the opening quote, in a fixed precedence:
+
+```
+counterfactual  ("a critic might say ...")   -> hypothetical
+reporting verb  ("the charter states ...")   -> attributive
+mention         ("so-called ...")            -> scare_quote
+example         ("for example, ...")         -> hypothetical
+shape           (< 4 content tokens, unpunctuated) -> term_of_art
+default                                      -> attributive, low confidence
+```
+
+The precedence is load-bearing: `might say` *contains* a reporting verb but
+attributes nothing, so the counterfactual rule must be tested first. The rule
+that fired is stored with the label, so every classification is inspectable
+rather than a black box. An unmatched span defaults to **attributive at low
+confidence** — wrongly auditing a scare quote is a false alarm a reviewer
+dismisses; wrongly excusing a fabricated quotation hides exactly what the check
+exists to find. Only attributive spans are graded.
+
+**Stage C — the provenance ladder** (no LLM). Cheapest-first; the first tier to
+clear its bar wins:
+
+```
+exact          norm(s) ⊑ norm(c)                                for some chunk c
+near_verbatim  strip(norm(s)) ⊑ strip(norm(c))
+               ∨ elided fragments occur in order
+               ∨ max_w ratio(s, w) ≥ τ_near
+paraphrase     overlap(s, c) ≥ τ_lex  ∨  max_w cos(s, w) ≥ τ_cos
+unsupported    nothing cleared a bar
+```
+
+where `strip` additionally removes punctuation (the one normalization §9.2
+deliberately refuses — it is what makes a smart-quote artifact stop looking
+like a rewrite), `ratio` is a character-similarity ratio over sliding windows,
+`overlap` is §9.1's `lexical_overlap`, and `w` ranges over 2-sentence windows
+of a chunk. The `exact` tier is **bit-identical to §9.2's predicate**, so every
+span §9.2 verifies lands in `exact`: this check only adds resolution below that
+line, never reinterprets above it.
+
+Ordering an elided quote's fragments is part of the check because `"A ... B"`
+claims that A precedes B in the source. Lexical overlap is the primary
+paraphrase signal rather than cosine, for §9.1's reason: e5 compresses cosine
+into a narrow high band. Measured on this stack against one passage, a faithful
+reword scored **0.849** while a wholly unrelated claim scored **0.807** — 0.04
+apart, far too tight to gate on, so `τ_cos` is set above both and fires only on
+near-identity.
+
+**Stage D — veracity** (LLM, flagged spans only). Spans reaching `paraphrase`
+or `unsupported` get one entailment call returning strict JSON:
+
+```
+{"support": "supported|partial|contradicted|not_addressed",
+ "evidence_sentence": "...", "grounded_fragment": "...", "reason": "..."}
+```
+
+The evidence window widens with the tier, because the question changes. A
+**paraphrase** is judged against the passage it aligned to — *did the model
+reword this faithfully?* An **unsupported** span aligned to nothing, so it is
+judged against the row's **entire** retrieved set — *the text is not there, but
+is the claim?* That widening is what makes `misquote_but_true` detectable at
+all. The adjudicator never sees the institutional-logics taxonomy, the same
+separation §9.2 and `rag_qa.py` insist on. A run whose quotes are all verbatim
+triggers **zero** generation calls and zero embedding calls.
+
+**Stage D′ — the verdict.** Derived by a pure function of
+`(tier, support, intent)` — no LLM in the derivation:
+
+| | content supported | content not supported |
+|---|---|---|
+| **text in sources** | `attributed` | `misattributed` |
+| **text not in sources** | `paraphrase_grounded` · `misquote_but_true` | `fabricated` |
+
+The bottom-left cell subdivides by how far the text drifted:
+`paraphrase_grounded` (the model reworded a real passage) is a much milder
+failure than `misquote_but_true` (the model manufactured a quotation whose
+content happens to hold), and collapsing them would hide that difference.
+`misattributed` requires entailment-checking spans that *did* match, which is
+opt-in (`--adjudicate-verbatim`) because it costs one call per verified span;
+by default a located span needs no adjudication and is `attributed`.
+
+**Row verdict.** Over a row's attributive spans `A`:
+
+```
+quotes_grounded    = |A| > 0 ∧ ∀ s ∈ A : verdict(s) ∈ {attributed, paraphrase_grounded}
+quotes_fabricated  = ∃ s ∈ A : verdict(s) = fabricated
+quotes_misquoted   = ∃ s ∈ A : verdict(s) ∈ {misquote_but_true, misattributed}
+```
+
+`quotes_grounded` carries the same `|A| > 0` guard as §9.2's
+`quotes_verified`, and for the same reason: a conjunction over an empty set is
+vacuously true, and a row that cited nothing has grounded nothing. Fabricated
+and misquoted are not mutually exclusive across a multi-span row — a row can
+both invent one span and half-rescue another.
+
+**Edge cases.** A row whose `retrieved_ids` are no longer in the index (e.g.
+after a `--fresh` reingest) cannot be audited at all; it is counted in
+`n_rows_without_evidence` and skipped rather than silently scored zero. An
+unrecognized or missing support label degrades to `not_addressed` — the neutral
+option — so a malformed reply can never manufacture a `supported` or a
+`contradicted` verdict. Adjudicator JSON that does not parse retries once at a
+doubled budget (1024 → 2048), then degrades to `not_addressed`.
+
+**Design rationale.** *§9.2 is read, never rewritten*, so runs from before this
+check stay directly comparable with runs after it and both numbers can be
+reported side by side. *Post-hoc* means being wrong is cheap: thresholds retune
+for the cost of the flagged spans alone. *A conservative tier boundary is
+nearly free*, because a span that misses the paraphrase bar is not lost — it
+falls through to `unsupported` and is then adjudicated against the full
+evidence set. The threshold decides which label a grounded span earns, never
+whether it gets checked. Unlike §9.2, this check necessarily *has* tunable
+constants: "close enough to be a copy" and "close enough to be a paraphrase"
+are matters of degree.
+
+**Limitations.** The evidence is scoped by `(org, source_type)` and this
+pipeline has **no world-knowledge oracle** by design — the answerer only ever
+sees the corpus. So `unsupported` means *unsupported by this lab's scoped
+corpus*, **not** *false in the world*. A claim can be true and still land there
+because the corpus is silent on it, which is precisely why `not_addressed` is a
+separate label from `contradicted`: **only `contradicted` is evidence against a
+span**. Beyond that, the intent rules are English cue patterns, not a parser,
+and will miss unusual phrasings (they fail toward auditing, so the cost is
+false alarms rather than missed fabrications); and the entailment judge is the
+same model family being audited, so it is a consistency check, not an
+independent oracle. The paraphrase thresholds still want calibrating against a
+real corpus run.
+
+**Basis in the literature.**
+
+- *Separating attribution from correctness* — that a span can be attributable
+  without being correct, and correct without being attributable — is the
+  distinction formalized as **AIS** by Rashkin et al. (2023) and
+  operationalized for QA by Bohnet et al. (2022) (both cited in §9.2). The 2×2
+  above is that distinction made into a verdict.
+- *Scoring a claim against retrieved evidence rather than against its surface
+  string* follows **FActScore** (Min et al., 2023), which decomposes generated
+  text into atomic claims and scores each for support against a knowledge
+  source.
+- *Verified quoting* remains **GopherCite** (Menick et al., 2022) and
+  *citation-quality evaluation* remains **ALCE** (Gao et al., 2023), both cited
+  in §9.2; this check grades the failures those methods reject wholesale.
+
+**References** (see §9.2 for Bohnet et al., Gao et al., Menick et al., and
+Rashkin et al.)
+
+- Lin, C.-Y. (2004). ROUGE: A Package for Automatic Evaluation of Summaries.
+  *Text Summarization Branches Out*. <https://aclanthology.org/W04-1013/>
+  (the lexical-overlap signal reused from §9.1)
+- Min, S., Krishna, K., Lyu, X., Lewis, M., Yih, W., Koh, P. W., Iyyer, M.,
+  Zettlemoyer, L., & Hajishirzi, H. (2023). FActScore: Fine-grained Atomic
+  Evaluation of Factual Precision in Long Form Text Generation. *EMNLP 2023*.
+  <https://aclanthology.org/2023.emnlp-main.741/>
+
+**Output files**, inside the evaluated run's snapshot
+(`<run_dir>/quote_provenance/`):
+
+- `spans.jsonl` — one record per candidate span: `org, source_type, qid,
+  category, quote, source ("quotes_field" | "answer_prose"), excerpt,
+  verbatim_verified` (§9.2's bit for the same span, carried through
+  unchanged), `intent, intent_rule, intent_confidence, match_tier, match_rule,
+  match_score, best_chunk_id, best_span, support, evidence_sentence,
+  grounded_fragment, support_reason, verdict`.
+- `summary.json` — `overall` / `by_category` / `by_org_source` slices, each
+  with tier and verdict histograms plus `paraphrase_rescue_rate`,
+  `true_fabrication_rate`, `misquote_but_true_rate`, `contradicted_rate`,
+  `non_attributive_rate`; also an `intents` histogram, per-row verdicts, and
+  `n_rows_without_evidence`.
+
+**Config** (`il_rag/config.py`): `QUOTE_NEAR_VERBATIM_THRESHOLD`,
+`QUOTE_PARAPHRASE_LEX_THRESHOLD`, `QUOTE_PARAPHRASE_COS_THRESHOLD`,
+`QUOTE_MIN_SPAN_TOKENS`.
 
 ---
 
@@ -746,11 +962,13 @@ il_rag/
   grounding.py           (check) retrieval-grounding buckets
   metamorphic.py         (check) paraphrase + lab-swap label stability
   embedding_agreement.py (check) non-LLM second judge
+  quote_provenance.py    (check) graded quote provenance x veracity
   bootstrap_ci.py        confidence intervals over the profiles
   json_utils.py, llm.py  shared JSON extraction; Together chat/embed wrappers
 scripts/
   01_ingest.py  02_run_profiles.py  03_run_metamorphic_eval.py
   04_run_embedding_agreement.py  05_run_bootstrap_ci.py
+  06_run_quote_provenance.py
 app.py                   Streamlit GUI (Run / Results / Audit / Hallucination / Compare)
 tests/                   offline unit tests
 Dockerfile, fly.toml, DEPLOY.md   deployment
@@ -773,6 +991,11 @@ Dockerfile, fly.toml, DEPLOY.md   deployment
   `thirdparty` side — a finding, not a bug.
 - **LLM grading is the classifier.** There is no gold-labeled ground truth; the
   reference answers *are* the standard, so results are only as good as they are.
+- **"Unsupported" is not "false."** Every check reasons only over the
+  `(lab, source_type)`-scoped corpus; there is no world-knowledge oracle here by
+  design. So §9.5's `unsupported` means *this corpus does not support it*, not
+  *it is untrue* — a true claim the corpus is simply silent on lands there. Only
+  the `contradicted` label is evidence against a span.
 - **Copyright.** The third-party corpus is licensed news content — keep any
   deployment private/gated.
 ```
