@@ -204,10 +204,20 @@ def run_embedding_agreement(run_id: str | None = None) -> dict:
 
     # ---- summary ----
     def _rate(items: list[dict]) -> dict:
+        """Binary agreement rate plus the graded means for one slice, so every
+        breakdown (overall / by category / by lab-source) reports both views."""
         n = len(items)
         agree = sum(r["agree"] for r in items)
-        return {"n": n, "agree": agree,
-                "rate": round(agree / n, 4) if n else None}
+        out = {"n": n, "agree": agree,
+               "rate": round(agree / n, 4) if n else None}
+        if n:
+            out["mean_share_on_matcher_top"] = round(
+                sum(r["share_on_matcher_top"] for r in items) / n, 4)
+            out["mean_overlap"] = round(
+                sum(r["overlap"] for r in items) / n, 4)
+            out["mean_overlap_uniform_baseline"] = round(
+                sum(r["overlap_uniform_baseline"] for r in items) / n, 4)
+        return out
 
     by_category = {c: _rate([r for r in per_row if r["category"] == c])
                    for c in sorted({r["category"] for r in per_row})}
@@ -248,9 +258,16 @@ def run_embedding_agreement(run_id: str | None = None) -> dict:
           f"(chance {summary['share_chance_baseline']:.3f})")
     print(f"mean distribution overlap: {summary['mean_overlap']:.3f} "
           f"(uniform baseline {summary['mean_overlap_uniform_baseline']:.3f})")
-    print("by category (binary):")
+    print("by category (binary | closeness share | overlap):")
     for cat, s in by_category.items():
-        print(f"  {cat:<24} {s['agree']:>3}/{s['n']:<3} ({s['rate']:.0%})")
+        print(f"  {cat:<24} {s['agree']:>3}/{s['n']:<3} ({s['rate']:.0%})  "
+              f"share {s['mean_share_on_matcher_top']:.3f}  "
+              f"overlap {s['mean_overlap']:.3f}")
+    print("by lab/source (binary | share | overlap):")
+    for key, s in by_pair.items():
+        print(f"  {key:<22} {s['agree']:>3}/{s['n']:<3} ({s['rate']:.0%})  "
+              f"share {s['mean_share_on_matcher_top']:.3f}  "
+              f"overlap {s['mean_overlap']:.3f}")
     print(f"mean top1-top2 margin: {summary['mean_margin']}")
     print(f"outputs: {out_dir}")
     return summary

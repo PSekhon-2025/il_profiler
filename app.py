@@ -1632,27 +1632,54 @@ with tab_halluc:
                          "matcher's weights (1 = identical); compare against "
                          "what a totally uninformative judge would score")
 
-            cat_rows = [{"category": c, "rate": v["rate"], "n": v["n"]}
+            cat_rows = [{"category": c, "rate": v["rate"], "n": v["n"],
+                         "share": v.get("mean_share_on_matcher_top"),
+                         "overlap": v.get("mean_overlap")}
                         for c, v in emb.get("by_category", {}).items()
                         if v.get("rate") is not None]
             if cat_rows:
                 edf = pd.DataFrame(cat_rows)
+                # Older summaries lack the graded per-category means; only
+                # offer the metrics the file actually carries.
+                metric_opts = {"binary agreement rate": ("rate", None)}
+                if edf["share"].notna().all():
+                    metric_opts["closeness share on matcher's pick"] = (
+                        "share", emb.get("share_chance_baseline", 1 / 7))
+                if edf["overlap"].notna().all():
+                    metric_opts["distribution overlap"] = ("overlap", None)
+                sel_metric = st.radio(
+                    "Per-category metric", list(metric_opts),
+                    horizontal=True, key="emb_cat_metric",
+                    help="Binary = strict argmax match. Closeness share and "
+                         "overlap are the graded (ratio) views; the dashed "
+                         "rule marks the chance baseline where applicable.")
+                field, baseline = metric_opts[sel_metric]
                 emb_chart = (
                     alt.Chart(edf)
                     .mark_bar()
                     .encode(
-                        x=alt.X("rate:Q", title="agreement rate",
+                        x=alt.X(f"{field}:Q", title=sel_metric,
                                 scale=alt.Scale(domain=[0, 1])),
                         y=alt.Y("category:N", title=None,
                                 sort=[c for c in CATEGORIES]),
-                        color=alt.Color("rate:Q", legend=None,
+                        color=alt.Color(f"{field}:Q", legend=None,
                                         scale=alt.Scale(scheme="redyellowgreen",
                                                         domain=[0, 1])),
                         tooltip=["category",
-                                 alt.Tooltip("rate:Q", format=".2f"), "n"],
+                                 alt.Tooltip("rate:Q", format=".2f",
+                                             title="binary rate"),
+                                 alt.Tooltip("share:Q", format=".3f",
+                                             title="closeness share"),
+                                 alt.Tooltip("overlap:Q", format=".3f"),
+                                 "n"],
                     )
                     .properties(height=220)
                 )
+                if baseline:
+                    rule = (alt.Chart(pd.DataFrame({"x": [baseline]}))
+                            .mark_rule(strokeDash=[4, 3], color="#666")
+                            .encode(x="x:Q"))
+                    emb_chart = emb_chart + rule
                 st.altair_chart(emb_chart, width="stretch")
 
             erows = load_embedding_rows(hal_run)
