@@ -15,10 +15,12 @@ Areas:
                   check, downloads.
   Audit         — browse every question's RAG answer, graded weights, matcher
                   reasoning, and (when enabled) quotes + grounding bucket.
-  Hallucination — the four opt-in checks for any saved run: retrieval-
-                  grounding buckets, quote verification, and the metamorphic
-                  label-stability eval (launchable from here), with alert
-                  banners when a detection fires.
+  Hallucination — the five opt-in checks for any saved run: retrieval-
+                  grounding buckets, quote verification, quote provenance
+                  (grading WHY a quote failed, and whether its content is
+                  true anyway), and the metamorphic label-stability eval
+                  (launchable from here), with alert banners when a
+                  detection fires.
   Compare       — diff two run snapshots.
 """
 import io
@@ -46,6 +48,10 @@ from il_rag.config import (
     METAMORPHIC_PARAPHRASE_TEMPERATURE,
     METAMORPHIC_STABILITY_THRESHOLD,
     ORGS,
+    QUOTE_MIN_SPAN_TOKENS,
+    QUOTE_NEAR_VERBATIM_THRESHOLD,
+    QUOTE_PARAPHRASE_COS_THRESHOLD,
+    QUOTE_PARAPHRASE_LEX_THRESHOLD,
     SOURCE_TYPES,
 )
 from il_rag.questionnaire import CATEGORIES, LOGICS
@@ -258,6 +264,35 @@ def load_embedding_rows(run_id: str | None) -> pd.DataFrame | None:
     return pd.DataFrame(rows) if rows else None
 
 
+def load_quote_provenance(run_id: str | None) -> dict | None:
+    """The quote-provenance summary for a run, if the stage has run."""
+    if not run_id:
+        return None
+    path = runs.run_paths(run_id)["quote_provenance_summary"]
+    if not path.exists():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def load_quote_spans(run_id: str | None) -> pd.DataFrame | None:
+    """Per-span provenance records for a run, if the stage has run."""
+    if not run_id:
+        return None
+    path = runs.run_paths(run_id)["quote_spans"]
+    if not path.exists():
+        return None
+    rows = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    return pd.DataFrame(rows) if rows else None
+
+
 # ---------------------------------------------------------------------------
 # Hallucination export: one "decision + underlying data" table per check
 # ---------------------------------------------------------------------------
@@ -269,6 +304,19 @@ def _series(df: pd.DataFrame, name: str) -> pd.Series:
     if name in df.columns:
         return df[name]
     return pd.Series([None] * len(df), index=df.index, dtype="object")
+
+
+def _present(v) -> str | None:
+    """The value as display text, or None if it is absent.
+
+    Pandas turns a JSON null into NaN, which is TRUTHY — a bare `if row[col]`
+    therefore renders the literal string "nan" into the page. Optional fields
+    (an unaligned span, an empty grounded fragment) must go through this.
+    """
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return None
+    s = str(v).strip()
+    return s if s and s.lower() != "nan" else None
 
 
 def _top_logic(weights) -> tuple:
@@ -329,6 +377,36 @@ def build_quotes_exports(dfh: pd.DataFrame):
                 "decision_span_verified": qq.get("verified"),
             })
     return pd.DataFrame(rows), (pd.DataFrame(spans) if spans else None)
+
+
+def build_quote_provenance_export(spans: pd.DataFrame | None) -> pd.DataFrame | None:
+    """Check 5 — per span: the graded verdict beside BOTH axes that produced it.
+
+    Feature 2's own bit for the same span travels in `verbatim_verified`, so a
+    reader can see exactly which spans the graded check reclassified and why.
+    """
+    if spans is None or spans.empty:
+        return None
+    s = spans.copy()
+    return pd.DataFrame({
+        "org": s["org"], "source_type": s["source_type"], "qid": s["qid"],
+        "category": _series(s, "category"),
+        "quote": s["quote"], "span_source": s["source"],
+        "feature2_verbatim_verified": _series(s, "verbatim_verified"),
+        "decision_intent": s["intent"],
+        "intent_rule": _series(s, "intent_rule"),
+        "intent_confidence": _series(s, "intent_confidence"),
+        "decision_match_tier": s["match_tier"],
+        "match_rule": _series(s, "match_rule"),
+        "match_score": _series(s, "match_score"),
+        "decision_support": _series(s, "support"),
+        "grounded_fragment": _series(s, "grounded_fragment"),
+        "evidence_sentence": _series(s, "evidence_sentence"),
+        "support_reason": _series(s, "support_reason"),
+        "decision_verdict": s["verdict"],
+        "best_chunk_id": _series(s, "best_chunk_id"),
+        "best_span": _series(s, "best_span"),
+    })
 
 
 def build_metamorphic_exports(stab: dict | None, variants: pd.DataFrame | None):
@@ -402,6 +480,11 @@ def build_detection_bundle(run_id: str, dfh: pd.DataFrame,
             members.append(("2_quote_verification_spans.csv", csv_bytes(q_spans)))
         ran.append("quote verification")
 
+    qp_spans = build_quote_provenance_export(load_quote_spans(run_id))
+    if qp_spans is not None:
+        members.append(("2b_quote_provenance.csv", csv_bytes(qp_spans)))
+        ran.append("quote provenance")
+
     mm_items, mm_var = build_metamorphic_exports(stab, load_variants(run_id))
     if mm_items is not None:
         members.append(("3_metamorphic_items.csv", csv_bytes(mm_items)))
@@ -419,7 +502,8 @@ def build_detection_bundle(run_id: str, dfh: pd.DataFrame,
     for rel in ("per_question.jsonl", "meta.json",
                 "metamorphic/stability.json", "metamorphic/variants.jsonl",
                 "embedding_agreement/summary.json",
-                "embedding_agreement/similarities.jsonl"):
+                "embedding_agreement/similarities.jsonl",
+                "quote_provenance/summary.json", "quote_provenance/spans.jsonl"):
         p = rd / rel
         if p.exists():
             members.append((f"raw/{rel}", p.read_bytes()))
@@ -451,6 +535,14 @@ def _bundle_readme(run_id: str, ran: list[str]) -> str:
         "(verified / unverified / no_quotes) + the cited spans.\n"
         "2_quote_verification_spans.csv   per cited span: whether that exact "
         "span was found verbatim in the retrieved sources.\n"
+        "2b_quote_provenance.csv          per quoted span, GRADED: intent "
+        "(is it even a claim about a source?), provenance tier (verbatim /\n"
+        "                                 drifted copy / paraphrase / absent), "
+        "entailment support, and the combined verdict. Includes\n"
+        "                                 feature2_verbatim_verified so you can "
+        "see which spans the graded check reclassified, and why.\n"
+        "                                 Note: 'unsupported' means unsupported "
+        "BY THIS SCOPED CORPUS, not false in the world.\n"
         "3_metamorphic_items.csv          per item: unstable + swap-flip "
         "decisions with label_stability and the original/swapped labels.\n"
         f"                                 Stability threshold theta = "
@@ -465,7 +557,7 @@ def _bundle_readme(run_id: str, ran: list[str]) -> str:
         "tables are derived from (per_question.jsonl, meta.json, and any\n"
         "                                 metamorphic / embedding outputs).\n\n"
         "Only checks that have actually run for this snapshot appear above.\n"
-        "See ARCHITECTURE.md sections 9.1-9.4 for the full method of each check.\n"
+        "See ARCHITECTURE.md sections 9.1-9.5 for the full method of each check.\n"
     )
 
 
@@ -931,22 +1023,26 @@ with tab_audit:
                 st.caption("retrieved: " + ", ".join(row["retrieved_ids"][:5]))
 
 # ---------------------------------------------------------------------------
-# Hallucination tab — the four opt-in checks, with alerts when one fires
+# Hallucination tab — the five opt-in checks, with alerts when one fires
 # ---------------------------------------------------------------------------
 with tab_halluc:
     st.header("Hallucination & grounding checks")
     st.caption(
-        "Four black-box checks: **retrieval grounding** (was there relevant "
+        "Five black-box checks: **retrieval grounding** (was there relevant "
         "text to answer from?), **quote verification** (does the cited support "
-        "actually appear in the sources?), **metamorphic stability** (does "
-        "the label survive paraphrase and a lab-name swap?), and **embedding "
-        "agreement** (does a non-LLM judge rank the same reference nearest?)."
+        "actually appear in the sources?), **quote provenance** (if it doesn't, "
+        "is it a paraphrase, a figure of speech, or a fabrication — and is its "
+        "content true anyway?), **metamorphic stability** (does the label "
+        "survive paraphrase and a lab-name swap?), and **embedding agreement** "
+        "(does a non-LLM judge rank the same reference nearest?)."
     )
     hal_run = run_selectbox("Run to inspect", key="halluc_run",
                             default_run_id=runs.get_current())
     dfh = load_per_question(hal_run)
     stab = load_stability(hal_run)
     emb = load_embedding_summary(hal_run)
+    prov = load_quote_provenance(hal_run)
+    prov_spans = load_quote_spans(hal_run)
 
     if dfh is None or dfh.empty:
         st.info("No per-question results yet — run the pipeline on the **Run** "
@@ -985,6 +1081,28 @@ with tab_halluc:
                            f"❌ **Unverified quotes** on {len(fab_rows)} answer(s): "
                            f"cited spans do not appear verbatim in the retrieved "
                            f"sources — possible fabricated support. See section 2."))
+        if prov:
+            po = prov["overall"]
+            n_fab = po["verdicts"].get("fabricated", 0)
+            n_misq = po["verdicts"].get("misquote_but_true", 0)
+            if n_fab:
+                alerts.append(("error",
+                               f"🚨 **{n_fab} genuinely fabricated span(s)**: not in "
+                               f"the sources, and the evidence does not support what "
+                               f"they assert either. This is the number to act on — "
+                               f"it is what survives after paraphrases and figures of "
+                               f"speech are separated out. See section 2b."))
+            if n_misq:
+                alerts.append(("warning",
+                               f"📎 **{n_misq} misquotation(s) with sound content**: "
+                               f"the quotation was manufactured, but what it claims "
+                               f"IS carried by the evidence — a citation-integrity "
+                               f"failure, not a factual one. See section 2b."))
+            if not n_fab and not n_misq and po["n_attributive"]:
+                alerts.append(("success",
+                               "✅ **No fabricated spans**: every attributive "
+                               "quotation is either in the sources or a grounded "
+                               "paraphrase of them. See section 2b."))
         if stab:
             s = stab["summary"]
             if s.get("n_unstable"):
@@ -1005,11 +1123,11 @@ with tab_halluc:
                            f"({emb['overall']['rate']:.0%}): the non-LLM judge "
                            f"often ranks a different logic's reference nearest "
                            f"than the matcher's top pick. See section 4."))
-        if not (has_grounding or has_quotes or stab or emb):
+        if not (has_grounding or has_quotes or stab or emb or prov):
             st.info("None of the checks have run for this snapshot yet. Enable "
                     "**--grounding** / **--quotes** on the Run tab for the next "
-                    "run, or launch the metamorphic eval / embedding agreement "
-                    "below (both work on any existing run).")
+                    "run, or launch the metamorphic eval / embedding agreement / "
+                    "quote provenance below (all three work on any existing run).")
         elif alerts:
             for kind, msg in alerts:
                 getattr(st, kind)(msg)
@@ -1301,6 +1419,335 @@ with tab_halluc:
             else:
                 st.caption("Every quoted span was found verbatim in its retrieved "
                            "sources.")
+
+        # ------- 2b · Quote provenance & paraphrase grounding -------
+        st.subheader("2b · Quote provenance & paraphrase grounding")
+        st.caption(
+            "Section 2 answers one question with one bit: is this span verbatim "
+            "in the sources? This section grades **how** each quoted span "
+            "relates to them, separates quotation marks that never claimed "
+            "anything about a source, and asks whether a span's **content** "
+            "holds up even when the span itself does not."
+        )
+        with st.expander("ℹ️ How quote provenance is computed", expanded=False):
+            st.markdown(
+                "A single ❌ in section 2 conflates four different things: a "
+                "**copy that drifted** (curly quotes, an em-dash, an elided "
+                "`…`), a **faithful paraphrase**, a **figure of speech** "
+                "(scare quotes, terms of art, hypotheticals — quotation marks "
+                "that never claimed anything about a source), and an actual "
+                "**fabrication**. Only the last is a hallucination."
+            )
+            st.markdown(
+                "**Step 1 — extraction.** Candidates come from the model's "
+                "structured `quotes` entries *and* from quotation marks in the "
+                "answer prose. The prose spans matter: they are unaudited by "
+                "section 2, and they are where the figures of speech live. "
+                f"Spans under {QUOTE_MIN_SPAN_TOKENS} content tokens are "
+                "dropped as noise."
+            )
+            st.markdown(
+                "**Step 2 — intent triage (no LLM).** Deterministic cue rules "
+                "over the ~70 characters before the opening quote, in a fixed "
+                "precedence: *counterfactual* (`a critic might say …`) → "
+                "*reporting verb* (`the charter states …`) → *mention* "
+                "(`so-called …`) → *example* → *shape* → default. The rule that "
+                "fired is stored with the label, so every classification is "
+                "inspectable. An unmatched span defaults to **attributive at "
+                "low confidence** — wrongly auditing a scare quote is a false "
+                "alarm you can dismiss, wrongly excusing a fabricated quotation "
+                "hides what the check exists to find."
+            )
+            st.markdown(
+                "**Step 3 — the provenance ladder (no LLM).** Cheapest-first; "
+                "the first tier to clear its bar wins:"
+            )
+            st.latex(
+                r"\begin{aligned}"
+                r"\textbf{exact}&:\ \mathrm{norm}(s)\sqsubseteq\mathrm{norm}(c)\\[2pt]"
+                r"\textbf{near\_verbatim}&:\ \mathrm{strip}(\mathrm{norm}(s))"
+                r"\sqsubseteq\mathrm{strip}(\mathrm{norm}(c))\\"
+                r"&\ \ \vee\ \text{elided fragments in order}\\"
+                r"&\ \ \vee\ \textstyle\max_w \mathrm{ratio}(s,w)\geq"
+                r"\tau_{\text{near}}\\[2pt]"
+                r"\textbf{paraphrase}&:\ \mathrm{overlap}(s,c)\geq"
+                r"\tau_{\text{lex}}\ \vee\ \textstyle\max_w\cos(s,w)\geq"
+                r"\tau_{\text{cos}}\\[2pt]"
+                r"\textbf{unsupported}&:\ \text{nothing cleared a bar}"
+                r"\end{aligned}"
+            )
+            st.markdown(
+                f"with $\\tau_{{\\text{{near}}}} = {QUOTE_NEAR_VERBATIM_THRESHOLD}$, "
+                f"$\\tau_{{\\text{{lex}}}} = {QUOTE_PARAPHRASE_LEX_THRESHOLD}$, "
+                f"$\\tau_{{\\text{{cos}}}} = {QUOTE_PARAPHRASE_COS_THRESHOLD}$. "
+                "The `exact` tier is bit-identical to section 2's predicate, so "
+                "**every span section 2 verifies lands in `exact`** — this "
+                "check only ever adds resolution below that line, never "
+                "reinterprets above it. Lexical overlap is the primary "
+                "paraphrase signal rather than cosine, for the same reason "
+                "section 1 thresholds lexical: e5 compresses cosine into a "
+                "narrow high band (measured here: a faithful reword scored "
+                "0.849, a wholly unrelated claim 0.807 — 0.04 apart), so a "
+                "cosine gate is far less discriminative than it looks."
+            )
+            st.markdown(
+                "**Step 4 — veracity (LLM, flagged spans only).** Provenance "
+                "asks *does this text exist in the sources?*; veracity asks "
+                "*is what it asserts supported by them?* Spans reaching the "
+                "paraphrase or unsupported tier get one entailment call "
+                "returning `supported` / `partial` / `contradicted` / "
+                "`not_addressed`, plus the fragment of the span the evidence "
+                "does carry. The evidence window widens with the tier: a "
+                "**paraphrase** is judged against the passage it aligned to "
+                "(*did the model reword this faithfully?*), an **unsupported** "
+                "span against the row's entire retrieved set (*the text isn't "
+                "there, but is the claim?*). A run whose quotes are all "
+                "verbatim costs **zero** LLM calls."
+            )
+            st.markdown(
+                "**Step 5 — the verdict.** The two axes are independent, so "
+                "the verdict is a 2×2 derived in pure code — no LLM in the "
+                "derivation:"
+            )
+            st.markdown(
+                "| | content supported | content not supported |\n"
+                "|---|---|---|\n"
+                "| **text in sources** | `attributed` | `misattributed` |\n"
+                "| **text not in sources** | `paraphrase_grounded` · "
+                "`misquote_but_true` | `fabricated` |\n"
+            )
+            st.markdown(
+                "The bottom-left cell is the point of the whole section: a "
+                "span that is not in the sources **as text** can still assert "
+                "something the sources support. It splits by how far the text "
+                "drifted — `paraphrase_grounded` (the model reworded a real "
+                "passage) is a much milder failure than `misquote_but_true` "
+                "(the model manufactured a quotation whose content happens to "
+                "hold). `misattributed` requires entailment-checking spans "
+                "that *did* match, which is opt-in "
+                "(`--adjudicate-verbatim`) because it costs one call per "
+                "verified span."
+            )
+            st.markdown(
+                "**Row verdicts.** Only *attributive* spans count — a scare "
+                "quote is not a claim about a source, so it can neither ground "
+                "a row nor fabricate one. `quotes_grounded` carries the same "
+                "$|A| > 0$ guard as section 2's `quotes_verified`, and for the "
+                "same reason: a conjunction over an empty set is vacuously "
+                "true, and a row that cited nothing has grounded nothing."
+            )
+            st.markdown(
+                "**Design decisions**\n"
+                "- *Section 2 is read, never rewritten.* `quotes_verified` "
+                "keeps its strict all-spans-verbatim meaning, so runs from "
+                "before this check stay directly comparable with runs after "
+                "it. Both numbers are reported side by side.\n"
+                "- *The model attests, the code audits.* An unrecognized or "
+                "missing support label degrades to `not_addressed` — the "
+                "neutral option — so a malformed reply can never manufacture "
+                "a `supported` or a `contradicted` verdict.\n"
+                "- *Post-hoc, so it is cheap to be wrong.* This stage replays "
+                "a saved run's evidence instead of re-answering, so thresholds "
+                "can be retuned and the check re-run for the cost of the "
+                "flagged spans alone.\n"
+                "- *A conservative tier boundary is nearly free.* A span that "
+                "misses the paraphrase bar is not lost — it falls through to "
+                "`unsupported` and is then adjudicated against the row's "
+                "**full** evidence. The threshold decides which label a "
+                "grounded span earns, never whether it gets checked."
+            )
+            st.markdown(
+                "**Limitations** — the evidence is scoped by (lab, source "
+                "type) and this pipeline has **no world-knowledge oracle** by "
+                "design: the answerer only ever sees the corpus. So "
+                "`unsupported` means *unsupported by this lab's scoped "
+                "corpus*, **not** *false*. A claim can be perfectly true and "
+                "still land there because the corpus is silent on it — which "
+                "is exactly why `not_addressed` is a separate label from "
+                "`contradicted`, and **only `contradicted` is evidence "
+                "against a span**. Beyond that: the intent rules are English "
+                "cue patterns, not a parser, and will miss unusual phrasings "
+                "(they fail toward auditing, so the cost is false alarms); and "
+                "the entailment judge is the same model family being audited, "
+                "so it is a consistency check, not an independent oracle.\n\n"
+                "**Basis in the literature** — the provenance/veracity split "
+                "is the *attribution vs correctness* distinction from **AIS** "
+                "([Rashkin et al., 2023]"
+                "(https://aclanthology.org/2023.cl-4.2/); "
+                "[Bohnet et al., 2022](https://arxiv.org/abs/2212.08037)); "
+                "scoring a claim against retrieved evidence rather than "
+                "against its surface string follows **FActScore** "
+                "([Min et al., 2023]"
+                "(https://aclanthology.org/2023.emnlp-main.741/)); verified "
+                "quoting follows **GopherCite** "
+                "([Menick et al., 2022](https://arxiv.org/abs/2203.11147)) and "
+                "citation-quality evaluation follows **ALCE** "
+                "([Gao et al., 2023]"
+                "(https://aclanthology.org/2023.emnlp-main.398/)). Full "
+                "reference list in ARCHITECTURE.md §9.5."
+            )
+
+        if st.button("Run quote provenance on this run", key="run_prov",
+                     help="Replays the run's retrieved evidence and grades every "
+                          "quoted span. Works on any saved run — it reads the "
+                          "answers and quotes already on disk, and never rewrites "
+                          "section 2's verdict. Cheapest-first: verbatim spans "
+                          "cost nothing; only paraphrased or absent spans are sent "
+                          "to the entailment judge."):
+            args = [PYTHON, "scripts/06_run_quote_provenance.py",
+                    "--run", hal_run]
+            with st.status("Grading quoted spans…", expanded=True) as status:
+                rc = stream_subprocess(args, st.empty())
+                if rc == 0:
+                    status.update(label="Quote provenance complete ✅",
+                                  state="complete")
+                else:
+                    status.update(label=f"Check failed (exit {rc})",
+                                  state="error")
+            st.rerun()
+
+        if not prov:
+            st.caption("Not computed for this run yet — use the button above. "
+                       "It works on any saved run, including ones answered "
+                       "without **--quotes** (it reads quotation marks in the "
+                       "answers themselves).")
+        else:
+            po = prov["overall"]
+            pv = po["verdicts"]
+            p1, p2, p3, p4 = st.columns(4)
+            p1.metric("🚨 fabricated", pv.get("fabricated", 0),
+                      help="not in the sources, and the evidence does not "
+                           "support what they assert either — the number that "
+                           "actually means hallucination")
+            p2.metric("📎 misquoted, content sound",
+                      pv.get("misquote_but_true", 0) + pv.get("misattributed", 0),
+                      help="the quotation was manufactured or miscited, but "
+                           "what it claims is carried by the evidence: a "
+                           "citation-integrity failure, not a factual one")
+            p3.metric("♻️ grounded paraphrases",
+                      pv.get("paraphrase_grounded", 0),
+                      help="not verbatim, so section 2 fails them, but they "
+                           "faithfully reword a passage that IS in the sources")
+            p4.metric("💬 figures of speech",
+                      pv.get("non_attributive", 0),
+                      help="scare quotes, terms of art, hypotheticals — "
+                           "quotation marks that never claimed anything about "
+                           "a source, so they are not graded at all")
+
+            if po.get("paraphrase_rescue_rate") is not None:
+                r1, r2 = st.columns(2)
+                r1.metric("Paraphrase rescue rate",
+                          f"{po['paraphrase_rescue_rate']:.0%}",
+                          help="share of attributive spans that are NOT "
+                               "verbatim — so section 2 marks them ❌ — but "
+                               "that this check finds grounded anyway. How "
+                               "much of the old fabrication number was never "
+                               "fabrication.")
+                r2.metric("True fabrication rate",
+                          f"{po['true_fabrication_rate']:.0%}",
+                          help="share of attributive spans that survive as "
+                               "genuine fabrications")
+
+            st.info(
+                "**Reading `fabricated` correctly:** the evidence is scoped by "
+                "(lab, source type) and there is no world-knowledge oracle "
+                "here, so this means *not supported by this corpus* — **not** "
+                "*false*. Only the `contradicted` support label is evidence "
+                "**against** a span.", icon="⚠️")
+
+            if prov_spans is not None and not prov_spans.empty:
+                tier_rows = pd.DataFrame(
+                    [{"tier": t, "n": n} for t, n in po["tiers"].items()])
+                st.altair_chart(
+                    alt.Chart(tier_rows).mark_bar().encode(
+                        x=alt.X("n:Q", title="attributive spans"),
+                        y=alt.Y("tier:N", title=None,
+                                sort=["exact", "near_verbatim", "paraphrase",
+                                      "unsupported"]),
+                        tooltip=["tier", "n"],
+                    ).properties(height=140),
+                    width="stretch")
+
+                rescued = prov_spans[
+                    (prov_spans["verbatim_verified"] == False)  # noqa: E712
+                    & (prov_spans["verdict"].isin(
+                        ["attributed", "paraphrase_grounded"]))]
+                if len(rescued):
+                    st.markdown(
+                        f"**{len(rescued)} span(s) section 2 failed that are "
+                        f"actually grounded** — claimed text against the source "
+                        f"it aligns to:")
+                    for _, s in rescued.iterrows():
+                        with st.expander(f"♻️ {s['org']} · {s['source_type']} · "
+                                         f"{s['qid']} — {s['match_tier']}"):
+                            st.markdown(f"**Claimed:** “{s['quote']}”")
+                            # The lexical-overlap route aligns to a whole chunk
+                            # rather than a span, so fall back to the sentence
+                            # the entailment judge actually leaned on.
+                            source = (_present(s.get("best_span"))
+                                      or _present(s.get("evidence_sentence")))
+                            if source:
+                                st.markdown(f"**Source says:** “{source}”")
+                            support = _present(s.get("support"))
+                            st.caption(
+                                f"tier `{s['match_tier']}` via "
+                                f"`{s['match_rule']}` (score {s['match_score']})"
+                                + (f" · entailment: `{support}`" if support else ""))
+
+                misq = prov_spans[prov_spans["verdict"].isin(
+                    ["misquote_but_true", "misattributed"])]
+                if len(misq):
+                    st.markdown(
+                        f"**{len(misq)} manufactured quotation(s) whose content "
+                        f"the evidence still carries** — the quotation marks are "
+                        f"not defensible, the claim underneath them is:")
+                    for _, s in misq.iterrows():
+                        with st.expander(f"📎 {s['org']} · {s['source_type']} · "
+                                         f"{s['qid']} — {s['verdict']}"):
+                            st.markdown(f"**Claimed:** “{s['quote']}”")
+                            evidence = _present(s.get("evidence_sentence"))
+                            if evidence:
+                                st.markdown(f"**Evidence:** “{evidence}”")
+                            fragment = _present(s.get("grounded_fragment"))
+                            if fragment:
+                                st.markdown("**Part the evidence supports:** "
+                                            f"“{fragment}”")
+                            reason = _present(s.get("support_reason"))
+                            if reason:
+                                st.caption(reason)
+
+                fabricated = prov_spans[prov_spans["verdict"] == "fabricated"]
+                if len(fabricated):
+                    st.markdown(f"**{len(fabricated)} fabricated span(s)** — "
+                                "neither the text nor its content is in the "
+                                "scoped evidence:")
+                    for _, s in fabricated.iterrows():
+                        with st.expander(f"🚨 {s['org']} · {s['source_type']} · "
+                                         f"{s['qid']}"):
+                            st.markdown(f"**Claimed:** “{s['quote']}”")
+                            reason = _present(s.get("support_reason"))
+                            st.caption(
+                                f"support: `{_present(s.get('support')) or '—'}`"
+                                + (f" — {reason}" if reason else ""))
+
+                with st.expander("All graded spans", expanded=False):
+                    st.dataframe(
+                        prov_spans[["org", "source_type", "qid", "quote",
+                                    "source", "intent", "intent_rule",
+                                    "match_tier", "match_score", "support",
+                                    "verdict"]],
+                        hide_index=True, width="stretch")
+
+            pdir = runs.run_paths(hal_run)["quote_provenance_dir"]
+            dlp1, dlp2 = st.columns(2)
+            if (pdir / "summary.json").exists():
+                dlp1.download_button(
+                    "summary.json", (pdir / "summary.json").read_bytes(),
+                    file_name=f"quote_provenance_summary_{hal_run}.json")
+            if (pdir / "spans.jsonl").exists():
+                dlp2.download_button(
+                    "spans.jsonl", (pdir / "spans.jsonl").read_bytes(),
+                    file_name=f"quote_provenance_spans_{hal_run}.jsonl")
 
         # ---------------- 3 · Metamorphic label stability ----------------
         st.subheader("3 · Metamorphic label stability")
