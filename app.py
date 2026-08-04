@@ -41,6 +41,8 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from il_rag import runs
 from il_rag.config import (
     CHROMA_DIR,
+    CHUNK_OVERLAP,
+    CHUNK_SIZE,
     COLLECTION_NAME,
     GROUNDING_LOW_THRESHOLD,
     LAB_SWAP,
@@ -53,6 +55,7 @@ from il_rag.config import (
     QUOTE_PARAPHRASE_COS_THRESHOLD,
     QUOTE_PARAPHRASE_LEX_THRESHOLD,
     SOURCE_TYPES,
+    TOP_K,
 )
 from il_rag.questionnaire import CATEGORIES, LOGICS
 
@@ -724,6 +727,91 @@ with tab_run:
             "pair: RAG answer + graded matching per question. Resumable — "
             "completed questions are skipped on rerun."
         )
+        with st.expander("ℹ️ How the pipeline computes each answer",
+                         expanded=False):
+            st.markdown(
+                "What one question costs and how it is processed, end to end. "
+                "Everything before the LLM is deterministic arithmetic; the "
+                "two LLM calls run at **temperature 0** (greedy decoding)."
+            )
+            st.markdown(
+                "**Stage 0 — chunking (done once, at ingest).** Documents are "
+                "cut into a sliding window of "
+                f"$L={CHUNK_SIZE}$ characters with $O={CHUNK_OVERLAP}$ "
+                "characters of overlap, preferring sentence/newline breaks. "
+                "Consecutive chunks therefore start $L-O$ apart:"
+            )
+            st.latex(rf"\text{{start}}_{{j+1}}=\text{{start}}_j+({CHUNK_SIZE}-{CHUNK_OVERLAP})")
+            st.markdown(
+                "**Stage 0b — near-duplicate removal.** The third-party press "
+                "dumps are heavily syndicated, so each chunk is keyed by a "
+                "normalized 240-character signature and only the first "
+                "occurrence per (lab, source) is embedded:"
+            )
+            st.latex(
+                r"\mathrm{sig}(c)=\mathrm{lower}\bigl(\mathrm{collapse\_ws}(c)\bigr)"
+                r"[0:240]"
+            )
+            st.markdown(
+                "**Stage 1 — retrieval.** The question is embedded and scored "
+                "against the index by **cosine similarity**, restricted to one "
+                "(lab, source) pair. Chroma returns a distance, which the "
+                "retriever converts back to a similarity:"
+            )
+            st.latex(
+                r"\mathrm{score}(q,c)=1-d_{\cos}(q,c)"
+                r"=\frac{v_q\cdot v_c}{\lVert v_q\rVert\,\lVert v_c\rVert}"
+            )
+            st.markdown(
+                f"To survive duplicates that slipped past ingest, retrieval "
+                f"**over-fetches** $k\\times6$ candidates, drops repeated "
+                f"signatures, and keeps the top $k={TOP_K}$ distinct chunks."
+            )
+            st.markdown(
+                "**Stage 2 — the answer (LLM call 1).** The answering model "
+                "sees *only* those $k$ excerpts — never the logics taxonomy or "
+                "the reference answers. That separation is what makes the "
+                "next stage meaningful: the answer reflects the corpus, not "
+                "the classification scheme."
+            )
+            st.markdown(
+                "**Stage 3 — graded matching (LLM call 2).** The matcher sees "
+                "the answer and the seven reference answers for that question, "
+                "and returns a raw weight per logic. The code then **clamps "
+                "and renormalizes** — these guarantees are never trusted to "
+                "the model:"
+            )
+            st.latex(
+                r"\tilde{w}_k=\max(0,\,\hat{w}_k), \qquad "
+                r"w_k=\frac{\tilde{w}_k}{\sum_{m}\tilde{w}_m}"
+                r"\quad\text{if}\quad \textstyle\sum_m \tilde{w}_m>0"
+            )
+            st.markdown(
+                "**Stage 4 — abstention.** If the model sets the abstain flag, "
+                "*or* the weights sum to zero (a malformed or empty verdict), "
+                "the row is recorded as an abstention with all weights forced "
+                "to 0 — so 'no evidence' can never leak weight into any logic:"
+            )
+            st.latex(
+                r"\mathrm{abstain}=\mathrm{flag}\ \vee\ "
+                r"\Bigl[\textstyle\sum_m \tilde{w}_m \le 0\Bigr]"
+                r"\;\Longrightarrow\; w=\mathbf{0}"
+            )
+            st.markdown(
+                "**Design decisions**\n"
+                "- *Why two separate LLM calls rather than one?* Asking a "
+                "single call to both read the evidence and pick a logic would "
+                "let the taxonomy steer what it reads. Splitting them "
+                "enforces the separation above.\n"
+                "- *Why clamp and renormalize in code?* An LLM asked for "
+                "numbers summing to 1 will occasionally return negatives, "
+                "omissions, or sums like 0.97. The invariant the aggregation "
+                "depends on is enforced deterministically instead.\n"
+                "- *Cost.* Each question is exactly 1 embedding + 1 answer "
+                "call + 1 matcher call, so a full six-profile run is "
+                f"{6 * n_q} of each. Runs are resumable: completed questions "
+                "are skipped, so an interrupted run is never re-billed."
+            )
         c1, c2 = st.columns(2)
         sel_orgs = c1.multiselect("Labs", ORGS, default=ORGS)
         sel_sources = c2.multiselect("Source types", SOURCE_TYPES, default=SOURCE_TYPES)
@@ -794,6 +882,64 @@ with tab_results:
                 f"{res_meta.get('abstained', 0)} abstained"
             )
 
+        with st.expander("ℹ️ How the profile percentages are computed",
+                         expanded=False):
+            st.markdown(
+                "Aggregation happens in `il_rag/profile_harness.py`. Every "
+                "**answered** question contributed a weight vector over the "
+                "seven logics that the matcher normalized to sum to 1:"
+            )
+            st.latex(r"w^{(i)}=\bigl(w^{(i)}_1,\dots,w^{(i)}_7\bigr),\qquad "
+                     r"\sum_{k=1}^{7} w^{(i)}_k = 1,\qquad w^{(i)}_k \ge 0")
+            st.markdown(
+                "**Step 1 — split answered from abstained.** For one "
+                "(lab, source) pair, let $A$ be its **answered** questions and "
+                "$B$ its abstentions. Abstained rows carry an all-zero weight "
+                "vector and are removed from the denominator entirely:"
+            )
+            st.latex(r"n_{\text{answered}} = |A|, \qquad "
+                     r"n_{\text{abstained}} = |B|")
+            st.markdown(
+                "**Step 2 — profile percentage per logic**: the mean weight "
+                "across answered questions, ×100."
+            )
+            st.latex(r"P_k \;=\; \frac{100}{|A|}\sum_{i \in A} w^{(i)}_k")
+            st.markdown(
+                "Because every $w^{(i)}$ sums to 1, the seven $P_k$ sum to "
+                "$\\approx 100$ (small deviations are display rounding to 2 "
+                "decimals). **Step 3 — per-category breakdown** is the same "
+                "formula restricted to the questions of one category $c$:"
+            )
+            st.latex(r"P^{(c)}_k \;=\; \frac{100}{|A_c|}\sum_{i \in A_c} "
+                     r"w^{(i)}_k, \qquad A_c=\{i \in A: \mathrm{cat}(i)=c\}")
+            st.markdown(
+                "**Design decisions**\n"
+                "- *Why exclude abstentions instead of scoring them as zeros?* "
+                "Dividing by all 27 questions would let a silent corpus drag "
+                "every logic toward 0 and silently rescale the profile. "
+                "Excluding them means silence reduces **confidence** (a smaller "
+                "$|A|$, hence wider confidence intervals) but never **shifts** "
+                "the distribution.\n"
+                "- *Why the mean and not a vote count?* Institutional logics "
+                "co-exist; the matcher may legitimately split a question "
+                "60/40 across two logics. Averaging the full weight vectors "
+                "preserves those mixtures, whereas counting argmax winners "
+                "would discard them.\n"
+                "- *Every question weighs the same.* There is no confidence "
+                "weighting: a question the matcher graded 0.99/0.01 counts "
+                "exactly as much as one it graded 0.30/0.25/0.25/0.20."
+            )
+            st.markdown(
+                "**Sanity-check banner thresholds.** The banner below reads the "
+                "largest Family or Religion percentage across all six profiles, "
+                "$m=\\max P_{\\text{Family}},P_{\\text{Religion}}$, and reports "
+                "**passed** at $m \\le 5$, **borderline** at $5 < m \\le 15$, "
+                "and **FAILED** above 15. These cutoffs are presentational "
+                "heuristics, not statistical tests — Family and Religion have "
+                "no natural place in an AI lab's institutional environment, so "
+                "a high score means the instrument is misfiring."
+            )
+
         # --- Bootstrap confidence intervals (optional, zero-API, post-hoc) ---
         ci_data = load_bootstrap_ci(res_run)
         with st.expander("Confidence intervals (bootstrap over questions)",
@@ -804,6 +950,66 @@ with tab_results:
                 "bars mean the estimate leans on which questions were asked — "
                 "expected with ~27 questions. Zero API cost, deterministic."
             )
+            with st.expander("ℹ️ How the confidence intervals are computed",
+                             expanded=False):
+                st.markdown(
+                    "The nonparametric bootstrap (Efron, 1979), implemented in "
+                    "`il_rag/bootstrap_ci.py`. A profile percentage is a "
+                    "**sample mean** over a finite questionnaire, so its "
+                    "uncertainty is estimated by resampling that sample."
+                )
+                st.markdown(
+                    "**Step 1 — the observed sample.** For one (lab, source) "
+                    "pair, stack its $n=|A|$ answered weight vectors into a "
+                    "matrix $W \\in \\mathbb{R}^{n \\times 7}$. The point "
+                    "estimate is the column mean — identical to the percentage "
+                    "shown on the chart:"
+                )
+                st.latex(r"\hat{P}_k = \frac{100}{n}\sum_{i=1}^{n} W_{ik}")
+                st.markdown(
+                    "**Step 2 — resample with replacement.** Draw $n$ row "
+                    "indices uniformly *with replacement* (so a question may "
+                    "appear twice or not at all) and recompute the mean. "
+                    "Repeat $B$ times ($B = $ iterations, default 2000):"
+                )
+                st.latex(
+                    r"I^{(b)}_1,\dots,I^{(b)}_n \overset{\text{iid}}{\sim} "
+                    r"\mathrm{Uniform}\{1,\dots,n\}, \qquad "
+                    r"\hat{P}^{*(b)}_k=\frac{100}{n}\sum_{j=1}^{n} W_{I^{(b)}_j k}"
+                )
+                st.markdown(
+                    "**Step 3 — percentile interval.** Sort the $B$ bootstrap "
+                    "means per logic and read the empirical quantiles. For a "
+                    "$1-\\alpha$ interval (default 95%, so $\\alpha=0.05$):"
+                )
+                st.latex(
+                    r"\mathrm{CI}_k=\Bigl[\,Q_{\alpha/2}\bigl(\hat{P}^{*}_k\bigr),"
+                    r"\;Q_{1-\alpha/2}\bigl(\hat{P}^{*}_k\bigr)\,\Bigr]"
+                )
+                st.markdown(
+                    "The reported `std` is the standard deviation of those "
+                    "same $B$ replicates (the bootstrap standard error). With "
+                    "$n < 2$ the interval is undefined and is reported as "
+                    "zero-width.\n\n"
+                    "**Design decisions**\n"
+                    "- *Why bootstrap the questions instead of re-running the "
+                    "pipeline $N$ times?* Both are legitimate but answer "
+                    "different questions. This one answers **“how much does "
+                    "the profile depend on *which questions* we asked?”** — "
+                    "the instrument's sampling uncertainty. A repeat-run study "
+                    "would instead measure decoding variance.\n"
+                    "- *Why percentile and not normal-approximation intervals?* "
+                    "Weights are bounded in $[0,1]$ and often skewed (many "
+                    "exact zeros), so a symmetric $\\hat{P}\\pm1.96\\,\\mathrm{SE}$ "
+                    "interval can run past 0 or 100. Percentile bounds cannot.\n"
+                    "- *Reproducibility.* The resampling uses a **seeded** RNG "
+                    "(`numpy.random.default_rng(seed)`), so identical inputs "
+                    "give byte-identical intervals every time.\n"
+                    "- *Reading the width.* Interval width shrinks roughly as "
+                    "$1/\\sqrt{n}$, so with ~20–27 answered questions per "
+                    "profile the bars are genuinely wide. Dominant-logic "
+                    "*rankings* are far more robust than the exact percentages."
+                )
             if st.button("Compute / refresh confidence intervals"):
                 args = [PYTHON, "scripts/05_run_bootstrap_ci.py",
                         "--run", res_run]
@@ -970,6 +1176,40 @@ with tab_audit:
         st.header("Audit trail")
         st.caption("Every question's RAG answer, graded weights, and matcher "
                    "reasoning — the evidence behind the percentages.")
+        with st.expander("ℹ️ How to read a row", expanded=False):
+            st.markdown(
+                "Each row is one **(lab, source, question)** triple — the "
+                "atomic unit everything else aggregates. The header shows the "
+                "row's *dominant* logic, i.e. the argmax of its weight vector "
+                "(ties break by the fixed logic order, so the label is "
+                "deterministic):"
+            )
+            st.latex(r"\mathrm{label}=\begin{cases}"
+                     r"\texttt{ABSTAINED} & \text{if the row abstained}\\[2pt]"
+                     r"\arg\max_k w_k & \text{otherwise}\end{cases}")
+            st.markdown(
+                "**Fields**\n"
+                "- **Weights** — the matcher's distribution over the seven "
+                "logics, clamped non-negative and normalized to sum to 1. Only "
+                "non-zero entries are listed. This exact vector is what the "
+                "profile percentages average.\n"
+                "- **Matcher reasoning** — the one-sentence justification the "
+                "matcher returned. It is recorded for auditing and **never "
+                "used in any calculation**.\n"
+                "- **retrieved** — the ids of the chunks the answer was "
+                "written from. These make the row replayable: the metamorphic "
+                "and quote-provenance checks refetch exactly these chunks.\n"
+                "- **Supporting quotes** (only when the run used `--quotes`) — "
+                "spans the model claims to have copied, each ✅/❌ by a "
+                "code-side verbatim check after whitespace normalization.\n"
+                "- **grounding** (only when the run used `--grounding`) — the "
+                "row's lexical grounding score, best cosine, and bucket.\n\n"
+                "**Abstentions** carry an all-zero weight vector and are "
+                "excluded from the profile denominator, so they reduce "
+                "confidence without shifting the distribution. Filter to them "
+                "with the *Abstentions only* checkbox to see where the corpus "
+                "was silent."
+            )
         f1, f2, f3, f4 = st.columns(4)
         orgs_f = f1.multiselect("Lab", sorted(dfq["org"].unique()))
         st_f = f2.multiselect("Source", sorted(dfq["source_type"].unique()))
@@ -2027,6 +2267,99 @@ with tab_halluc:
             "cosine values are NOT interpretable (e5 compresses them into a "
             "narrow band) — only the ranking and the top1–top2 margin are."
         )
+        with st.expander("ℹ️ How embedding agreement is computed",
+                         expanded=False):
+            st.markdown(
+                "Implemented in `il_rag/embedding_agreement.py`. Every "
+                "**committed** answer is compared against the seven reference "
+                "answers *for its own question* (base text plus any "
+                "per-question override — the identical references the LLM "
+                "matcher saw). Abstained rows are skipped. No LLM is involved "
+                "here: embeddings and arithmetic only, so the result is "
+                "exactly reproducible."
+            )
+            st.markdown(
+                "**Step 1 — embed and measure cosine similarity.** Answers and "
+                "references are embedded with the same e5 model used for "
+                "retrieval (each truncated to 1400 characters to respect its "
+                "512-token limit; answers state their conclusion first, so the "
+                "head carries the signal). For each logic $k$:"
+            )
+            st.latex(r"s_k=\cos\bigl(v_{\text{answer}},\,v_{\text{ref}_k}\bigr)"
+                     r"=\frac{v_{\text{answer}}\cdot v_{\text{ref}_k}}"
+                     r"{\lVert v_{\text{answer}}\rVert\,\lVert v_{\text{ref}_k}\rVert}")
+            st.markdown(
+                "**Step 2 — the binary verdict.** Take the nearest reference "
+                "and compare it with the matcher's top-weighted logic. The "
+                "**margin** records how decisive that pick was:"
+            )
+            st.latex(
+                r"\hat{k}=\arg\max_k s_k, \qquad "
+                r"\mathrm{agree}=\bigl[\hat{k}=\arg\max_k w_k\bigr], \qquad "
+                r"\mathrm{margin}=s_{(1)}-s_{(2)}"
+            )
+            st.markdown(
+                "**Step 3 — graded closeness shares.** Convert the seven "
+                "similarities into proportions by subtracting the *farthest* "
+                "reference's similarity, then normalizing (min-shifted "
+                "normalization). The farthest logic receives exactly 0; a row "
+                "with no spread at all degrades to uniform $1/7$:"
+            )
+            st.latex(
+                r"\sigma_k=\frac{s_k-\min_j s_j}{\sum_{m}\bigl(s_m-\min_j s_j\bigr)},"
+                r"\qquad \sum_k \sigma_k = 1"
+            )
+            st.markdown(
+                "**Step 4 — two continuous comparisons** against the matcher's "
+                "weight vector $w$. The first reads the share landing on the "
+                "matcher's single top pick; the second compares the *whole* "
+                "shape via the overlapping coefficient (histogram "
+                "intersection):"
+            )
+            st.latex(
+                r"\mathrm{share\_on\_top}=\sigma_{\arg\max_k w_k}, \qquad "
+                r"\mathrm{overlap}=\sum_{k=1}^{7}\min(\sigma_k, w_k)"
+            )
+            st.markdown(
+                "**Step 5 — baselines.** Each metric is reported against what "
+                "an uninformative judge would score, so the numbers can be "
+                "read as *above chance* rather than in the abstract:"
+            )
+            st.latex(
+                r"\text{chance share}=\tfrac{1}{7}\approx 0.143, \qquad "
+                r"\text{uniform overlap}=\sum_{k}\min\bigl(\tfrac{1}{7},\,w_k\bigr)"
+            )
+            st.markdown(
+                "All five quantities are averaged for the overall summary and "
+                "for each category and lab×source slice.\n\n"
+                "**Design decisions**\n"
+                "- *Why min-shifted shares instead of softmax?* Softmax needs "
+                "a temperature constant that would have to be tuned and "
+                "justified. Min-shifting is parameter-free and "
+                "**scale-invariant**: adding a constant to every similarity "
+                "leaves the shares unchanged. That matters because e5 "
+                "compresses cosines into a narrow high band (empirically "
+                "≈0.78–0.87 here), so only the *relative spread within a row* "
+                "carries information.\n"
+                "- *Why absolute cosines are not reported as a score.* For the "
+                "same reason: a 0.84 similarity is not '84% similar'. Only "
+                "rankings, margins and shares are interpretable.\n"
+                "- *Why keep both the binary and graded views?* The binary "
+                "argmax is the conventional, recognizable number but is harsh: "
+                "a near-tie that falls the other way counts as a full "
+                "disagreement. The graded metrics show whether the answer "
+                "*leaned* toward the matcher's pick even when the argmax "
+                "flipped.\n"
+                "- *Why overlap needs a per-row baseline.* Overlap's floor "
+                "depends on how concentrated $w$ is — a matcher putting 1.0 on "
+                "one logic can score at most $1/7$ against a uniform judge, "
+                "while a diffuse $w$ scores much higher. Share, by contrast, "
+                "has the flat $1/7$ baseline.\n"
+                "- *What this check is for.* It is **triangulation, not ground "
+                "truth**: whole-answer embeddings track topic more than "
+                "institutional stance, so treat low agreement as a limit of "
+                "surface similarity rather than evidence the matcher is wrong."
+            )
         if st.button("Compute embedding agreement",
                      disabled=not api_key_present(),
                      help="One embedding per committed row + 63 references, "
@@ -2196,6 +2529,39 @@ with tab_compare:
 
             # --- 1. Profile % deltas (B − A) ------------------------------
             with sub_delta:
+                with st.expander("ℹ️ How the deltas are computed",
+                                 expanded=False):
+                    st.markdown(
+                        "A plain arithmetic difference of the two runs' "
+                        "profile percentages, per (lab, source, logic) — run B "
+                        "minus run A:"
+                    )
+                    st.latex(r"\Delta_k = P^{B}_k - P^{A}_k")
+                    st.markdown(
+                        "Values are **percentage points**, not percentages of "
+                        "a percentage: a bar reading $+8$ means that logic's "
+                        "share rose from e.g. 30% to 38%. Since each run's "
+                        "seven percentages sum to ~100, the seven deltas of a "
+                        "profile sum to ~0 — weight moves *between* logics, so "
+                        "a rise in one is necessarily a fall in others. Bars "
+                        "are sorted by $|\\Delta_k|$ so the largest movements "
+                        "appear first, and pairs answered in only one of the "
+                        "two runs are skipped.\n\n"
+                        "**How to read a delta**\n"
+                        "- Deltas are **not** significance-tested. Compare "
+                        "each against the bootstrap confidence interval on the "
+                        "Results tab: a shift well inside the CI is "
+                        "indistinguishable from question-sampling noise.\n"
+                        "- Two runs of the *same* questionnaire still differ, "
+                        "because decoding at temperature 0 is greedy but not "
+                        "bit-reproducible on shared GPU infrastructure. "
+                        "Attribute a delta to a questionnaire change only if "
+                        "it exceeds that baseline wobble.\n"
+                        "- The denominators can differ too: if a question "
+                        "abstained in one run and committed in the other, "
+                        "$|A|$ changes, which moves every percentage slightly "
+                        "even for untouched questions."
+                    )
                 if not prof_a or not prof_b:
                     st.info("One of the runs has no aggregated profiles yet.")
                 else:
