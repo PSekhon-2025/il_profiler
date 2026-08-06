@@ -15,10 +15,12 @@ Areas:
                   check, downloads.
   Audit         — browse every question's RAG answer, graded weights, matcher
                   reasoning, and (when enabled) quotes + grounding bucket.
-  Hallucination — the four opt-in checks for any saved run: retrieval-
-                  grounding buckets, quote verification, and the metamorphic
-                  label-stability eval (launchable from here), with alert
-                  banners when a detection fires.
+  Hallucination — the five opt-in checks for any saved run: retrieval-
+                  grounding buckets, quote verification, quote provenance
+                  (grading WHY a quote failed, and whether its content is
+                  true anyway), and the metamorphic label-stability eval
+                  (launchable from here), with alert banners when a
+                  detection fires.
   Compare       — diff two run snapshots.
 """
 import io
@@ -39,6 +41,8 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from il_rag import runs
 from il_rag.config import (
     CHROMA_DIR,
+    CHUNK_OVERLAP,
+    CHUNK_SIZE,
     COLLECTION_NAME,
     GROUNDING_LOW_THRESHOLD,
     METAMORPHIC_CONTROLS,
@@ -49,7 +53,12 @@ from il_rag.config import (
     ORGS,
     PARAPHRASE_MAX_TOKEN_OVERLAP,
     PARAPHRASE_MIN_COSINE,
+    QUOTE_MIN_SPAN_TOKENS,
+    QUOTE_NEAR_VERBATIM_THRESHOLD,
+    QUOTE_PARAPHRASE_COS_THRESHOLD,
+    QUOTE_PARAPHRASE_LEX_THRESHOLD,
     SOURCE_TYPES,
+    TOP_K,
 )
 from il_rag.questionnaire import CATEGORIES, LOGICS
 
@@ -261,6 +270,35 @@ def load_embedding_rows(run_id: str | None) -> pd.DataFrame | None:
     return pd.DataFrame(rows) if rows else None
 
 
+def load_quote_provenance(run_id: str | None) -> dict | None:
+    """The quote-provenance summary for a run, if the stage has run."""
+    if not run_id:
+        return None
+    path = runs.run_paths(run_id)["quote_provenance_summary"]
+    if not path.exists():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def load_quote_spans(run_id: str | None) -> pd.DataFrame | None:
+    """Per-span provenance records for a run, if the stage has run."""
+    if not run_id:
+        return None
+    path = runs.run_paths(run_id)["quote_spans"]
+    if not path.exists():
+        return None
+    rows = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    return pd.DataFrame(rows) if rows else None
+
+
 # ---------------------------------------------------------------------------
 # Hallucination export: one "decision + underlying data" table per check
 # ---------------------------------------------------------------------------
@@ -272,6 +310,19 @@ def _series(df: pd.DataFrame, name: str) -> pd.Series:
     if name in df.columns:
         return df[name]
     return pd.Series([None] * len(df), index=df.index, dtype="object")
+
+
+def _present(v) -> str | None:
+    """The value as display text, or None if it is absent.
+
+    Pandas turns a JSON null into NaN, which is TRUTHY — a bare `if row[col]`
+    therefore renders the literal string "nan" into the page. Optional fields
+    (an unaligned span, an empty grounded fragment) must go through this.
+    """
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return None
+    s = str(v).strip()
+    return s if s and s.lower() != "nan" else None
 
 
 def _top_logic(weights) -> tuple:
@@ -332,6 +383,36 @@ def build_quotes_exports(dfh: pd.DataFrame):
                 "decision_span_verified": qq.get("verified"),
             })
     return pd.DataFrame(rows), (pd.DataFrame(spans) if spans else None)
+
+
+def build_quote_provenance_export(spans: pd.DataFrame | None) -> pd.DataFrame | None:
+    """Check 5 — per span: the graded verdict beside BOTH axes that produced it.
+
+    Feature 2's own bit for the same span travels in `verbatim_verified`, so a
+    reader can see exactly which spans the graded check reclassified and why.
+    """
+    if spans is None or spans.empty:
+        return None
+    s = spans.copy()
+    return pd.DataFrame({
+        "org": s["org"], "source_type": s["source_type"], "qid": s["qid"],
+        "category": _series(s, "category"),
+        "quote": s["quote"], "span_source": s["source"],
+        "feature2_verbatim_verified": _series(s, "verbatim_verified"),
+        "decision_intent": s["intent"],
+        "intent_rule": _series(s, "intent_rule"),
+        "intent_confidence": _series(s, "intent_confidence"),
+        "decision_match_tier": s["match_tier"],
+        "match_rule": _series(s, "match_rule"),
+        "match_score": _series(s, "match_score"),
+        "decision_support": _series(s, "support"),
+        "grounded_fragment": _series(s, "grounded_fragment"),
+        "evidence_sentence": _series(s, "evidence_sentence"),
+        "support_reason": _series(s, "support_reason"),
+        "decision_verdict": s["verdict"],
+        "best_chunk_id": _series(s, "best_chunk_id"),
+        "best_span": _series(s, "best_span"),
+    })
 
 
 def build_metamorphic_exports(stab: dict | None, variants: pd.DataFrame | None):
@@ -420,6 +501,11 @@ def build_detection_bundle(run_id: str, dfh: pd.DataFrame,
             members.append(("2_quote_verification_spans.csv", csv_bytes(q_spans)))
         ran.append("quote verification")
 
+    qp_spans = build_quote_provenance_export(load_quote_spans(run_id))
+    if qp_spans is not None:
+        members.append(("2b_quote_provenance.csv", csv_bytes(qp_spans)))
+        ran.append("quote provenance")
+
     mm_items, mm_var = build_metamorphic_exports(stab, load_variants(run_id))
     if mm_items is not None:
         members.append(("3_metamorphic_items.csv", csv_bytes(mm_items)))
@@ -437,7 +523,8 @@ def build_detection_bundle(run_id: str, dfh: pd.DataFrame,
     for rel in ("per_question.jsonl", "meta.json",
                 "metamorphic/stability.json", "metamorphic/variants.jsonl",
                 "embedding_agreement/summary.json",
-                "embedding_agreement/similarities.jsonl"):
+                "embedding_agreement/similarities.jsonl",
+                "quote_provenance/summary.json", "quote_provenance/spans.jsonl"):
         p = rd / rel
         if p.exists():
             members.append((f"raw/{rel}", p.read_bytes()))
@@ -469,6 +556,14 @@ def _bundle_readme(run_id: str, ran: list[str]) -> str:
         "(verified / unverified / no_quotes) + the cited spans.\n"
         "2_quote_verification_spans.csv   per cited span: whether that exact "
         "span was found verbatim in the retrieved sources.\n"
+        "2b_quote_provenance.csv          per quoted span, GRADED: intent "
+        "(is it even a claim about a source?), provenance tier (verbatim /\n"
+        "                                 drifted copy / paraphrase / absent), "
+        "entailment support, and the combined verdict. Includes\n"
+        "                                 feature2_verbatim_verified so you can "
+        "see which spans the graded check reclassified, and why.\n"
+        "                                 Note: 'unsupported' means unsupported "
+        "BY THIS SCOPED CORPUS, not false in the world.\n"
         "3_metamorphic_items.csv          per item, one column per probe "
         "decision: control_flipped (pipeline noise), unstable (a paraphrase\n"
         "                                 changed the label), "
@@ -488,7 +583,7 @@ def _bundle_readme(run_id: str, ran: list[str]) -> str:
         "tables are derived from (per_question.jsonl, meta.json, and any\n"
         "                                 metamorphic / embedding outputs).\n\n"
         "Only checks that have actually run for this snapshot appear above.\n"
-        "See ARCHITECTURE.md sections 9.1-9.4 for the full method of each check.\n"
+        "See ARCHITECTURE.md sections 9.1-9.5 for the full method of each check.\n"
     )
 
 
@@ -655,6 +750,91 @@ with tab_run:
             "pair: RAG answer + graded matching per question. Resumable — "
             "completed questions are skipped on rerun."
         )
+        with st.expander("ℹ️ How the pipeline computes each answer",
+                         expanded=False):
+            st.markdown(
+                "What one question costs and how it is processed, end to end. "
+                "Everything before the LLM is deterministic arithmetic; the "
+                "two LLM calls run at **temperature 0** (greedy decoding)."
+            )
+            st.markdown(
+                "**Stage 0 — chunking (done once, at ingest).** Documents are "
+                "cut into a sliding window of "
+                f"$L={CHUNK_SIZE}$ characters with $O={CHUNK_OVERLAP}$ "
+                "characters of overlap, preferring sentence/newline breaks. "
+                "Consecutive chunks therefore start $L-O$ apart:"
+            )
+            st.latex(rf"\text{{start}}_{{j+1}}=\text{{start}}_j+({CHUNK_SIZE}-{CHUNK_OVERLAP})")
+            st.markdown(
+                "**Stage 0b — near-duplicate removal.** The third-party press "
+                "dumps are heavily syndicated, so each chunk is keyed by a "
+                "normalized 240-character signature and only the first "
+                "occurrence per (lab, source) is embedded:"
+            )
+            st.latex(
+                r"\mathrm{sig}(c)=\mathrm{lower}\bigl(\mathrm{collapse\_ws}(c)\bigr)"
+                r"[0:240]"
+            )
+            st.markdown(
+                "**Stage 1 — retrieval.** The question is embedded and scored "
+                "against the index by **cosine similarity**, restricted to one "
+                "(lab, source) pair. Chroma returns a distance, which the "
+                "retriever converts back to a similarity:"
+            )
+            st.latex(
+                r"\mathrm{score}(q,c)=1-d_{\cos}(q,c)"
+                r"=\frac{v_q\cdot v_c}{\lVert v_q\rVert\,\lVert v_c\rVert}"
+            )
+            st.markdown(
+                f"To survive duplicates that slipped past ingest, retrieval "
+                f"**over-fetches** $k\\times6$ candidates, drops repeated "
+                f"signatures, and keeps the top $k={TOP_K}$ distinct chunks."
+            )
+            st.markdown(
+                "**Stage 2 — the answer (LLM call 1).** The answering model "
+                "sees *only* those $k$ excerpts — never the logics taxonomy or "
+                "the reference answers. That separation is what makes the "
+                "next stage meaningful: the answer reflects the corpus, not "
+                "the classification scheme."
+            )
+            st.markdown(
+                "**Stage 3 — graded matching (LLM call 2).** The matcher sees "
+                "the answer and the seven reference answers for that question, "
+                "and returns a raw weight per logic. The code then **clamps "
+                "and renormalizes** — these guarantees are never trusted to "
+                "the model:"
+            )
+            st.latex(
+                r"\tilde{w}_k=\max(0,\,\hat{w}_k), \qquad "
+                r"w_k=\frac{\tilde{w}_k}{\sum_{m}\tilde{w}_m}"
+                r"\quad\text{if}\quad \textstyle\sum_m \tilde{w}_m>0"
+            )
+            st.markdown(
+                "**Stage 4 — abstention.** If the model sets the abstain flag, "
+                "*or* the weights sum to zero (a malformed or empty verdict), "
+                "the row is recorded as an abstention with all weights forced "
+                "to 0 — so 'no evidence' can never leak weight into any logic:"
+            )
+            st.latex(
+                r"\mathrm{abstain}=\mathrm{flag}\ \vee\ "
+                r"\Bigl[\textstyle\sum_m \tilde{w}_m \le 0\Bigr]"
+                r"\;\Longrightarrow\; w=\mathbf{0}"
+            )
+            st.markdown(
+                "**Design decisions**\n"
+                "- *Why two separate LLM calls rather than one?* Asking a "
+                "single call to both read the evidence and pick a logic would "
+                "let the taxonomy steer what it reads. Splitting them "
+                "enforces the separation above.\n"
+                "- *Why clamp and renormalize in code?* An LLM asked for "
+                "numbers summing to 1 will occasionally return negatives, "
+                "omissions, or sums like 0.97. The invariant the aggregation "
+                "depends on is enforced deterministically instead.\n"
+                "- *Cost.* Each question is exactly 1 embedding + 1 answer "
+                "call + 1 matcher call, so a full six-profile run is "
+                f"{6 * n_q} of each. Runs are resumable: completed questions "
+                "are skipped, so an interrupted run is never re-billed."
+            )
         c1, c2 = st.columns(2)
         sel_orgs = c1.multiselect("Labs", ORGS, default=ORGS)
         sel_sources = c2.multiselect("Source types", SOURCE_TYPES, default=SOURCE_TYPES)
@@ -725,6 +905,64 @@ with tab_results:
                 f"{res_meta.get('abstained', 0)} abstained"
             )
 
+        with st.expander("ℹ️ How the profile percentages are computed",
+                         expanded=False):
+            st.markdown(
+                "Aggregation happens in `il_rag/profile_harness.py`. Every "
+                "**answered** question contributed a weight vector over the "
+                "seven logics that the matcher normalized to sum to 1:"
+            )
+            st.latex(r"w^{(i)}=\bigl(w^{(i)}_1,\dots,w^{(i)}_7\bigr),\qquad "
+                     r"\sum_{k=1}^{7} w^{(i)}_k = 1,\qquad w^{(i)}_k \ge 0")
+            st.markdown(
+                "**Step 1 — split answered from abstained.** For one "
+                "(lab, source) pair, let $A$ be its **answered** questions and "
+                "$B$ its abstentions. Abstained rows carry an all-zero weight "
+                "vector and are removed from the denominator entirely:"
+            )
+            st.latex(r"n_{\text{answered}} = |A|, \qquad "
+                     r"n_{\text{abstained}} = |B|")
+            st.markdown(
+                "**Step 2 — profile percentage per logic**: the mean weight "
+                "across answered questions, ×100."
+            )
+            st.latex(r"P_k \;=\; \frac{100}{|A|}\sum_{i \in A} w^{(i)}_k")
+            st.markdown(
+                "Because every $w^{(i)}$ sums to 1, the seven $P_k$ sum to "
+                "$\\approx 100$ (small deviations are display rounding to 2 "
+                "decimals). **Step 3 — per-category breakdown** is the same "
+                "formula restricted to the questions of one category $c$:"
+            )
+            st.latex(r"P^{(c)}_k \;=\; \frac{100}{|A_c|}\sum_{i \in A_c} "
+                     r"w^{(i)}_k, \qquad A_c=\{i \in A: \mathrm{cat}(i)=c\}")
+            st.markdown(
+                "**Design decisions**\n"
+                "- *Why exclude abstentions instead of scoring them as zeros?* "
+                "Dividing by all 27 questions would let a silent corpus drag "
+                "every logic toward 0 and silently rescale the profile. "
+                "Excluding them means silence reduces **confidence** (a smaller "
+                "$|A|$, hence wider confidence intervals) but never **shifts** "
+                "the distribution.\n"
+                "- *Why the mean and not a vote count?* Institutional logics "
+                "co-exist; the matcher may legitimately split a question "
+                "60/40 across two logics. Averaging the full weight vectors "
+                "preserves those mixtures, whereas counting argmax winners "
+                "would discard them.\n"
+                "- *Every question weighs the same.* There is no confidence "
+                "weighting: a question the matcher graded 0.99/0.01 counts "
+                "exactly as much as one it graded 0.30/0.25/0.25/0.20."
+            )
+            st.markdown(
+                "**Sanity-check banner thresholds.** The banner below reads the "
+                "largest Family or Religion percentage across all six profiles, "
+                "$m=\\max P_{\\text{Family}},P_{\\text{Religion}}$, and reports "
+                "**passed** at $m \\le 5$, **borderline** at $5 < m \\le 15$, "
+                "and **FAILED** above 15. These cutoffs are presentational "
+                "heuristics, not statistical tests — Family and Religion have "
+                "no natural place in an AI lab's institutional environment, so "
+                "a high score means the instrument is misfiring."
+            )
+
         # --- Bootstrap confidence intervals (optional, zero-API, post-hoc) ---
         ci_data = load_bootstrap_ci(res_run)
         with st.expander("Confidence intervals (bootstrap over questions)",
@@ -735,6 +973,66 @@ with tab_results:
                 "bars mean the estimate leans on which questions were asked — "
                 "expected with ~27 questions. Zero API cost, deterministic."
             )
+            with st.expander("ℹ️ How the confidence intervals are computed",
+                             expanded=False):
+                st.markdown(
+                    "The nonparametric bootstrap (Efron, 1979), implemented in "
+                    "`il_rag/bootstrap_ci.py`. A profile percentage is a "
+                    "**sample mean** over a finite questionnaire, so its "
+                    "uncertainty is estimated by resampling that sample."
+                )
+                st.markdown(
+                    "**Step 1 — the observed sample.** For one (lab, source) "
+                    "pair, stack its $n=|A|$ answered weight vectors into a "
+                    "matrix $W \\in \\mathbb{R}^{n \\times 7}$. The point "
+                    "estimate is the column mean — identical to the percentage "
+                    "shown on the chart:"
+                )
+                st.latex(r"\hat{P}_k = \frac{100}{n}\sum_{i=1}^{n} W_{ik}")
+                st.markdown(
+                    "**Step 2 — resample with replacement.** Draw $n$ row "
+                    "indices uniformly *with replacement* (so a question may "
+                    "appear twice or not at all) and recompute the mean. "
+                    "Repeat $B$ times ($B = $ iterations, default 2000):"
+                )
+                st.latex(
+                    r"I^{(b)}_1,\dots,I^{(b)}_n \overset{\text{iid}}{\sim} "
+                    r"\mathrm{Uniform}\{1,\dots,n\}, \qquad "
+                    r"\hat{P}^{*(b)}_k=\frac{100}{n}\sum_{j=1}^{n} W_{I^{(b)}_j k}"
+                )
+                st.markdown(
+                    "**Step 3 — percentile interval.** Sort the $B$ bootstrap "
+                    "means per logic and read the empirical quantiles. For a "
+                    "$1-\\alpha$ interval (default 95%, so $\\alpha=0.05$):"
+                )
+                st.latex(
+                    r"\mathrm{CI}_k=\Bigl[\,Q_{\alpha/2}\bigl(\hat{P}^{*}_k\bigr),"
+                    r"\;Q_{1-\alpha/2}\bigl(\hat{P}^{*}_k\bigr)\,\Bigr]"
+                )
+                st.markdown(
+                    "The reported `std` is the standard deviation of those "
+                    "same $B$ replicates (the bootstrap standard error). With "
+                    "$n < 2$ the interval is undefined and is reported as "
+                    "zero-width.\n\n"
+                    "**Design decisions**\n"
+                    "- *Why bootstrap the questions instead of re-running the "
+                    "pipeline $N$ times?* Both are legitimate but answer "
+                    "different questions. This one answers **“how much does "
+                    "the profile depend on *which questions* we asked?”** — "
+                    "the instrument's sampling uncertainty. A repeat-run study "
+                    "would instead measure decoding variance.\n"
+                    "- *Why percentile and not normal-approximation intervals?* "
+                    "Weights are bounded in $[0,1]$ and often skewed (many "
+                    "exact zeros), so a symmetric $\\hat{P}\\pm1.96\\,\\mathrm{SE}$ "
+                    "interval can run past 0 or 100. Percentile bounds cannot.\n"
+                    "- *Reproducibility.* The resampling uses a **seeded** RNG "
+                    "(`numpy.random.default_rng(seed)`), so identical inputs "
+                    "give byte-identical intervals every time.\n"
+                    "- *Reading the width.* Interval width shrinks roughly as "
+                    "$1/\\sqrt{n}$, so with ~20–27 answered questions per "
+                    "profile the bars are genuinely wide. Dominant-logic "
+                    "*rankings* are far more robust than the exact percentages."
+                )
             if st.button("Compute / refresh confidence intervals"):
                 args = [PYTHON, "scripts/05_run_bootstrap_ci.py",
                         "--run", res_run]
@@ -901,6 +1199,40 @@ with tab_audit:
         st.header("Audit trail")
         st.caption("Every question's RAG answer, graded weights, and matcher "
                    "reasoning — the evidence behind the percentages.")
+        with st.expander("ℹ️ How to read a row", expanded=False):
+            st.markdown(
+                "Each row is one **(lab, source, question)** triple — the "
+                "atomic unit everything else aggregates. The header shows the "
+                "row's *dominant* logic, i.e. the argmax of its weight vector "
+                "(ties break by the fixed logic order, so the label is "
+                "deterministic):"
+            )
+            st.latex(r"\mathrm{label}=\begin{cases}"
+                     r"\texttt{ABSTAINED} & \text{if the row abstained}\\[2pt]"
+                     r"\arg\max_k w_k & \text{otherwise}\end{cases}")
+            st.markdown(
+                "**Fields**\n"
+                "- **Weights** — the matcher's distribution over the seven "
+                "logics, clamped non-negative and normalized to sum to 1. Only "
+                "non-zero entries are listed. This exact vector is what the "
+                "profile percentages average.\n"
+                "- **Matcher reasoning** — the one-sentence justification the "
+                "matcher returned. It is recorded for auditing and **never "
+                "used in any calculation**.\n"
+                "- **retrieved** — the ids of the chunks the answer was "
+                "written from. These make the row replayable: the metamorphic "
+                "and quote-provenance checks refetch exactly these chunks.\n"
+                "- **Supporting quotes** (only when the run used `--quotes`) — "
+                "spans the model claims to have copied, each ✅/❌ by a "
+                "code-side verbatim check after whitespace normalization.\n"
+                "- **grounding** (only when the run used `--grounding`) — the "
+                "row's lexical grounding score, best cosine, and bucket.\n\n"
+                "**Abstentions** carry an all-zero weight vector and are "
+                "excluded from the profile denominator, so they reduce "
+                "confidence without shifting the distribution. Filter to them "
+                "with the *Abstentions only* checkbox to see where the corpus "
+                "was silent."
+            )
         f1, f2, f3, f4 = st.columns(4)
         orgs_f = f1.multiselect("Lab", sorted(dfq["org"].unique()))
         st_f = f2.multiselect("Source", sorted(dfq["source_type"].unique()))
@@ -954,14 +1286,16 @@ with tab_audit:
                 st.caption("retrieved: " + ", ".join(row["retrieved_ids"][:5]))
 
 # ---------------------------------------------------------------------------
-# Hallucination tab — the four opt-in checks, with alerts when one fires
+# Hallucination tab — the five opt-in checks, with alerts when one fires
 # ---------------------------------------------------------------------------
 with tab_halluc:
     st.header("Hallucination & grounding checks")
     st.caption(
-        "Four black-box checks: **retrieval grounding** (was there relevant "
+        "Five black-box checks: **retrieval grounding** (was there relevant "
         "text to answer from?), **quote verification** (does the cited support "
-        "actually appear in the sources?), **metamorphic stability & evidence "
+        "actually appear in the sources?), **quote provenance** (if it doesn't, "
+        "is it a paraphrase, a figure of speech, or a fabrication — and is its "
+        "content true anyway?), **metamorphic stability & evidence "
         "sensitivity** (does the label survive a reword — and does it stop when "
         "the supporting evidence is taken away?), and **embedding agreement** "
         "(does a non-LLM judge rank the same reference nearest?)."
@@ -971,6 +1305,8 @@ with tab_halluc:
     dfh = load_per_question(hal_run)
     stab = load_stability(hal_run)
     emb = load_embedding_summary(hal_run)
+    prov = load_quote_provenance(hal_run)
+    prov_spans = load_quote_spans(hal_run)
 
     if dfh is None or dfh.empty:
         st.info("No per-question results yet — run the pipeline on the **Run** "
@@ -1009,6 +1345,28 @@ with tab_halluc:
                            f"❌ **Unverified quotes** on {len(fab_rows)} answer(s): "
                            f"cited spans do not appear verbatim in the retrieved "
                            f"sources — possible fabricated support. See section 2."))
+        if prov:
+            po = prov["overall"]
+            n_fab = po["verdicts"].get("fabricated", 0)
+            n_misq = po["verdicts"].get("misquote_but_true", 0)
+            if n_fab:
+                alerts.append(("error",
+                               f"🚨 **{n_fab} genuinely fabricated span(s)**: not in "
+                               f"the sources, and the evidence does not support what "
+                               f"they assert either. This is the number to act on — "
+                               f"it is what survives after paraphrases and figures of "
+                               f"speech are separated out. See section 2b."))
+            if n_misq:
+                alerts.append(("warning",
+                               f"📎 **{n_misq} misquotation(s) with sound content**: "
+                               f"the quotation was manufactured, but what it claims "
+                               f"IS carried by the evidence — a citation-integrity "
+                               f"failure, not a factual one. See section 2b."))
+            if not n_fab and not n_misq and po["n_attributive"]:
+                alerts.append(("success",
+                               "✅ **No fabricated spans**: every attributive "
+                               "quotation is either in the sources or a grounded "
+                               "paraphrase of them. See section 2b."))
         if stab:
             s = stab["summary"]
             if s.get("n_unstable"):
@@ -1035,11 +1393,11 @@ with tab_halluc:
                            f"({emb['overall']['rate']:.0%}): the non-LLM judge "
                            f"often ranks a different logic's reference nearest "
                            f"than the matcher's top pick. See section 4."))
-        if not (has_grounding or has_quotes or stab or emb):
+        if not (has_grounding or has_quotes or stab or emb or prov):
             st.info("None of the checks have run for this snapshot yet. Enable "
                     "**--grounding** / **--quotes** on the Run tab for the next "
-                    "run, or launch the metamorphic eval / embedding agreement "
-                    "below (both work on any existing run).")
+                    "run, or launch the metamorphic eval / embedding agreement / "
+                    "quote provenance below (all three work on any existing run).")
         elif alerts:
             for kind, msg in alerts:
                 getattr(st, kind)(msg)
@@ -1331,6 +1689,335 @@ with tab_halluc:
             else:
                 st.caption("Every quoted span was found verbatim in its retrieved "
                            "sources.")
+
+        # ------- 2b · Quote provenance & paraphrase grounding -------
+        st.subheader("2b · Quote provenance & paraphrase grounding")
+        st.caption(
+            "Section 2 answers one question with one bit: is this span verbatim "
+            "in the sources? This section grades **how** each quoted span "
+            "relates to them, separates quotation marks that never claimed "
+            "anything about a source, and asks whether a span's **content** "
+            "holds up even when the span itself does not."
+        )
+        with st.expander("ℹ️ How quote provenance is computed", expanded=False):
+            st.markdown(
+                "A single ❌ in section 2 conflates four different things: a "
+                "**copy that drifted** (curly quotes, an em-dash, an elided "
+                "`…`), a **faithful paraphrase**, a **figure of speech** "
+                "(scare quotes, terms of art, hypotheticals — quotation marks "
+                "that never claimed anything about a source), and an actual "
+                "**fabrication**. Only the last is a hallucination."
+            )
+            st.markdown(
+                "**Step 1 — extraction.** Candidates come from the model's "
+                "structured `quotes` entries *and* from quotation marks in the "
+                "answer prose. The prose spans matter: they are unaudited by "
+                "section 2, and they are where the figures of speech live. "
+                f"Spans under {QUOTE_MIN_SPAN_TOKENS} content tokens are "
+                "dropped as noise."
+            )
+            st.markdown(
+                "**Step 2 — intent triage (no LLM).** Deterministic cue rules "
+                "over the ~70 characters before the opening quote, in a fixed "
+                "precedence: *counterfactual* (`a critic might say …`) → "
+                "*reporting verb* (`the charter states …`) → *mention* "
+                "(`so-called …`) → *example* → *shape* → default. The rule that "
+                "fired is stored with the label, so every classification is "
+                "inspectable. An unmatched span defaults to **attributive at "
+                "low confidence** — wrongly auditing a scare quote is a false "
+                "alarm you can dismiss, wrongly excusing a fabricated quotation "
+                "hides what the check exists to find."
+            )
+            st.markdown(
+                "**Step 3 — the provenance ladder (no LLM).** Cheapest-first; "
+                "the first tier to clear its bar wins:"
+            )
+            st.latex(
+                r"\begin{aligned}"
+                r"\textbf{exact}&:\ \mathrm{norm}(s)\sqsubseteq\mathrm{norm}(c)\\[2pt]"
+                r"\textbf{near\_verbatim}&:\ \mathrm{strip}(\mathrm{norm}(s))"
+                r"\sqsubseteq\mathrm{strip}(\mathrm{norm}(c))\\"
+                r"&\ \ \vee\ \text{elided fragments in order}\\"
+                r"&\ \ \vee\ \textstyle\max_w \mathrm{ratio}(s,w)\geq"
+                r"\tau_{\text{near}}\\[2pt]"
+                r"\textbf{paraphrase}&:\ \mathrm{overlap}(s,c)\geq"
+                r"\tau_{\text{lex}}\ \vee\ \textstyle\max_w\cos(s,w)\geq"
+                r"\tau_{\text{cos}}\\[2pt]"
+                r"\textbf{unsupported}&:\ \text{nothing cleared a bar}"
+                r"\end{aligned}"
+            )
+            st.markdown(
+                f"with $\\tau_{{\\text{{near}}}} = {QUOTE_NEAR_VERBATIM_THRESHOLD}$, "
+                f"$\\tau_{{\\text{{lex}}}} = {QUOTE_PARAPHRASE_LEX_THRESHOLD}$, "
+                f"$\\tau_{{\\text{{cos}}}} = {QUOTE_PARAPHRASE_COS_THRESHOLD}$. "
+                "The `exact` tier is bit-identical to section 2's predicate, so "
+                "**every span section 2 verifies lands in `exact`** — this "
+                "check only ever adds resolution below that line, never "
+                "reinterprets above it. Lexical overlap is the primary "
+                "paraphrase signal rather than cosine, for the same reason "
+                "section 1 thresholds lexical: e5 compresses cosine into a "
+                "narrow high band (measured here: a faithful reword scored "
+                "0.849, a wholly unrelated claim 0.807 — 0.04 apart), so a "
+                "cosine gate is far less discriminative than it looks."
+            )
+            st.markdown(
+                "**Step 4 — veracity (LLM, flagged spans only).** Provenance "
+                "asks *does this text exist in the sources?*; veracity asks "
+                "*is what it asserts supported by them?* Spans reaching the "
+                "paraphrase or unsupported tier get one entailment call "
+                "returning `supported` / `partial` / `contradicted` / "
+                "`not_addressed`, plus the fragment of the span the evidence "
+                "does carry. The evidence window widens with the tier: a "
+                "**paraphrase** is judged against the passage it aligned to "
+                "(*did the model reword this faithfully?*), an **unsupported** "
+                "span against the row's entire retrieved set (*the text isn't "
+                "there, but is the claim?*). A run whose quotes are all "
+                "verbatim costs **zero** LLM calls."
+            )
+            st.markdown(
+                "**Step 5 — the verdict.** The two axes are independent, so "
+                "the verdict is a 2×2 derived in pure code — no LLM in the "
+                "derivation:"
+            )
+            st.markdown(
+                "| | content supported | content not supported |\n"
+                "|---|---|---|\n"
+                "| **text in sources** | `attributed` | `misattributed` |\n"
+                "| **text not in sources** | `paraphrase_grounded` · "
+                "`misquote_but_true` | `fabricated` |\n"
+            )
+            st.markdown(
+                "The bottom-left cell is the point of the whole section: a "
+                "span that is not in the sources **as text** can still assert "
+                "something the sources support. It splits by how far the text "
+                "drifted — `paraphrase_grounded` (the model reworded a real "
+                "passage) is a much milder failure than `misquote_but_true` "
+                "(the model manufactured a quotation whose content happens to "
+                "hold). `misattributed` requires entailment-checking spans "
+                "that *did* match, which is opt-in "
+                "(`--adjudicate-verbatim`) because it costs one call per "
+                "verified span."
+            )
+            st.markdown(
+                "**Row verdicts.** Only *attributive* spans count — a scare "
+                "quote is not a claim about a source, so it can neither ground "
+                "a row nor fabricate one. `quotes_grounded` carries the same "
+                "$|A| > 0$ guard as section 2's `quotes_verified`, and for the "
+                "same reason: a conjunction over an empty set is vacuously "
+                "true, and a row that cited nothing has grounded nothing."
+            )
+            st.markdown(
+                "**Design decisions**\n"
+                "- *Section 2 is read, never rewritten.* `quotes_verified` "
+                "keeps its strict all-spans-verbatim meaning, so runs from "
+                "before this check stay directly comparable with runs after "
+                "it. Both numbers are reported side by side.\n"
+                "- *The model attests, the code audits.* An unrecognized or "
+                "missing support label degrades to `not_addressed` — the "
+                "neutral option — so a malformed reply can never manufacture "
+                "a `supported` or a `contradicted` verdict.\n"
+                "- *Post-hoc, so it is cheap to be wrong.* This stage replays "
+                "a saved run's evidence instead of re-answering, so thresholds "
+                "can be retuned and the check re-run for the cost of the "
+                "flagged spans alone.\n"
+                "- *A conservative tier boundary is nearly free.* A span that "
+                "misses the paraphrase bar is not lost — it falls through to "
+                "`unsupported` and is then adjudicated against the row's "
+                "**full** evidence. The threshold decides which label a "
+                "grounded span earns, never whether it gets checked."
+            )
+            st.markdown(
+                "**Limitations** — the evidence is scoped by (lab, source "
+                "type) and this pipeline has **no world-knowledge oracle** by "
+                "design: the answerer only ever sees the corpus. So "
+                "`unsupported` means *unsupported by this lab's scoped "
+                "corpus*, **not** *false*. A claim can be perfectly true and "
+                "still land there because the corpus is silent on it — which "
+                "is exactly why `not_addressed` is a separate label from "
+                "`contradicted`, and **only `contradicted` is evidence "
+                "against a span**. Beyond that: the intent rules are English "
+                "cue patterns, not a parser, and will miss unusual phrasings "
+                "(they fail toward auditing, so the cost is false alarms); and "
+                "the entailment judge is the same model family being audited, "
+                "so it is a consistency check, not an independent oracle.\n\n"
+                "**Basis in the literature** — the provenance/veracity split "
+                "is the *attribution vs correctness* distinction from **AIS** "
+                "([Rashkin et al., 2023]"
+                "(https://aclanthology.org/2023.cl-4.2/); "
+                "[Bohnet et al., 2022](https://arxiv.org/abs/2212.08037)); "
+                "scoring a claim against retrieved evidence rather than "
+                "against its surface string follows **FActScore** "
+                "([Min et al., 2023]"
+                "(https://aclanthology.org/2023.emnlp-main.741/)); verified "
+                "quoting follows **GopherCite** "
+                "([Menick et al., 2022](https://arxiv.org/abs/2203.11147)) and "
+                "citation-quality evaluation follows **ALCE** "
+                "([Gao et al., 2023]"
+                "(https://aclanthology.org/2023.emnlp-main.398/)). Full "
+                "reference list in ARCHITECTURE.md §9.5."
+            )
+
+        if st.button("Run quote provenance on this run", key="run_prov",
+                     help="Replays the run's retrieved evidence and grades every "
+                          "quoted span. Works on any saved run — it reads the "
+                          "answers and quotes already on disk, and never rewrites "
+                          "section 2's verdict. Cheapest-first: verbatim spans "
+                          "cost nothing; only paraphrased or absent spans are sent "
+                          "to the entailment judge."):
+            args = [PYTHON, "scripts/06_run_quote_provenance.py",
+                    "--run", hal_run]
+            with st.status("Grading quoted spans…", expanded=True) as status:
+                rc = stream_subprocess(args, st.empty())
+                if rc == 0:
+                    status.update(label="Quote provenance complete ✅",
+                                  state="complete")
+                else:
+                    status.update(label=f"Check failed (exit {rc})",
+                                  state="error")
+            st.rerun()
+
+        if not prov:
+            st.caption("Not computed for this run yet — use the button above. "
+                       "It works on any saved run, including ones answered "
+                       "without **--quotes** (it reads quotation marks in the "
+                       "answers themselves).")
+        else:
+            po = prov["overall"]
+            pv = po["verdicts"]
+            p1, p2, p3, p4 = st.columns(4)
+            p1.metric("🚨 fabricated", pv.get("fabricated", 0),
+                      help="not in the sources, and the evidence does not "
+                           "support what they assert either — the number that "
+                           "actually means hallucination")
+            p2.metric("📎 misquoted, content sound",
+                      pv.get("misquote_but_true", 0) + pv.get("misattributed", 0),
+                      help="the quotation was manufactured or miscited, but "
+                           "what it claims is carried by the evidence: a "
+                           "citation-integrity failure, not a factual one")
+            p3.metric("♻️ grounded paraphrases",
+                      pv.get("paraphrase_grounded", 0),
+                      help="not verbatim, so section 2 fails them, but they "
+                           "faithfully reword a passage that IS in the sources")
+            p4.metric("💬 figures of speech",
+                      pv.get("non_attributive", 0),
+                      help="scare quotes, terms of art, hypotheticals — "
+                           "quotation marks that never claimed anything about "
+                           "a source, so they are not graded at all")
+
+            if po.get("paraphrase_rescue_rate") is not None:
+                r1, r2 = st.columns(2)
+                r1.metric("Paraphrase rescue rate",
+                          f"{po['paraphrase_rescue_rate']:.0%}",
+                          help="share of attributive spans that are NOT "
+                               "verbatim — so section 2 marks them ❌ — but "
+                               "that this check finds grounded anyway. How "
+                               "much of the old fabrication number was never "
+                               "fabrication.")
+                r2.metric("True fabrication rate",
+                          f"{po['true_fabrication_rate']:.0%}",
+                          help="share of attributive spans that survive as "
+                               "genuine fabrications")
+
+            st.info(
+                "**Reading `fabricated` correctly:** the evidence is scoped by "
+                "(lab, source type) and there is no world-knowledge oracle "
+                "here, so this means *not supported by this corpus* — **not** "
+                "*false*. Only the `contradicted` support label is evidence "
+                "**against** a span.", icon="⚠️")
+
+            if prov_spans is not None and not prov_spans.empty:
+                tier_rows = pd.DataFrame(
+                    [{"tier": t, "n": n} for t, n in po["tiers"].items()])
+                st.altair_chart(
+                    alt.Chart(tier_rows).mark_bar().encode(
+                        x=alt.X("n:Q", title="attributive spans"),
+                        y=alt.Y("tier:N", title=None,
+                                sort=["exact", "near_verbatim", "paraphrase",
+                                      "unsupported"]),
+                        tooltip=["tier", "n"],
+                    ).properties(height=140),
+                    width="stretch")
+
+                rescued = prov_spans[
+                    (prov_spans["verbatim_verified"] == False)  # noqa: E712
+                    & (prov_spans["verdict"].isin(
+                        ["attributed", "paraphrase_grounded"]))]
+                if len(rescued):
+                    st.markdown(
+                        f"**{len(rescued)} span(s) section 2 failed that are "
+                        f"actually grounded** — claimed text against the source "
+                        f"it aligns to:")
+                    for _, s in rescued.iterrows():
+                        with st.expander(f"♻️ {s['org']} · {s['source_type']} · "
+                                         f"{s['qid']} — {s['match_tier']}"):
+                            st.markdown(f"**Claimed:** “{s['quote']}”")
+                            # The lexical-overlap route aligns to a whole chunk
+                            # rather than a span, so fall back to the sentence
+                            # the entailment judge actually leaned on.
+                            source = (_present(s.get("best_span"))
+                                      or _present(s.get("evidence_sentence")))
+                            if source:
+                                st.markdown(f"**Source says:** “{source}”")
+                            support = _present(s.get("support"))
+                            st.caption(
+                                f"tier `{s['match_tier']}` via "
+                                f"`{s['match_rule']}` (score {s['match_score']})"
+                                + (f" · entailment: `{support}`" if support else ""))
+
+                misq = prov_spans[prov_spans["verdict"].isin(
+                    ["misquote_but_true", "misattributed"])]
+                if len(misq):
+                    st.markdown(
+                        f"**{len(misq)} manufactured quotation(s) whose content "
+                        f"the evidence still carries** — the quotation marks are "
+                        f"not defensible, the claim underneath them is:")
+                    for _, s in misq.iterrows():
+                        with st.expander(f"📎 {s['org']} · {s['source_type']} · "
+                                         f"{s['qid']} — {s['verdict']}"):
+                            st.markdown(f"**Claimed:** “{s['quote']}”")
+                            evidence = _present(s.get("evidence_sentence"))
+                            if evidence:
+                                st.markdown(f"**Evidence:** “{evidence}”")
+                            fragment = _present(s.get("grounded_fragment"))
+                            if fragment:
+                                st.markdown("**Part the evidence supports:** "
+                                            f"“{fragment}”")
+                            reason = _present(s.get("support_reason"))
+                            if reason:
+                                st.caption(reason)
+
+                fabricated = prov_spans[prov_spans["verdict"] == "fabricated"]
+                if len(fabricated):
+                    st.markdown(f"**{len(fabricated)} fabricated span(s)** — "
+                                "neither the text nor its content is in the "
+                                "scoped evidence:")
+                    for _, s in fabricated.iterrows():
+                        with st.expander(f"🚨 {s['org']} · {s['source_type']} · "
+                                         f"{s['qid']}"):
+                            st.markdown(f"**Claimed:** “{s['quote']}”")
+                            reason = _present(s.get("support_reason"))
+                            st.caption(
+                                f"support: `{_present(s.get('support')) or '—'}`"
+                                + (f" — {reason}" if reason else ""))
+
+                with st.expander("All graded spans", expanded=False):
+                    st.dataframe(
+                        prov_spans[["org", "source_type", "qid", "quote",
+                                    "source", "intent", "intent_rule",
+                                    "match_tier", "match_score", "support",
+                                    "verdict"]],
+                        hide_index=True, width="stretch")
+
+            pdir = runs.run_paths(hal_run)["quote_provenance_dir"]
+            dlp1, dlp2 = st.columns(2)
+            if (pdir / "summary.json").exists():
+                dlp1.download_button(
+                    "summary.json", (pdir / "summary.json").read_bytes(),
+                    file_name=f"quote_provenance_summary_{hal_run}.json")
+            if (pdir / "spans.jsonl").exists():
+                dlp2.download_button(
+                    "spans.jsonl", (pdir / "spans.jsonl").read_bytes(),
+                    file_name=f"quote_provenance_spans_{hal_run}.jsonl")
 
         # ------- 3 · Metamorphic stability & evidence sensitivity -------
         st.subheader("3 · Metamorphic stability & evidence sensitivity")
@@ -1798,6 +2485,99 @@ with tab_halluc:
             "cosine values are NOT interpretable (e5 compresses them into a "
             "narrow band) — only the ranking and the top1–top2 margin are."
         )
+        with st.expander("ℹ️ How embedding agreement is computed",
+                         expanded=False):
+            st.markdown(
+                "Implemented in `il_rag/embedding_agreement.py`. Every "
+                "**committed** answer is compared against the seven reference "
+                "answers *for its own question* (base text plus any "
+                "per-question override — the identical references the LLM "
+                "matcher saw). Abstained rows are skipped. No LLM is involved "
+                "here: embeddings and arithmetic only, so the result is "
+                "exactly reproducible."
+            )
+            st.markdown(
+                "**Step 1 — embed and measure cosine similarity.** Answers and "
+                "references are embedded with the same e5 model used for "
+                "retrieval (each truncated to 1400 characters to respect its "
+                "512-token limit; answers state their conclusion first, so the "
+                "head carries the signal). For each logic $k$:"
+            )
+            st.latex(r"s_k=\cos\bigl(v_{\text{answer}},\,v_{\text{ref}_k}\bigr)"
+                     r"=\frac{v_{\text{answer}}\cdot v_{\text{ref}_k}}"
+                     r"{\lVert v_{\text{answer}}\rVert\,\lVert v_{\text{ref}_k}\rVert}")
+            st.markdown(
+                "**Step 2 — the binary verdict.** Take the nearest reference "
+                "and compare it with the matcher's top-weighted logic. The "
+                "**margin** records how decisive that pick was:"
+            )
+            st.latex(
+                r"\hat{k}=\arg\max_k s_k, \qquad "
+                r"\mathrm{agree}=\bigl[\hat{k}=\arg\max_k w_k\bigr], \qquad "
+                r"\mathrm{margin}=s_{(1)}-s_{(2)}"
+            )
+            st.markdown(
+                "**Step 3 — graded closeness shares.** Convert the seven "
+                "similarities into proportions by subtracting the *farthest* "
+                "reference's similarity, then normalizing (min-shifted "
+                "normalization). The farthest logic receives exactly 0; a row "
+                "with no spread at all degrades to uniform $1/7$:"
+            )
+            st.latex(
+                r"\sigma_k=\frac{s_k-\min_j s_j}{\sum_{m}\bigl(s_m-\min_j s_j\bigr)},"
+                r"\qquad \sum_k \sigma_k = 1"
+            )
+            st.markdown(
+                "**Step 4 — two continuous comparisons** against the matcher's "
+                "weight vector $w$. The first reads the share landing on the "
+                "matcher's single top pick; the second compares the *whole* "
+                "shape via the overlapping coefficient (histogram "
+                "intersection):"
+            )
+            st.latex(
+                r"\mathrm{share\_on\_top}=\sigma_{\arg\max_k w_k}, \qquad "
+                r"\mathrm{overlap}=\sum_{k=1}^{7}\min(\sigma_k, w_k)"
+            )
+            st.markdown(
+                "**Step 5 — baselines.** Each metric is reported against what "
+                "an uninformative judge would score, so the numbers can be "
+                "read as *above chance* rather than in the abstract:"
+            )
+            st.latex(
+                r"\text{chance share}=\tfrac{1}{7}\approx 0.143, \qquad "
+                r"\text{uniform overlap}=\sum_{k}\min\bigl(\tfrac{1}{7},\,w_k\bigr)"
+            )
+            st.markdown(
+                "All five quantities are averaged for the overall summary and "
+                "for each category and lab×source slice.\n\n"
+                "**Design decisions**\n"
+                "- *Why min-shifted shares instead of softmax?* Softmax needs "
+                "a temperature constant that would have to be tuned and "
+                "justified. Min-shifting is parameter-free and "
+                "**scale-invariant**: adding a constant to every similarity "
+                "leaves the shares unchanged. That matters because e5 "
+                "compresses cosines into a narrow high band (empirically "
+                "≈0.78–0.87 here), so only the *relative spread within a row* "
+                "carries information.\n"
+                "- *Why absolute cosines are not reported as a score.* For the "
+                "same reason: a 0.84 similarity is not '84% similar'. Only "
+                "rankings, margins and shares are interpretable.\n"
+                "- *Why keep both the binary and graded views?* The binary "
+                "argmax is the conventional, recognizable number but is harsh: "
+                "a near-tie that falls the other way counts as a full "
+                "disagreement. The graded metrics show whether the answer "
+                "*leaned* toward the matcher's pick even when the argmax "
+                "flipped.\n"
+                "- *Why overlap needs a per-row baseline.* Overlap's floor "
+                "depends on how concentrated $w$ is — a matcher putting 1.0 on "
+                "one logic can score at most $1/7$ against a uniform judge, "
+                "while a diffuse $w$ scores much higher. Share, by contrast, "
+                "has the flat $1/7$ baseline.\n"
+                "- *What this check is for.* It is **triangulation, not ground "
+                "truth**: whole-answer embeddings track topic more than "
+                "institutional stance, so treat low agreement as a limit of "
+                "surface similarity rather than evidence the matcher is wrong."
+            )
         if st.button("Compute embedding agreement",
                      disabled=not api_key_present(),
                      help="One embedding per committed row + 63 references, "
@@ -1850,27 +2630,54 @@ with tab_halluc:
                          "matcher's weights (1 = identical); compare against "
                          "what a totally uninformative judge would score")
 
-            cat_rows = [{"category": c, "rate": v["rate"], "n": v["n"]}
+            cat_rows = [{"category": c, "rate": v["rate"], "n": v["n"],
+                         "share": v.get("mean_share_on_matcher_top"),
+                         "overlap": v.get("mean_overlap")}
                         for c, v in emb.get("by_category", {}).items()
                         if v.get("rate") is not None]
             if cat_rows:
                 edf = pd.DataFrame(cat_rows)
+                # Older summaries lack the graded per-category means; only
+                # offer the metrics the file actually carries.
+                metric_opts = {"binary agreement rate": ("rate", None)}
+                if edf["share"].notna().all():
+                    metric_opts["closeness share on matcher's pick"] = (
+                        "share", emb.get("share_chance_baseline", 1 / 7))
+                if edf["overlap"].notna().all():
+                    metric_opts["distribution overlap"] = ("overlap", None)
+                sel_metric = st.radio(
+                    "Per-category metric", list(metric_opts),
+                    horizontal=True, key="emb_cat_metric",
+                    help="Binary = strict argmax match. Closeness share and "
+                         "overlap are the graded (ratio) views; the dashed "
+                         "rule marks the chance baseline where applicable.")
+                field, baseline = metric_opts[sel_metric]
                 emb_chart = (
                     alt.Chart(edf)
                     .mark_bar()
                     .encode(
-                        x=alt.X("rate:Q", title="agreement rate",
+                        x=alt.X(f"{field}:Q", title=sel_metric,
                                 scale=alt.Scale(domain=[0, 1])),
                         y=alt.Y("category:N", title=None,
                                 sort=[c for c in CATEGORIES]),
-                        color=alt.Color("rate:Q", legend=None,
+                        color=alt.Color(f"{field}:Q", legend=None,
                                         scale=alt.Scale(scheme="redyellowgreen",
                                                         domain=[0, 1])),
                         tooltip=["category",
-                                 alt.Tooltip("rate:Q", format=".2f"), "n"],
+                                 alt.Tooltip("rate:Q", format=".2f",
+                                             title="binary rate"),
+                                 alt.Tooltip("share:Q", format=".3f",
+                                             title="closeness share"),
+                                 alt.Tooltip("overlap:Q", format=".3f"),
+                                 "n"],
                     )
                     .properties(height=220)
                 )
+                if baseline:
+                    rule = (alt.Chart(pd.DataFrame({"x": [baseline]}))
+                            .mark_rule(strokeDash=[4, 3], color="#666")
+                            .encode(x="x:Q"))
+                    emb_chart = emb_chart + rule
                 st.altair_chart(emb_chart, width="stretch")
 
             erows = load_embedding_rows(hal_run)
@@ -1940,6 +2747,39 @@ with tab_compare:
 
             # --- 1. Profile % deltas (B − A) ------------------------------
             with sub_delta:
+                with st.expander("ℹ️ How the deltas are computed",
+                                 expanded=False):
+                    st.markdown(
+                        "A plain arithmetic difference of the two runs' "
+                        "profile percentages, per (lab, source, logic) — run B "
+                        "minus run A:"
+                    )
+                    st.latex(r"\Delta_k = P^{B}_k - P^{A}_k")
+                    st.markdown(
+                        "Values are **percentage points**, not percentages of "
+                        "a percentage: a bar reading $+8$ means that logic's "
+                        "share rose from e.g. 30% to 38%. Since each run's "
+                        "seven percentages sum to ~100, the seven deltas of a "
+                        "profile sum to ~0 — weight moves *between* logics, so "
+                        "a rise in one is necessarily a fall in others. Bars "
+                        "are sorted by $|\\Delta_k|$ so the largest movements "
+                        "appear first, and pairs answered in only one of the "
+                        "two runs are skipped.\n\n"
+                        "**How to read a delta**\n"
+                        "- Deltas are **not** significance-tested. Compare "
+                        "each against the bootstrap confidence interval on the "
+                        "Results tab: a shift well inside the CI is "
+                        "indistinguishable from question-sampling noise.\n"
+                        "- Two runs of the *same* questionnaire still differ, "
+                        "because decoding at temperature 0 is greedy but not "
+                        "bit-reproducible on shared GPU infrastructure. "
+                        "Attribute a delta to a questionnaire change only if "
+                        "it exceeds that baseline wobble.\n"
+                        "- The denominators can differ too: if a question "
+                        "abstained in one run and committed in the other, "
+                        "$|A|$ changes, which moves every percentage slightly "
+                        "even for untouched questions."
+                    )
                 if not prof_a or not prof_b:
                     st.info("One of the runs has no aggregated profiles yet.")
                 else:

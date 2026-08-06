@@ -84,12 +84,13 @@ The app opens in your browser with five tabs:
 - **Audit** — pick a run, then filter and read every question's RAG answer,
   graded weights, and matcher reasoning (plus supporting quotes and grounding
   bucket when those checks were enabled).
-- **Hallucination** — the four opt-in checks for any saved run: alert banners
+- **Hallucination** — the five opt-in checks for any saved run: alert banners
   when a detection fires, retrieval-grounding buckets with a score histogram,
-  unverified-quote listings, the metamorphic eval (launchable
-  from this tab, flagged items shown variant-by-variant), and the
-  embedding-agreement check (binary + graded closeness metrics, launchable
-  from this tab).
+  unverified-quote listings, quote provenance (why each failed quote failed,
+  and whether its content holds up anyway — launchable from this tab), the
+  metamorphic eval (launchable from this tab, flagged items shown
+  variant-by-variant), and the embedding-agreement check (binary + graded
+  closeness metrics, launchable from this tab).
 - **Compare runs** — diff two snapshots: per-logic profile deltas (B − A),
   a question-wording and reference-answer diff (including per-question
   overrides), and a per-question answer/weight diff. This is how you see what
@@ -116,7 +117,7 @@ run at temperature 0.
 
 ## Hallucination & grounding checks (opt-in)
 
-Four additive checks, all black-box / API-only (no logits, weights, or
+Five additive checks, all black-box / API-only (no logits, weights, or
 attention — nothing the Together API doesn't expose). **All are off by
 default; a default run produces byte-identical output to before.**
 
@@ -228,6 +229,65 @@ the audited property is Attribution to Identified Sources
 evaluation follows ALCE
 ([Gao et al., 2023](https://aclanthology.org/2023.emnlp-main.398/)). Full
 reference list in ARCHITECTURE.md §9.2.
+
+### 2b. Quote provenance & paraphrase grounding — `scripts/06_run_quote_provenance.py`
+
+```bash
+# works on any saved run, including ones answered WITHOUT --quotes
+.venv/bin/python scripts/06_run_quote_provenance.py                 # CURRENT run
+.venv/bin/python scripts/06_run_quote_provenance.py --run 2026-07-01_120000
+```
+
+Check 2 answers one question with one bit, so a single ❌ conflates four
+different failures: a **copy that drifted** (curly quote, em-dash, an elided
+`…`), a **faithful paraphrase**, a **figure of speech** (scare quotes, terms of
+art, hypotheticals — quotation marks that never claimed anything about a
+source), and an actual **fabrication**. Only the last is a hallucination.
+
+This stage grades them, and adds the axis check 2 lacks entirely:
+
+```
+PROVENANCE   does this TEXT exist in the sources?     (no LLM)
+VERACITY     is what it ASSERTS supported by them?    (one LLM call, flagged spans only)
+```
+
+They are independent, so the verdict is a 2×2:
+
+| | content supported | content not supported |
+|---|---|---|
+| **text in sources** | `attributed` | `misattributed` |
+| **text not in sources** | `paraphrase_grounded` · `misquote_but_true` | `fabricated` |
+
+`misquote_but_true` is the interesting cell: the model manufactured a
+quotation, but the proposition underneath it *does* hold up against the
+evidence — a citation-integrity failure, not a factual one. Check 2 cannot tell
+that apart from outright invention.
+
+Spans are also triaged for **intent** before being graded, by deterministic cue
+rules (`the charter states …` → attributive; `so-called …` → scare quote;
+`a critic might say …` → hypothetical). Only attributive spans are graded, so
+figures of speech stop being counted as fabrications. Candidates come from the
+model's structured `quotes` *and* from quotation marks in the answer prose —
+which is why this works on runs that never used `--quotes`, and where the
+figures of speech actually live.
+
+Post-hoc over a saved run (it replays each row's evidence via `retrieved_ids`),
+so it needs no re-answering, **never rewrites check 2's `quotes_verified`**, and
+can be re-run freely after retuning thresholds. Cheapest-first and
+short-circuiting: a run whose quotes are all verbatim costs **zero** generation
+and zero embedding calls.
+
+> **`unsupported` ≠ false.** The evidence is scoped by (lab, source type) and
+> this pipeline has no world-knowledge oracle by design. `unsupported` means
+> *unsupported by this corpus*; a true claim the corpus is silent on lands
+> there too. Only `contradicted` is evidence **against** a span.
+
+Literature basis: the provenance/veracity split is the attribution-vs-correctness
+distinction from AIS ([Rashkin et al., 2023](https://aclanthology.org/2023.cl-4.2/);
+[Bohnet et al., 2022](https://arxiv.org/abs/2212.08037)); scoring a claim
+against retrieved evidence rather than its surface string follows FActScore
+([Min et al., 2023](https://aclanthology.org/2023.emnlp-main.741/)). Full
+derivation and reference list in ARCHITECTURE.md §9.5.
 
 ### 3. Metamorphic stability & evidence sensitivity — `scripts/03_run_metamorphic_eval.py`
 
@@ -385,8 +445,10 @@ understate the real uncertainty. Results land in the run's `bootstrap_ci/`
 ```
 
 The suite pins the invariant that default runs keep the exact original row
-schema, and covers grounding scores/buckets, quote verification, the paraphrase
-fidelity gates, distractor selection, and the stability math.
+schema, and covers grounding scores/buckets, quote verification, quote
+provenance (each ladder tier, each intent rule, and every cell of the 2×2
+verdict), the paraphrase fidelity gates, distractor selection, and the
+stability math.
 
 ## Outputs — run snapshots (`data/profiles/runs/<run_id>/`)
 
@@ -401,6 +463,12 @@ the active run (used for resumption). Each snapshot contains:
 - `questionnaire.json` — the exact questionnaire (questions + reference answers)
   that produced this run, so wording changes can be diffed
 - `meta.json` — label, timestamps, params, answered/abstained counts, status
+
+Optional checks write into subdirectories of the same snapshot:
+`metamorphic/`, `embedding_agreement/`, `bootstrap_ci/`, and
+`quote_provenance/` (`spans.jsonl` — one graded record per quoted span;
+`summary.json` — tier/intent/verdict histograms and rates, overall and per
+category and lab/source).
 
 Pre-snapshot results (flat files from before this layout) are migrated into a
 `legacy` run automatically on first launch. A console report still prints each
@@ -422,6 +490,7 @@ il_rag/
   grounding.py        opt-in: no-LLM retrieval-grounding score + buckets
   metamorphic.py      opt-in: control / paraphrase / ablation / distractor eval
   embedding_agreement.py  opt-in: non-LLM second judge (binary + graded)
+  quote_provenance.py opt-in: graded quote provenance x veracity (2x2 verdict)
   bootstrap_ci.py     confidence intervals over the profiles (seeded, no API)
   profile_harness.py  orchestration, aggregation, outputs, report
   runs.py             run snapshots: archive/list/compare, legacy migration
@@ -431,6 +500,7 @@ scripts/
   03_run_metamorphic_eval.py  stage 3 (optional): metamorphic eval
   04_run_embedding_agreement.py  stage 4 (optional): embedding second judge
   05_run_bootstrap_ci.py      stage 5 (optional): bootstrap error bars
+  06_run_quote_provenance.py  stage 6 (optional): graded quote provenance
 tests/                offline unit tests (pytest; all API calls stubbed)
 app.py                Streamlit GUI (Run / Results / Audit / Hallucination / Compare)
 Launch IL Profiler.command   double-clickable launcher (macOS)
@@ -444,4 +514,8 @@ profile run makes 162 generation calls + 162 matching calls + 162 query
 embeddings (`--grounding` adds nothing; `--quotes` changes the answer prompt
 but not the call count). A full metamorphic eval with all four probes at the
 default 3 paraphrases is ~2,400 chat calls (answer + match per variant, plus one
-generation call per paraphrase) — use `--sample`, or `--probes`, first. Stages are resumable, so an interrupted run loses nothing.
+generation call per paraphrase) — use `--sample`, or `--probes`, first. Quote
+provenance is cheapest-first and short-circuits: a run whose quotes are all
+verbatim costs nothing, and otherwise it is one chat call per non-verbatim span
+plus a handful of cached embeddings. Stages are resumable, so an interrupted run
+loses nothing.

@@ -75,7 +75,13 @@ def test_overrides_resolved_per_variant(tmp_path, monkeypatch):
     # The overridden reference must have been embedded (i.e. not the base
     # State text for variant 2), and the row must agree via it.
     assert any("OVERRIDDEN" in t for t in embedded)
-    assert summary["overall"] == {"n": 1, "agree": 1, "rate": 1.0}
+    assert summary["overall"]["n"] == 1
+    assert summary["overall"]["agree"] == 1
+    assert summary["overall"]["rate"] == 1.0
+    # Graded means must ride along on every slice, not just the top level.
+    assert "mean_share_on_matcher_top" in summary["overall"]
+    for slice_ in summary["by_category"].values():
+        assert "mean_share_on_matcher_top" in slice_ and "mean_overlap" in slice_
     sim_rows = [json.loads(l) for l in  # noqa: E741
                 (run_dir / "embedding_agreement" / "similarities.jsonl")
                 .read_text().splitlines()]
