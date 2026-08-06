@@ -86,7 +86,7 @@ The app opens in your browser with five tabs:
   bucket when those checks were enabled).
 - **Hallucination** — the four opt-in checks for any saved run: alert banners
   when a detection fires, retrieval-grounding buckets with a score histogram,
-  unverified-quote listings, the metamorphic label-stability eval (launchable
+  unverified-quote listings, the metamorphic eval (launchable
   from this tab, flagged items shown variant-by-variant), and the
   embedding-agreement check (binary + graded closeness metrics, launchable
   from this tab).
@@ -229,77 +229,120 @@ evaluation follows ALCE
 ([Gao et al., 2023](https://aclanthology.org/2023.emnlp-main.398/)). Full
 reference list in ARCHITECTURE.md §9.2.
 
-### 3. Metamorphic label-stability eval — `scripts/03_run_metamorphic_eval.py`
+### 3. Metamorphic stability & evidence sensitivity — `scripts/03_run_metamorphic_eval.py`
 
 ```bash
-# after a profile run exists; start with a sample — the full run is ~1,800 calls
+# after a profile run exists; start with a sample — the full run is ~2,400 calls
 .venv/bin/python scripts/03_run_metamorphic_eval.py --sample 30
 .venv/bin/python scripts/03_run_metamorphic_eval.py --run 2026-07-01_120000 --paraphrases 5
+.venv/bin/python scripts/03_run_metamorphic_eval.py --probes control paraphrase
 ```
 
-For each item of an existing run (after MetaQA, Yang et al. FSE 2025): the
-exact retrieved chunks are refetched by id and perturbed into *k*
-meaning-preserving **paraphrases** (LLM-generated) plus one **lab-name swap**
-(deterministic regex — e.g. every "OpenAI" becomes "DeepMind" — the described
-decisions stay intact). Each variant flows through the production
-answer → match path, and its predicted label (argmax logic, or abstain) is
-compared with the original run's:
+There are no gold labels here, so instead of checking whether an answer is
+right, this check **changes the evidence it was built from and watches what the
+label does**. For each item of an existing run the exact retrieved chunks are
+refetched by id, and four probes run — each re-answered and re-graded through
+the production answer → match path, so a changed label is down to the
+perturbation alone. Each probe is toggleable with `--probes`.
 
-- `label_stability` — fraction of paraphrase variants whose label matches the
-  original. A grounded label should survive paraphrase; items below
-  `METAMORPHIC_STABILITY_THRESHOLD` are flagged **unstable**.
-- `swap_label_changed` — the swap leaves the decision text intact, so a
-  grounded label should survive it too; a **flip** suggests the label was
-  keyed on the model's prior about the named lab rather than on the text.
+| Probe | In plain terms | What a grounded label should do |
+|---|---|---|
+| `control` | run it again, change nothing | keep the same label |
+| `paraphrase` | say the same thing in different words | keep the same label |
+| `ablation` | remove the excerpt the answer quoted | weaken, toward *abstain* |
+| `distractor` | ask the same question over real same-lab text that doesn't answer it | say the excerpts don't address this |
 
-**How the score is computed** (full derivation in ARCHITECTURE.md §9.3; the
+For the first two a **changed** label is suspicious. For the last two it is the
+reverse: a label that **survives** is the warning sign, because the answer
+plainly did not need the evidence it cited.
+
+**The control comes first.** It re-runs an item on unchanged evidence, so
+anything that flips there flipped on its own. `control_flip_rate` is the noise
+floor every other number is read against — and an item whose own control
+flipped is never counted as unstable, because its paraphrase result can't be
+interpreted.
+
+**Paraphrases must pass three gates, checked in code.** A rewrite that quietly
+changed meaning would show up as a label flip and be misread as a
+hallucination, so fidelity is verified rather than trusted to the prompt:
+
+1. **Facts kept** — every number, date and name in the original survives.
+2. **Actually reworded** — word overlap stays at or below
+   `PARAPHRASE_MAX_TOKEN_OVERLAP` (0.95), so a copy can't pass as a paraphrase.
+3. **Still means the same** — the rewrite must embed closer to its own excerpt
+   than to any sibling excerpt, with a floor of `PARAPHRASE_MIN_COSINE` (0.85).
+
+A rewrite failing any gate is **thrown out and retried, never scored**, and the
+rejection is reported with its reason.
+
+**How the scores are computed** (full derivation in ARCHITECTURE.md §9.3; the
 GUI's Hallucination tab has the same math in an expander):
 
 ```
-label(v)        = "abstain" if the matcher abstained, else argmax_k w_k
-                  (ties break by the fixed LOGICS order; abstain is a label)
-label_stability = |{ v ∈ P_ok : label(v) = label₀ }| / |P_ok|
-                  P_ok = paraphrase variants that ran without error
-unstable        = label_stability < θ
-swap flip       = label(swap) ≠ label₀
-swap_flip_rate  = n_swap_label_changed / n_swap_evaluated
+label(v)           = "abstain" if the matcher abstained, else argmax_k w_k
+                     (ties break by the fixed LOGICS order; abstain is a label)
+
+control_flip_rate  = |{ i : label(control_i) ≠ label₀(i) }| / n_control
+
+label_stability    = |{ v ∈ P_ok : label(v) = label₀ }| / |P_ok|
+                     P_ok = rewrites that ran AND passed all three gates
+unstable           = label_stability < θ  ∧  the item's control did NOT flip
+
+ablation_survival_rate = |{ i : label(abl_i) = label₀ ≠ "abstain" }| / n_abl
+prior_leak_rate        = |{ i : label(dis_i) = label₀ ≠ "abstain" }| / n_dis
 ```
 
-Failed variants (paraphrase parse failure, missing chunks) are excluded from
-denominators — never counted as flips. Config: `k` =
-`METAMORPHIC_PARAPHRASES` (3), `θ` = `METAMORPHIC_STABILITY_THRESHOLD`
-(1.0 — any single flip flags the item; relax if paraphrase noise is high),
-paraphrase temperature = `METAMORPHIC_PARAPHRASE_TEMPERATURE` (0.9, so the
-k variants differ; answering and matching stay at temperature 0).
+Failed and rejected variants are excluded from denominators — never counted as
+flips. Config: `k` = `METAMORPHIC_PARAPHRASES` (3), `θ` =
+`METAMORPHIC_STABILITY_THRESHOLD` (1.0 — any single flip flags the item; relax
+if paraphrase noise is high), paraphrase temperature =
+`METAMORPHIC_PARAPHRASE_TEMPERATURE` (0.7, so the k variants differ; answering
+and matching stay at temperature 0).
 
-*Worked example* (the case pinned by
-`tests/test_metamorphic.py::test_compute_stability_paraphrases_and_swap`):
-an item labeled `State` gets 3 paraphrases; 2 keep the label, 1 flips →
-`label_stability = 2/3 ≈ 0.67 < θ = 1.0` → **unstable**. Its lab-swap
-variant comes back `Market` ≠ `State` → **swap flip**.
+*Worked example:* an item labeled `State` gets 3 rewrites; one is discarded for
+dropping a figure, of the remaining 2 both keep the label → `label_stability =
+1.0`, stable. Its distractor variant — the same question over excerpts
+retrieved for an unrelated category of the same lab — comes back `State`
+again → **prior-keyed**: the label reappeared without the evidence that was
+supposed to produce it.
+
+`prior_leak_rate` is the headline detection metric, and it replaces the
+lab-name swap that earlier versions used. That arm renamed the lab throughout
+the evidence and read a flip as prior-keying, but the rename changes what the
+question asks *and* left product names and people untouched, so the model was
+being shown a self-contradictory document and a flip could not be pinned on the
+name. The distractor probe tests the same worry with text that is real and
+correctly named. See ARCHITECTURE.md §9.3 for the full argument.
 
 Outputs land inside the evaluated run's snapshot
-(`data/profiles/runs/<run_id>/metamorphic/`): `variants.jsonl` (resumable
-audit trail) and `stability.json` (per-item records + aggregate summary,
-including stability by category and — if the run used `--grounding` — by
-bucket). The console report prints stability alongside the run's profiles.
+(`data/profiles/runs/<run_id>/metamorphic/`): `variants.jsonl` (resumable audit
+trail — paraphrase rows carry the original excerpts next to their rewrites, so
+a flagged item can be checked by hand) and `stability.json` (per-item records +
+aggregate summary, including stability by category and — if the run used
+`--grounding` — by bucket). The console report prints the noise floor first,
+then everything else.
 
-> **Self-referential caveat:** the same model (gpt-oss-120b) generates the
-> paraphrases and classifies them, so "meaning-preserving" is only as good as
-> the model's own judgment, and stability numbers inherit that circularity.
-> Anchor them by human-auditing a small sample of `variants.jsonl` — check
-> that paraphrases genuinely preserve the decision content, and that flagged
-> flips aren't artifacts of a drifted paraphrase — before reading the
-> aggregate numbers as evidence.
+> **What is still taken on trust:** the gates verify facts, wording and topic,
+> but not shifts of emphasis subtle enough to clear all three. The distractor
+> probe also uses *unrelated* evidence, a harder test than the merely thin
+> evidence a real run meets, so `prior_leak_rate` is an upper bound on the
+> tendency rather than its production rate. Skim a few flagged variants before
+> reading the aggregates as evidence.
 
 Literature basis: metamorphic testing for the no-oracle setting
 ([Chen et al., 1998](https://arxiv.org/abs/2002.12543); survey:
 [Segura et al., 2016](https://doi.org/10.1109/TSE.2016.2532875));
-invariance tests under label-preserving perturbations incl. name swaps
+invariance tests under label-preserving perturbations
 ([Ribeiro et al., 2020](https://aclanthology.org/2020.acl-main.442/));
 consistency under paraphrase
 ([Elazar et al., 2021](https://aclanthology.org/2021.tacl-1.60/)); MetaQA
-([Yang et al., FSE 2025](https://conf.researchr.org/details/fse-2025/fse-2025-research-papers/48/Hallucination-Detection-in-Large-Language-Models-with-Metamorphic-Relations)).
+([Yang et al., FSE 2025](https://conf.researchr.org/details/fse-2025/fse-2025-research-papers/48/Hallucination-Detection-in-Large-Language-Models-with-Metamorphic-Relations));
+abstention on unsupported questions
+([Rajpurkar et al., 2018](https://aclanthology.org/P18-2124/)); parametric
+knowledge overriding the context
+([Longpre et al., 2021](https://aclanthology.org/2021.emnlp-main.565/));
+sampling-based consistency as a baseline
+([Manakul et al., 2023](https://aclanthology.org/2023.emnlp-main.557/)).
 Full reference list in ARCHITECTURE.md §9.3.
 
 ### 4. Embedding agreement — `scripts/04_run_embedding_agreement.py`
@@ -342,8 +385,8 @@ understate the real uncertainty. Results land in the run's `bootstrap_ci/`
 ```
 
 The suite pins the invariant that default runs keep the exact original row
-schema, and covers grounding scores/buckets, quote verification, lab-swap
-substitution, and the stability math.
+schema, and covers grounding scores/buckets, quote verification, the paraphrase
+fidelity gates, distractor selection, and the stability math.
 
 ## Outputs — run snapshots (`data/profiles/runs/<run_id>/`)
 
@@ -377,7 +420,7 @@ il_rag/
   rag_qa.py           retrieve -> grounded free-form answer (opt-in: quotes)
   graded_matcher.py   answer -> weight distribution over the 7 logics
   grounding.py        opt-in: no-LLM retrieval-grounding score + buckets
-  metamorphic.py      opt-in: paraphrase / lab-swap label-stability eval
+  metamorphic.py      opt-in: control / paraphrase / ablation / distractor eval
   embedding_agreement.py  opt-in: non-LLM second judge (binary + graded)
   bootstrap_ci.py     confidence intervals over the profiles (seeded, no API)
   profile_harness.py  orchestration, aggregation, outputs, report
@@ -385,7 +428,7 @@ il_rag/
 scripts/
   01_ingest.py                stage 1: build the index
   02_run_profiles.py          stage 2: produce the profiles
-  03_run_metamorphic_eval.py  stage 3 (optional): label-stability eval
+  03_run_metamorphic_eval.py  stage 3 (optional): metamorphic eval
   04_run_embedding_agreement.py  stage 4 (optional): embedding second judge
   05_run_bootstrap_ci.py      stage 5 (optional): bootstrap error bars
 tests/                offline unit tests (pytest; all API calls stubbed)
@@ -399,6 +442,6 @@ Launch IL Profiler.bat       double-clickable launcher (Windows)
 Ingestion embeds the full corpora (thousands of embedding calls). A full
 profile run makes 162 generation calls + 162 matching calls + 162 query
 embeddings (`--grounding` adds nothing; `--quotes` changes the answer prompt
-but not the call count). A full metamorphic eval at the default 3 paraphrases
-is ~1,800 chat calls (paraphrase + answer + match per variant) — use
-`--sample` first. Stages are resumable, so an interrupted run loses nothing.
+but not the call count). A full metamorphic eval with all four probes at the
+default 3 paraphrases is ~2,400 chat calls (answer + match per variant, plus one
+generation call per paraphrase) — use `--sample`, or `--probes`, first. Stages are resumable, so an interrupted run loses nothing.

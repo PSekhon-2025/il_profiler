@@ -41,11 +41,14 @@ from il_rag.config import (
     CHROMA_DIR,
     COLLECTION_NAME,
     GROUNDING_LOW_THRESHOLD,
-    LAB_SWAP,
+    METAMORPHIC_CONTROLS,
     METAMORPHIC_PARAPHRASES,
     METAMORPHIC_PARAPHRASE_TEMPERATURE,
+    METAMORPHIC_PROBES,
     METAMORPHIC_STABILITY_THRESHOLD,
     ORGS,
+    PARAPHRASE_MAX_TOKEN_OVERLAP,
+    PARAPHRASE_MIN_COSINE,
     SOURCE_TYPES,
 )
 from il_rag.questionnaire import CATEGORIES, LOGICS
@@ -332,23 +335,38 @@ def build_quotes_exports(dfh: pd.DataFrame):
 
 
 def build_metamorphic_exports(stab: dict | None, variants: pd.DataFrame | None):
-    """Check 3 — per-item stability verdicts and the per-variant audit trail."""
+    """Check 3 — per-item probe verdicts and the per-variant audit trail."""
     items = None
     if stab and stab.get("per_item"):
         items = pd.DataFrame(stab["per_item"])
         items["stability_threshold"] = METAMORPHIC_STABILITY_THRESHOLD
         items = items.rename(columns={
             "unstable": "decision_unstable",
-            "swap_label_changed": "decision_swap_label_changed",
+            "control_flipped": "decision_control_flipped",
+            "label_survived_ablation": "decision_label_survived_ablation",
+            "prior_keyed": "decision_prior_keyed",
         })
     var = None
     if variants is not None and not variants.empty:
         keep = ["org", "source_type", "qid", "category", "variant",
-                "variant_kind", "variant_idx", "original_label", "swap_to",
+                "variant_kind", "variant_idx", "original_label",
                 "question", "answer", "abstain", "reasoning", "label",
-                "label_matches_original", "error"]
+                "label_matches_original", "ablation_basis",
+                "ablation_removed_id", "distractor_category",
+                "distractor_grounding", "error"]
         var = variants[[c for c in keep if c in variants.columns]].rename(
             columns={"label_matches_original": "decision_label_matches_original"})
+        # The fidelity block is a dict per row; flatten the two fields a reader
+        # of the CSV actually needs (why a rewrite was thrown out, how far it
+        # moved) rather than dumping raw JSON into a cell.
+        if "fidelity" in variants.columns:
+            fid = variants["fidelity"].apply(
+                lambda f: f if isinstance(f, dict) else {})
+            var = var.assign(
+                paraphrase_rejected_reason=fid.apply(lambda f: f.get("reason")),
+                paraphrase_divergence=fid.apply(lambda f: f.get("divergence")),
+                paraphrase_min_cosine=fid.apply(lambda f: f.get("min_cosine")),
+            )
     return items, var
 
 
@@ -407,7 +425,7 @@ def build_detection_bundle(run_id: str, dfh: pd.DataFrame,
         members.append(("3_metamorphic_items.csv", csv_bytes(mm_items)))
         if mm_var is not None:
             members.append(("3_metamorphic_variants.csv", csv_bytes(mm_var)))
-        ran.append("metamorphic stability")
+        ran.append("metamorphic stability & evidence sensitivity")
 
     emb_rows = build_embedding_export(load_embedding_rows(run_id))
     if emb_rows is not None:
@@ -451,12 +469,17 @@ def _bundle_readme(run_id: str, ran: list[str]) -> str:
         "(verified / unverified / no_quotes) + the cited spans.\n"
         "2_quote_verification_spans.csv   per cited span: whether that exact "
         "span was found verbatim in the retrieved sources.\n"
-        "3_metamorphic_items.csv          per item: unstable + swap-flip "
-        "decisions with label_stability and the original/swapped labels.\n"
+        "3_metamorphic_items.csv          per item, one column per probe "
+        "decision: control_flipped (pipeline noise), unstable (a paraphrase\n"
+        "                                 changed the label), "
+        "label_survived_ablation (the label held after its quoted excerpt was\n"
+        "                                 removed), prior_keyed (the same label "
+        "came back from text that doesn't answer the question).\n"
         f"                                 Stability threshold theta = "
         f"{METAMORPHIC_STABILITY_THRESHOLD}.\n"
-        "3_metamorphic_variants.csv       per paraphrase / lab-swap variant: "
-        "its label and whether it matched the original (the audit trail).\n"
+        "3_metamorphic_variants.csv       per variant: its label, whether it "
+        "matched the original, and why a rewrite was thrown out (the audit\n"
+        "                                 trail).\n"
         "4_embedding_agreement.csv        per answer: agree (decision) + the "
         "matcher's top logic, the embedding-nearest logic, the margin, and\n"
         "                                 the 7 per-logic cosine similarities "
@@ -938,9 +961,10 @@ with tab_halluc:
     st.caption(
         "Four black-box checks: **retrieval grounding** (was there relevant "
         "text to answer from?), **quote verification** (does the cited support "
-        "actually appear in the sources?), **metamorphic stability** (does "
-        "the label survive paraphrase and a lab-name swap?), and **embedding "
-        "agreement** (does a non-LLM judge rank the same reference nearest?)."
+        "actually appear in the sources?), **metamorphic stability & evidence "
+        "sensitivity** (does the label survive a reword — and does it stop when "
+        "the supporting evidence is taken away?), and **embedding agreement** "
+        "(does a non-LLM judge rank the same reference nearest?)."
     )
     hal_run = run_selectbox("Run to inspect", key="halluc_run",
                             default_run_id=runs.get_current())
@@ -992,12 +1016,18 @@ with tab_halluc:
                                f"🎲 **{s['n_unstable']} unstable item(s)**: the "
                                f"predicted logic flipped under meaning-preserving "
                                f"paraphrase. See section 3."))
-            if s.get("n_swap_label_changed"):
+            if s.get("n_prior_keyed"):
                 alerts.append(("error",
-                               f"🏷️ **{s['n_swap_label_changed']} lab-swap flip(s)**: "
-                               f"the label changed when only the lab's NAME changed — "
-                               f"the model may be keyed on its prior about the lab, "
-                               f"not the text. See section 3."))
+                               f"🧠 **{s['n_prior_keyed']} item(s) answered from a "
+                               f"prior, not the text**: given real text from the same "
+                               f"lab that does NOT address the question, the model "
+                               f"returned the same logic anyway. See section 3."))
+            if s.get("n_label_survived_ablation"):
+                alerts.append(("warning",
+                               f"🕳️ **{s['n_label_survived_ablation']} item(s) kept "
+                               f"their label without their evidence**: removing the "
+                               f"excerpt the answer quoted changed nothing. See "
+                               f"section 3."))
         if emb and emb["overall"].get("rate") is not None \
                 and emb["overall"]["rate"] < 0.5:
             alerts.append(("warning",
@@ -1302,23 +1332,25 @@ with tab_halluc:
                 st.caption("Every quoted span was found verbatim in its retrieved "
                            "sources.")
 
-        # ---------------- 3 · Metamorphic label stability ----------------
-        st.subheader("3 · Metamorphic label stability")
-        with st.expander("ℹ️ How stability is computed", expanded=False):
+        # ------- 3 · Metamorphic stability & evidence sensitivity -------
+        st.subheader("3 · Metamorphic stability & evidence sensitivity")
+        with st.expander("ℹ️ How these checks work", expanded=False):
             st.markdown(
                 "There are no gold labels in this pipeline, so correctness "
-                "can't be checked directly. Instead this check tests an "
-                "**invariance relation**: a label that is grounded in the "
-                "text should survive a meaning-preserving rewrite of that "
-                "text. The same notation is used in ARCHITECTURE.md §9.3 and "
+                "can't be checked directly. Instead we **change the evidence "
+                "an answer was built from and watch what the label does**. "
+                "Four probes run against each answered item, all through the "
+                "same answer → match pipeline as the original run, so any "
+                "change in the label comes from the perturbation and nothing "
+                "else. The same notation is used in ARCHITECTURE.md §9.3 and "
                 "the README."
             )
             st.markdown(
-                "**Step 1 — the label.** Each answered item's label is the "
-                "matcher's abstention, or else the top-weight logic (ties "
-                "break deterministically by the fixed logic order). "
-                "*Abstain is a label, not a gap* — a paraphrase that abstains "
-                "matches only if the original also abstained:"
+                "**Step 1 — the label.** Each item's label is the matcher's "
+                "abstention, or else the top-weight logic (ties break "
+                "deterministically by the fixed logic order). *Abstain is a "
+                "label, not a gap* — a variant that abstains matches only if "
+                "the original also abstained:"
             )
             st.latex(
                 r"\mathrm{label}(v)=\begin{cases}"
@@ -1327,114 +1359,223 @@ with tab_halluc:
                 r"\end{cases}"
             )
             st.markdown(
-                "**Step 2 — the variants.** For each item, "
-                f"$k = {METAMORPHIC_PARAPHRASES}$ meaning-preserving "
-                "paraphrases of its retrieved chunks are generated by the "
-                "LLM under a strict preservation rule (*\"every fact, name, "
-                "number, date, and claim is preserved exactly while the "
-                "wording and sentence structure change substantially\"*), "
-                f"sampled at temperature {METAMORPHIC_PARAPHRASE_TEMPERATURE} "
-                "so the $k$ variants differ — plus **one lab-name swap**: a "
-                "deterministic, case-insensitive, word-boundaried regex that "
-                "replaces every alias of the lab "
-                f"({', '.join(f'{a} → {b}' for a, b in LAB_SWAP.items())}), "
-                "longest alias first, in the chunks *and* the question. No "
-                "LLM touches the swap, so the swap itself cannot drift the "
-                "text's meaning."
+                "**Step 2 — the four probes.** Two ask whether the label "
+                "*survives* something harmless; two ask whether it *stops* "
+                "when it should.\n\n"
+                "| Probe | In plain terms | What a grounded label should do |\n"
+                "|---|---|---|\n"
+                "| **Control** | run it again, change nothing | keep the same "
+                "label — anything else is noise |\n"
+                "| **Paraphrase** | say the same thing in different words | "
+                "keep the same label |\n"
+                "| **Ablation** | remove the excerpt the answer quoted | "
+                "weaken, and lean toward *abstain* |\n"
+                "| **Distractor** | ask the same question about real text from "
+                "the same lab that doesn't answer it | say the excerpts don't "
+                "address this |\n\n"
+                "For the first two, a **changed** label is suspicious. For the "
+                "last two it is the opposite: a label that **survives** is the "
+                "warning sign, because the answer clearly didn't need the "
+                "evidence it cited."
             )
             st.markdown(
-                "**Step 3 — re-run the production path.** Every variant goes "
-                "through the exact same answer → match pipeline as the "
-                "original run (same refetched chunks, temperature 0), so a "
-                "changed label is attributable to the text perturbation "
-                "alone."
+                "**Step 3 — the control, and why it comes first.** The control "
+                "re-runs an item on its *unchanged* evidence. Anything that "
+                "flips here flipped on its own, so this is the floor every "
+                "other number is read against — and an item whose own control "
+                "flipped is never called unstable:"
+            )
+            st.latex(
+                r"\mathrm{control\_flip\_rate}=\frac{\left|\{\,i:"
+                r"\mathrm{label}(\mathrm{control}_i)\neq\mathrm{label}_0(i)\,\}"
+                r"\right|}{n_{\mathrm{control}}}"
             )
             st.markdown(
-                "**Step 4 — stability score.** With $P_{ok}$ the paraphrase "
-                "variants that ran without error and $\\mathrm{label}_0$ the "
-                "original run's label:"
+                f"**Step 4 — paraphrases, and the three gates they must pass.** "
+                f"$k = {METAMORPHIC_PARAPHRASES}$ rewrites of the item's "
+                f"excerpts are generated by the LLM at temperature "
+                f"{METAMORPHIC_PARAPHRASE_TEMPERATURE}. Because a rewrite that "
+                f"quietly changed meaning would show up as a hallucination, "
+                f"**fidelity is checked in code, not taken on trust.** Each "
+                f"rewrite must pass all three:\n\n"
+                f"1. **Facts kept** — every number, date and name in the "
+                f"original still appears in the rewrite.\n"
+                f"2. **Actually reworded** — word overlap with the original "
+                f"stays at or below {PARAPHRASE_MAX_TOKEN_OVERLAP}, so a copy "
+                f"can't pass as a paraphrase.\n"
+                f"3. **Still means the same** — the rewrite must be closer "
+                f"(by embedding) to its own excerpt than to any other excerpt "
+                f"of the item, with a floor of {PARAPHRASE_MIN_COSINE}.\n\n"
+                f"A rewrite that fails any gate is **thrown out and retried**, "
+                f"never scored — a bad paraphrase says nothing about the "
+                f"model. With $P_{{ok}}$ the rewrites that ran *and* passed, "
+                f"and $\\mathrm{{label}}_0$ the original label:"
             )
             st.latex(
                 r"\mathrm{label\_stability}="
                 r"\frac{|\{\,v\in P_{ok} : \mathrm{label}(v)=\mathrm{label}_0\,\}|}"
                 r"{|P_{ok}|}"
-            )
-            st.latex(
+                r"\qquad\quad"
                 r"\mathrm{unstable}\iff\mathrm{label\_stability}<\theta"
-                r"\qquad\qquad"
-                r"\mathrm{swap\ flip}\iff\mathrm{label}(\mathrm{swap})\neq\mathrm{label}_0"
+                r"\ \wedge\ \neg\,\mathrm{control\ flipped}"
             )
             st.markdown(
                 f"with $\\theta = {METAMORPHIC_STABILITY_THRESHOLD}$ "
-                "(`METAMORPHIC_STABILITY_THRESHOLD` in `il_rag/config.py`). "
-                "The summary reports the mean stability over scored items, "
-                "the share of fully stable items, and "
-                "$\\mathrm{swap\\_flip\\_rate} = n_{\\text{changed}} / "
-                "n_{\\text{evaluated}}$.\n\n"
+                "(`METAMORPHIC_STABILITY_THRESHOLD` in `il_rag/config.py`)."
+            )
+            st.markdown(
+                "**Step 5 — the two probes that expect the label to stop.** "
+                "Ablation removes the excerpt the answer quoted (the one check "
+                "2 verified, else the top-ranked one). The distractor keeps the "
+                "question but swaps in real excerpts retrieved for a different "
+                "question of the *same lab and source type* — correct names, "
+                "coherent text, wrong topic — and any set that turns out to be "
+                "relevant to the original question (by check 1's grounding "
+                "score) is rejected rather than scored. Answering anyway is a "
+                "problem; answering with the **same logic as before** is the "
+                "strongest hallucination signal this pipeline can produce:"
+            )
+            st.latex(
+                r"\mathrm{ablation\_survival\_rate}=\frac{\left|\{\,i:"
+                r"\mathrm{label}(\mathrm{abl}_i)=\mathrm{label}_0(i)\neq"
+                r"\texttt{abstain}\,\}\right|}{n_{\mathrm{abl}}}"
+            )
+            st.latex(
+                r"\mathrm{prior\_leak\_rate}=\frac{\left|\{\,i:"
+                r"\mathrm{label}(\mathrm{dis}_i)=\mathrm{label}_0(i)\neq"
+                r"\texttt{abstain}\,\}\right|}{n_{\mathrm{dis}}}"
+            )
+            st.markdown(
                 "**Design decisions**\n"
-                "- *Failed variants are excluded from denominators*, never "
-                "counted as flips — a paraphrase parse failure is evidence "
-                "of nothing about stability.\n"
+                "- *Failed and rejected variants are excluded from every "
+                "denominator*, never counted as flips — a call that failed or "
+                "a rewrite that broke the rules is evidence of nothing. Their "
+                "counts are reported separately so each probe's health stays "
+                "visible.\n"
                 f"- *$\\theta = {METAMORPHIC_STABILITY_THRESHOLD}$ is the "
                 "strictest setting*: any single paraphrase flip flags the "
                 "item. Relax it in `config.py` if paraphrase noise is high.\n"
-                "- *A paraphrase flip and a swap flip mean different "
-                "things.* A paraphrase flip says the label isn't robust to "
-                "rewording. A swap flip says the label changed when **only "
-                "the lab's name** changed — evidence the model keys on its "
-                "prior about the lab rather than on the text.\n"
-                "- When the run also has grounding scores (check 1), "
-                "stability is broken down by grounding bucket — the checks "
-                "cross-validate each other.\n\n"
-                "**Limitations** — the check is *self-referential*: the same "
-                "model generates the paraphrases and classifies them, so "
-                "\"meaning-preserving\" is only as good as the model's own "
-                "judgment — audit a sample of `variants.jsonl` by hand. "
-                "Paraphrase fidelity is attested by the prompt, not "
-                "verified. And at "
-                f"$k = {METAMORPHIC_PARAPHRASES}$ stability is "
+                "- *The noise floor gates the verdict, not just the reading.* "
+                "An item whose control flipped is reported but not counted as "
+                "unstable, because its paraphrase result is uninterpretable.\n"
+                "- *Gate 3 is rank-based on purpose.* e5 squeezes absolute "
+                "cosines into a narrow band (the same reason check 4 only "
+                "reads rankings), so the real test is \"nearest to its own "
+                f"excerpt\"; {PARAPHRASE_MIN_COSINE} is a coarse guard, not a "
+                "calibrated threshold.\n"
+                "- When the run also has grounding scores (check 1), stability "
+                "is broken down by grounding bucket — the checks "
+                "cross-validate each other.\n"
+            )
+            st.markdown(
+                "**Why there is no lab-name swap any more.** An earlier "
+                "version renamed the lab throughout the evidence (OpenAI → "
+                "DeepMind, and so on) and read a label change as proof the "
+                "model was going on its prior about the lab. That test was "
+                "dropped: renaming a lab changes what the question is asking, "
+                "and the rename only caught the lab's name — product names, "
+                "people and events stayed put — so the model was being shown a "
+                "document that contradicted itself. A flip could not be pinned "
+                "on the name. The **distractor** probe answers the same "
+                "underlying question with text that is real and correctly "
+                "named, so its number means what it says."
+            )
+            st.markdown(
+                "**Limitations** — the fidelity gates check facts, wording and "
+                "topic, but not subtle shifts in emphasis, so a rewrite can "
+                "still pass and read slightly differently. The distractor "
+                "probe shows how the model behaves on *unrelated* evidence, "
+                "which is a harder test than the merely thin evidence it meets "
+                "in a real run. And at "
+                f"$k = {METAMORPHIC_PARAPHRASES}$ per-item stability is "
                 "coarse-grained (steps of "
-                f"$1/{METAMORPHIC_PARAPHRASES}$).\n\n"
+                f"$1/{METAMORPHIC_PARAPHRASES}$) — the aggregates are the "
+                "readable numbers. Flagged items are worth a look by hand; the "
+                "originals and rewrites are shown below for exactly that.\n\n"
                 "**Basis in the literature** — testing output *relations* "
                 "under input transformations when no oracle exists is "
                 "metamorphic testing "
                 "([Chen et al., 1998](https://arxiv.org/abs/2002.12543); "
                 "survey: [Segura et al., 2016]"
                 "(https://doi.org/10.1109/TSE.2016.2532875)); "
-                "label-preserving perturbations incl. name substitutions "
-                "follow CheckList's invariance tests "
-                "([Ribeiro et al., 2020]"
+                "label-preserving perturbations follow CheckList's invariance "
+                "tests ([Ribeiro et al., 2020]"
                 "(https://aclanthology.org/2020.acl-main.442/)); prediction "
                 "consistency under paraphrase follows "
                 "([Elazar et al., 2021]"
                 "(https://aclanthology.org/2021.tacl-1.60/)); metamorphic "
                 "relations for LLM hallucination detection follow MetaQA "
                 "([Yang et al., FSE 2025]"
-                "(https://conf.researchr.org/details/fse-2025/fse-2025-research-papers/48/Hallucination-Detection-in-Large-Language-Models-with-Metamorphic-Relations)). "
+                "(https://conf.researchr.org/details/fse-2025/fse-2025-research-papers/48/Hallucination-Detection-in-Large-Language-Models-with-Metamorphic-Relations)); "
+                "the distractor probe's expected behaviour — abstaining when "
+                "the evidence doesn't support an answer — follows "
+                "([Rajpurkar et al., 2018]"
+                "(https://aclanthology.org/P18-2124/)), and reading a surviving "
+                "label as the model preferring what it already believed over "
+                "what it was shown follows ([Longpre et al., 2021]"
+                "(https://aclanthology.org/2021.emnlp-main.565/)); "
+                "re-running an unchanged input to establish a noise floor "
+                "follows sampling-based consistency checking "
+                "([Manakul et al., 2023]"
+                "(https://aclanthology.org/2023.emnlp-main.557/)). "
                 "Full reference list in ARCHITECTURE.md §9.3."
             )
         with st.expander("Run the metamorphic eval for this snapshot",
                          expanded=stab is None):
             st.caption(
-                "For each item: k LLM paraphrases of its retrieved chunks + one "
-                "deterministic lab-name swap, each re-answered and re-graded "
-                "through the production path. A grounded label survives both. "
-                "Resumable; results land inside this run's folder."
+                "Pick which probes to run. Every variant is re-answered and "
+                "re-graded through the production path. Resumable — turning a "
+                "probe on later only runs the variants you added. Results land "
+                "inside this run's folder."
             )
+            p1, p2, p3, p4 = st.columns(4)
+            use_control = p1.checkbox(
+                "Control", value=True, key="mm_p_control",
+                help="Same evidence, run again. The noise floor — keep this on "
+                     "unless you already know it.")
+            use_para = p2.checkbox(
+                "Paraphrase", value=True, key="mm_p_para",
+                help="Same meaning, different words. A changed label is "
+                     "suspicious.")
+            use_abl = p3.checkbox(
+                "Ablation", value=True, key="mm_p_abl",
+                help="Removes the excerpt the answer quoted. A label that "
+                     "survives is suspicious.")
+            use_dis = p4.checkbox(
+                "Distractor", value=True, key="mm_p_dis",
+                help="Real same-lab text that doesn't answer the question. "
+                     "The right response is to abstain.")
+            probes = [p for p, on in (("control", use_control),
+                                      ("paraphrase", use_para),
+                                      ("ablation", use_abl),
+                                      ("distractor", use_dis)) if on]
+
             c1, c2, c3 = st.columns(3)
-            n_para = c1.number_input("Paraphrases per item", 1, 10, 3,
-                                     key="mm_para")
+            n_para = c1.number_input("Paraphrases per item", 1, 10,
+                                     METAMORPHIC_PARAPHRASES, key="mm_para",
+                                     disabled=not use_para)
             mm_sample = c2.number_input("Sample size (0 = all items)", 0, 500, 30,
                                         key="mm_sample")
             mm_seed = c3.number_input("Sample seed", 0, 9999, 0, key="mm_seed")
+
             n_items = len(dfh) if not mm_sample else min(int(mm_sample), len(dfh))
-            st.caption(f"≈ {n_items} item(s) × ({int(n_para)} paraphrases + 1 swap) "
-                       f"≈ {n_items * (3 * int(n_para) + 2)} chat calls.")
+            n_variants = (METAMORPHIC_CONTROLS * use_control
+                          + int(n_para) * use_para + use_abl + use_dis)
+            # Each variant costs an answer call plus a matching call; each
+            # paraphrase costs one more call to generate the rewrite.
+            n_calls = n_items * (2 * n_variants + int(n_para) * use_para)
+            if not probes:
+                st.warning("Select at least one probe.")
+            else:
+                st.caption(f"≈ {n_items} item(s) × {n_variants} variant(s) "
+                           f"≈ {n_calls} chat calls.")
             if st.button("Run metamorphic eval", type="primary",
-                         disabled=not api_key_present() or not hal_run,
+                         disabled=not api_key_present() or not hal_run
+                         or not probes,
                          key="mm_go"):
                 args = [PYTHON, "scripts/03_run_metamorphic_eval.py",
                         "--run", hal_run,
+                        "--probes", *probes,
                         "--paraphrases", str(int(n_para)),
                         "--seed", str(int(mm_seed))]
                 if mm_sample:
@@ -1452,28 +1593,71 @@ with tab_halluc:
         if stab:
             s = stab["summary"]
             items = pd.DataFrame(stab["per_item"])
-            st.caption(f"Evaluated {s['items']} item(s) "
-                       f"({s['paraphrases_per_item']} paraphrases + 1 swap each"
-                       + (f", sample={s['sample']}" if s.get("sample") else "")
-                       + ") — self-referential: the same model paraphrases and "
-                         "classifies, so audit a few variants by hand.")
-            m1, m2, m3, m4 = st.columns(4)
+
+            def _flag(col) -> pd.Series:
+                """A column as a boolean mask, tolerating older result files."""
+                series = items.get(col)
+                if series is None:
+                    return pd.Series(False, index=items.index)
+                return series.fillna(False).astype(bool)
+
+            ran = s.get("probes") or ["paraphrase"]
+            st.caption(f"Evaluated {s['items']} item(s) — probes: "
+                       + ", ".join(ran)
+                       + (f", sample={s['sample']}" if s.get("sample") else ""))
+
+            def _rate(key, fmt="{:.2f}"):
+                v = s.get(key)
+                return "—" if v is None else fmt.format(v)
+
+            m1, m2, m3 = st.columns(3)
+            m1.metric("🎛️ Control flip rate", _rate("control_flip_rate"),
+                      help="how often the label changed with NOTHING changed. "
+                           "This is the noise floor — read every number below "
+                           "against it.")
+            m2.metric("🧠 Prior leak rate", _rate("prior_leak_rate"),
+                      help="how often the original label came back from text "
+                           "that doesn't answer the question — the model went "
+                           "on what it already believed. Higher is worse.")
+            m3.metric("🕳️ Survived ablation", _rate("ablation_survival_rate"),
+                      help="how often the label held after the excerpt the "
+                           "answer quoted was removed — the answer didn't need "
+                           "its evidence. Higher is worse.")
+
+            m4, m5, m6 = st.columns(3)
             ms = s.get("mean_label_stability")
-            m1.metric("Mean label stability",
+            m4.metric("Mean label stability",
                       "—" if ms is None else f"{ms:.2f}",
-                      help="fraction of paraphrase variants keeping the "
-                           "original label, averaged over items")
+                      help="fraction of paraphrases keeping the original "
+                           "label, averaged over items. Higher is better.")
             pf = s.get("pct_fully_stable")
-            m2.metric("Fully stable items",
-                      "—" if pf is None else f"{pf:.0f}%")
-            m3.metric("🎲 Unstable items", s.get("n_unstable", 0),
+            m5.metric("Fully stable items", "—" if pf is None else f"{pf:.0f}%")
+            m6.metric("🎲 Unstable items", s.get("n_unstable", 0),
                       delta=None if not s.get("n_unstable") else "detection",
-                      delta_color="inverse")
-            m4.metric("🏷️ Lab-swap flips",
-                      f"{s.get('n_swap_label_changed', 0)}"
-                      f"/{s.get('n_swap_evaluated', 0)}",
-                      help="label changed although only the lab's name changed "
-                           "— suggests prior-keyed, not text-grounded")
+                      delta_color="inverse",
+                      help="a paraphrase changed the label, and the item's own "
+                           "control did not — so it isn't just noise.")
+
+            if s.get("mean_paraphrase_divergence") is not None \
+                    or s.get("n_paraphrases_rejected"):
+                q1, q2, q3 = st.columns(3)
+                rejected = s.get("n_paraphrases_rejected", 0)
+                reasons = s.get("rejected_by_reason") or {}
+                q1.metric("Rewrites thrown out", rejected,
+                          help="failed a fidelity gate or the call itself — "
+                               "discarded, never counted as a flip. "
+                               + (", ".join(f"{r}: {n}"
+                                            for r, n in reasons.items())
+                                  if reasons else "none"))
+                q2.metric("Wording changed",
+                          _rate("mean_paraphrase_divergence"),
+                          help="how far the rewrites moved from the original "
+                               "wording (0 = identical, 1 = no words in "
+                               "common).")
+                q3.metric("Meaning kept", _rate("mean_paraphrase_cosine"),
+                          help="similarity between each rewrite and its own "
+                               "excerpt. Near 1 is what a faithful paraphrase "
+                               "looks like.")
 
             cat_rows = [{"category": c, "stability": v}
                         for c, v in s.get("by_category", {}).items()
@@ -1504,11 +1688,13 @@ with tab_halluc:
                 st.dataframe(pd.DataFrame(s["by_grounding_bucket"]).T,
                              width="stretch")
 
-            flagged = items[(items.get("unstable") == True)  # noqa: E712
-                            | (items.get("swap_label_changed") == True)]  # noqa: E712
+            flagged = items[_flag("unstable")
+                            | _flag("prior_keyed")
+                            | _flag("label_survived_ablation")]
             if flagged.empty:
-                st.success("✅ Every evaluated item kept its label under all "
-                           "paraphrases and the lab swap.")
+                st.success("✅ No item was flagged: labels held under "
+                           "paraphrase, and none of them came back from "
+                           "evidence that didn't support them.")
             else:
                 st.markdown(f"**⚠️ {len(flagged)} flagged item(s)** — the "
                             "detection firing, item by item:")
@@ -1517,47 +1703,79 @@ with tab_halluc:
                     badges = []
                     if it.get("unstable"):
                         badges.append("🎲 unstable")
-                    if it.get("swap_label_changed"):
-                        badges.append("🏷️ swap flip")
+                    if it.get("prior_keyed"):
+                        badges.append("🧠 prior-keyed")
+                    if it.get("label_survived_ablation"):
+                        badges.append("🕳️ unsupported")
                     ls = it.get("label_stability")
                     title = (f"{' + '.join(badges)} · {it['org']} · "
                              f"{it['source_type']} · {it['qid']} — original "
                              f"label: {it['original_label']}"
-                             + (f", stability {ls:.2f}" if ls is not None else ""))
+                             + (f", stability {ls:.2f}"
+                                if ls is not None and not pd.isna(ls) else ""))
                     with st.expander(title):
-                        if it.get("swap_label_changed"):
+                        if it.get("prior_keyed"):
                             st.markdown(
-                                f"**Lab swap:** text renamed to "
-                                f"**{it.get('swap_to', '?')}** → label flipped "
-                                f"**{it['original_label']} → "
-                                f"{it.get('swap_label', '?')}**")
-                        if vdf is not None:
-                            sub = vdf[(vdf["org"] == it["org"])
-                                      & (vdf["source_type"] == it["source_type"])
-                                      & (vdf["qid"] == it["qid"])]
-                            if not sub.empty:
-                                disp = sub[["variant_kind", "variant_idx",
-                                            "label", "label_matches_original"]
-                                           ].copy() if "label" in sub.columns else None
-                                if disp is not None:
-                                    disp["label_matches_original"] = disp[
-                                        "label_matches_original"].map(
-                                        {True: "✅ kept", False: "❌ flipped"})
-                                    st.dataframe(
-                                        disp.rename(columns={
-                                            "variant_kind": "variant",
-                                            "variant_idx": "#",
-                                            "label_matches_original": "vs original",
-                                        }), hide_index=True, width="stretch")
-                                flips = sub[(sub.get("label_matches_original")
-                                             == False)]  # noqa: E712
-                                for _, v in flips.iterrows():
-                                    st.markdown(
-                                        f"**{v['variant_kind']} #"
-                                        f"{v['variant_idx']} → "
-                                        f"{v.get('label', '?')}** — variant "
-                                        f"answer:")
-                                    st.caption(v.get("answer") or "(no answer)")
+                                f"**Prior-keyed:** asked the same question over "
+                                f"excerpts retrieved for *"
+                                f"{it.get('distractor_category', '?')}* — text "
+                                f"from the same lab that doesn't address it — "
+                                f"and it answered **{it['original_label']}** "
+                                f"again instead of saying the excerpts don't "
+                                f"cover this.")
+                        if it.get("label_survived_ablation"):
+                            st.markdown(
+                                f"**Unsupported:** removing the excerpt the "
+                                f"answer rested on "
+                                f"(*{it.get('ablation_basis', '?')}*) left the "
+                                f"label at **{it['original_label']}**.")
+                        if it.get("control_flipped"):
+                            st.info("This item's control also flipped, so its "
+                                    "paraphrase result is noise — read the "
+                                    "directional probes only.")
+                        if vdf is None:
+                            continue
+                        sub = vdf[(vdf["org"] == it["org"])
+                                  & (vdf["source_type"] == it["source_type"])
+                                  & (vdf["qid"] == it["qid"])]
+                        if sub.empty:
+                            continue
+                        if "label" in sub.columns:
+                            disp = sub[["variant_kind", "variant_idx", "label",
+                                        "label_matches_original"]].copy()
+                            disp["label_matches_original"] = disp[
+                                "label_matches_original"].map(
+                                {True: "✅ kept", False: "❌ changed"})
+                            st.dataframe(
+                                disp.rename(columns={
+                                    "variant_kind": "probe",
+                                    "variant_idx": "#",
+                                    "label_matches_original": "vs original",
+                                }), hide_index=True, width="stretch")
+                        for _, v in sub.iterrows():
+                            kind = v.get("variant_kind")
+                            changed = v.get("label_matches_original") is False
+                            directional = kind in ("ablation", "distractor")
+                            if not changed and not directional:
+                                continue
+                            st.markdown(f"**{kind} #{v.get('variant_idx')} → "
+                                        f"{v.get('label', '?')}** — answer:")
+                            st.caption(v.get("answer") or "(no answer)")
+                            # For a paraphrase flip, the thing worth auditing is
+                            # whether the rewrite really did say the same thing.
+                            src_ctx = v.get("source_context")
+                            new_ctx = v.get("context")
+                            if kind == "paraphrase" and isinstance(src_ctx, list) \
+                                    and isinstance(new_ctx, list):
+                                with st.popover("Compare the rewritten "
+                                                "excerpts"):
+                                    for n, (before, after) in enumerate(
+                                            zip(src_ctx, new_ctx), 1):
+                                        st.markdown(f"**Excerpt {n} — original**")
+                                        st.caption(before)
+                                        st.markdown(f"**Excerpt {n} — rewrite**")
+                                        st.caption(after)
+                                        st.divider()
 
             dl1, dl2 = st.columns(2)
             mdir = runs.run_dir(hal_run) / "metamorphic"

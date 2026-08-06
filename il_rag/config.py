@@ -55,28 +55,40 @@ COLLECTION_NAME = "il_corpus"
 # in [0, 1]) falls below this are bucketed "retrieval_missed". Tune per corpus.
 GROUNDING_LOW_THRESHOLD = 0.2
 
-# Feature 3 (metamorphic label-stability eval).
+# Feature 3 (metamorphic eval: label stability + evidence sensitivity).
+# Four probes, each independently toggleable. "control" is the no-perturbation
+# null arm whose flip rate is the noise floor the others are read against;
+# "paraphrase" is the invariance test; "ablation" and "distractor" are
+# DIRECTIONAL — for those, a label that SURVIVES is the suspicious outcome.
+METAMORPHIC_PROBES = ("control", "paraphrase", "ablation", "distractor")
+METAMORPHIC_CONTROLS = 1             # unperturbed re-runs per item (noise floor)
 METAMORPHIC_PARAPHRASES = 3          # meaning-preserving paraphrases per item
 # label_stability below this flags an item unstable. 1.0 = any paraphrase that
 # flips the predicted logic flags the item; relax if paraphrase noise is high.
 METAMORPHIC_STABILITY_THRESHOLD = 1.0
-# Paraphrases are sampled at nonzero temperature so the k variants differ;
-# answering and matching stay at temperature 0 like the production path.
-METAMORPHIC_PARAPHRASE_TEMPERATURE = 0.9
+# Paraphrases are sampled at nonzero temperature so the k variants differ.
+# 0.7 rather than a higher setting: the fidelity gates below now GUARANTEE the
+# variants differ from the source, so extra sampling temperature only buys
+# meaning drift. Answering and matching stay at 0 like the production path.
+METAMORPHIC_PARAPHRASE_TEMPERATURE = 0.7
 
-# Lab-name swap: which lab replaces which in the swap variant, and the alias
-# spellings to rewrite. The swap is a deterministic regex substitution — no
-# LLM — so the swap itself cannot drift the text's meaning.
-LAB_SWAP = {
-    "OpenAI": "DeepMind",
-    "DeepMind": "Anthropic",
-    "Anthropic": "OpenAI",
-}
-LAB_ALIASES = {
-    "OpenAI": ["OpenAI", "Open AI"],
-    "DeepMind": ["Google DeepMind", "DeepMind", "Deep Mind"],
-    "Anthropic": ["Anthropic"],
-}
+# Paraphrase fidelity gates — all checked IN CODE, never trusted to the model,
+# because a drifted rewrite scored as a "flip" is a false detection. A variant
+# failing any gate is discarded (not counted as unstable). See metamorphic.py.
+#   gate 1 "facts kept"          numbers and capitalised names must all survive
+#   gate 2 "actually reworded"   token overlap with the source must stay BELOW
+PARAPHRASE_MAX_TOKEN_OVERLAP = 0.95  #   this, else the "paraphrase" is a copy
+#   gate 3 "still means the same" the paraphrase must embed nearer to its own
+#     source chunk than to any sibling chunk (rank-based — e5 cosines are only
+#     interpretable as a ranking), plus this coarse floor as a sanity guard.
+PARAPHRASE_MIN_COSINE = 0.85
+
+# Distractor probe: evidence retrieved for a DIFFERENT question of the same lab
+# and source type, used to answer the original question. Correct behaviour is
+# abstention. A distractor set that happens to be relevant to the original
+# question would invalidate the probe, so it is rejected using the Feature-1
+# grounding score against GROUNDING_LOW_THRESHOLD above (the checks
+# cross-validate each other).
 
 # ---------------------------------------------------------------------------
 # Study design
