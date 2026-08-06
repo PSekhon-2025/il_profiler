@@ -489,19 +489,21 @@ never rewrites it, so the strict number above stays comparable across runs.
 `{"excerpt": int, "quote": str, "verified": bool}`) and `quotes_verified`
 (their guarded conjunction).
 
-### 9.3 Metamorphic label stability (`il_rag/metamorphic.py`, `scripts/03_run_metamorphic_eval.py`)
+### 9.3 Metamorphic stability & evidence sensitivity (`il_rag/metamorphic.py`, `scripts/03_run_metamorphic_eval.py`)
 
 There are no gold labels in this pipeline, so correctness cannot be checked
-directly. Instead this check tests an **invariance relation** — the
-metamorphic-testing move for the no-oracle setting: a label that is grounded
-in the text should survive a meaning-preserving rewrite of that text. The
-notation below (`label(v)`, `label₀`, `P_ok`, `θ`) is the same one used in
-the GUI's "How stability is computed" expander and in `metamorphic.py`'s
-docstrings.
+directly. Instead this check **changes the evidence an answer was built from
+and watches what the label does** — the metamorphic-testing move for the
+no-oracle setting. Four probes run against each answered item of a saved run,
+each re-answered and re-graded through the same `answer_question` →
+`match_graded` path at temperature 0, so a change in the label is attributable
+to the perturbation and nothing else. The notation below (`label(v)`, `label₀`,
+`P_ok`, `θ`) is the same one used in the GUI's "How these checks work" expander
+and in `metamorphic.py`'s docstrings.
 
 **The label.** Each item's label is the matcher's abstention, or else the
 top-weight logic; ties break deterministically by the fixed `LOGICS` order.
-Abstain is a first-class label — a paraphrase that abstains matches iff the
+Abstain is a first-class label — a variant that abstains matches iff the
 original also abstained:
 
 ```
@@ -509,96 +511,214 @@ label(v) = "abstain"        if the matcher abstained
            argmax_k w_k     otherwise   (ties → LOGICS order)
 ```
 
-**The variants.** For each item of an existing run, the exact retrieved
-chunks are refetched by stored id and perturbed into:
+**The four probes.** Two ask whether the label *survives* something harmless;
+two ask whether it *stops* when it should. That difference is the whole design:
 
-- `k = METAMORPHIC_PARAPHRASES` (3) **paraphrases** — one LLM call per
-  variant, under a strict preservation rule ("every fact, name, number,
-  date, and claim is preserved exactly while the wording and sentence
-  structure change substantially"), sampled at
-  `METAMORPHIC_PARAPHRASE_TEMPERATURE` (0.9) so the k variants differ;
-- one **lab-name swap** — a deterministic regex, no LLM:
+| Probe | Perturbation | Relation | Suspicious outcome |
+|---|---|---|---|
+| `control` | none — the same excerpts, run again | — | any change (it is noise) |
+| `paraphrase` | the excerpts rewritten, meaning preserved | invariance | the label **changes** |
+| `ablation` | the excerpt the answer quoted is removed | directional | the label **survives** |
+| `distractor` | real same-lab excerpts that don't address the question | directional | the label **survives** |
+
+Each is independently toggleable (`METAMORPHIC_PROBES`, `--probes`), and the
+eval is resumable per `(item, probe, index)`, so enabling a probe later runs
+only the variants that were added.
+
+#### The control, and why it comes first
+
+The control re-runs an item on its unchanged evidence. Anything that flips here
+flipped on its own — matcher nondeterminism, or an argmax tie between two
+near-equal weights. It is the floor every other number is read against:
 
 ```
-swap(text) = re.sub(r"\b(alias₁|alias₂|…)\b", LAB_SWAP[org], text, IGNORECASE)
+control_flipped(i) = label(control_i) ≠ label₀(i)
+control_flip_rate  = |{ i : control_flipped(i) }| / n_control
 ```
 
-  Aliases are matched longest-first (so "Google DeepMind" is consumed whole),
-  word-boundaried ("OpenAIish" untouched), and the substitution is applied to
-  the chunks *and* the question. The swap map cycles
-  OpenAI → DeepMind → Anthropic → OpenAI (`LAB_SWAP` in `config.py`).
+This is not only reported: it **gates the verdict**. An item whose own control
+flipped is never counted as unstable, because its paraphrase result cannot be
+interpreted.
 
-**Re-running the production path.** Every variant flows through the same
-`answer_question` → `match_graded` pipeline as the original run, at
-temperature 0, on the same (perturbed) chunks — so a changed label is
-attributable to the text perturbation alone.
+#### Paraphrases, and the three gates they must pass
 
-**Stability score.** With `P_ok` the paraphrase variants that ran without
-error and `label₀` the original run's label:
+`k = METAMORPHIC_PARAPHRASES` (3) rewrites of the item's excerpts are generated
+in one LLM call per variant, under a strict preservation rule ("every fact,
+name, number, date, and claim is preserved exactly while the wording and
+sentence structure change substantially"), sampled at
+`METAMORPHIC_PARAPHRASE_TEMPERATURE` (0.7) so the k variants differ.
+
+A rewrite that quietly changed meaning would surface as a label flip and be
+read as a hallucination, so **fidelity is verified in code, never attested by
+the prompt**. For each original excerpt `c` and its rewrite `p`:
+
+```
+gate 1  "facts kept"            numbers(c) ⊆ numbers(p)  ∧  entities(c) ⊆ entities(p)
+gate 2  "actually reworded"     overlap(T(c), T(p)) ≤ ρ            ρ = PARAPHRASE_MAX_TOKEN_OVERLAP (0.95)
+gate 3  "still means the same"  argmax_j cos(c_j, p) = c's own index
+                                ∧ cos(c, p) ≥ PARAPHRASE_MIN_COSINE (0.85)
+```
+
+- `numbers` are `\d[\d,.:%/-]*` tokens; `entities` are capitalised tokens, minus
+  stopwords and minus any word that also appears lowercased in the same text
+  (which is what a common noun at a sentence start looks like). Both are
+  compared as sets, and the entity pattern excludes apostrophes and hyphens so
+  that "OpenAI's" and "OpenAI" normalize to the same token — otherwise a
+  faithful rewrite that merely dropped a possessive would be rejected.
+- `overlap` and `T(·)` are exactly Feature 1's `lexical_overlap` and
+  `content_tokens`, reused rather than reimplemented.
+- Gate 3 is **rank-based on purpose**: e5 compresses absolute cosines into a
+  narrow band (the same property that makes §9.4 read only rankings), so the
+  load is carried by "nearest to its own excerpt", with `0.85` as a coarse
+  sanity floor rather than a calibrated threshold. It costs one batched
+  embedding call, and runs only after the two free text gates have passed.
+
+A variant failing any gate is **discarded and retried once**, then recorded with
+its reason and excluded from the denominator. With `P_ok` the rewrites that ran
+*and* passed:
 
 ```
 label_stability = |{ v ∈ P_ok : label(v) = label₀ }| / |P_ok|    (None if P_ok empty)
-unstable        = label_stability < θ          θ = METAMORPHIC_STABILITY_THRESHOLD (1.0)
-swap_label_changed = label(swap) ≠ label₀      (on the error-free swap variant)
+unstable        = label_stability < θ  ∧  ¬control_flipped(i)    θ = METAMORPHIC_STABILITY_THRESHOLD (1.0)
 ```
+
+#### The two directional probes
+
+**Ablation** removes the excerpt the answer actually rested on — the one cited
+by the first quote §9.2 verified, else the top-ranked excerpt (retrieval returns
+nearest-first). Quote records index the run's *original* retrieved list, so they
+are only trusted when every id was refetched; a shortened set falls back to the
+top-ranked excerpt. Items with fewer than two excerpts are skipped
+(`ablation_no_remainder`).
+
+**Distractor** keeps the question but supplies excerpts retrieved for a
+*different* question of the same lab and source type — a fixed half-list
+rotation over `CATEGORIES`, so names and framing stay correct and only the topic
+is wrong. Any excerpt the item was actually answered from is removed, and the
+resulting set is re-scored against the **original** question with §9.1's
+grounding score: a "distractor" that turns out to be relevant would make the
+probe meaningless, so it is rejected (`distractor_relevant`) rather than scored.
+The checks cross-validate each other.
+
+For both, the correct behaviour is to weaken toward abstention, so a surviving
+label is the finding:
+
+```
+label_survived_ablation = label(abl) = label₀ ≠ "abstain"
+ablation_survival_rate  = n_survived / n_ablation_evaluated
+
+distractor_committed    = label(dis) ≠ "abstain"
+prior_keyed             = label(dis) = label₀ ≠ "abstain"
+prior_leak_rate         = n_prior_keyed / n_distractor_evaluated
+```
+
+`prior_leak_rate` is the headline detection metric: the model was shown text
+that does not answer the question and returned the original logic anyway.
 
 **Summary statistics** over the evaluated items:
 
 ```
-mean_label_stability = mean of per-item stabilities (scored items only)
-pct_fully_stable     = share of scored items with label_stability ≥ 1.0
-swap_flip_rate       = n_swap_label_changed / n_swap_evaluated
-by_category          = mean stability per question category
-by_grounding_bucket  = mean stability per Feature-1 bucket (only when the
-                       source run carried grounding scores — the checks
-                       cross-validate each other)
+control_flip_rate           the noise floor (read everything against it)
+mean_label_stability        mean of per-item stabilities (scored items only)
+pct_fully_stable            share of scored items with label_stability ≥ 1.0
+n_paraphrases_rejected      rewrites discarded, with rejected_by_reason
+mean_paraphrase_divergence  1 − mean overlap with the source wording
+mean_paraphrase_cosine      mean similarity of a rewrite to its own excerpt
+ablation_survival_rate      labels that held without their evidence
+distractor_commit_rate      answered instead of abstaining
+prior_leak_rate             answered with the ORIGINAL label
+by_category                 mean stability per question category
+by_grounding_bucket         mean stability per Feature-1 bucket (only when the
+                            source run carried grounding scores)
 ```
 
-**Edge cases.** A paraphrase whose JSON does not parse (or returns the wrong
-number of strings) is retried once at a larger token budget, then recorded
-as `error: "paraphrase_failed"`; rows whose chunks cannot be refetched are
-`"chunks_not_found"`; a lab without a swap target would be
-`"no_swap_target"`. **Failed variants are excluded from denominators, never
-counted as flips** — a parse failure is evidence of nothing about
-stability. Item sampling is deterministic per seed
-(`random.Random(seed).sample`), and the eval is resumable: completed
-error-free variants are kept, error rows are retried.
+**Edge cases.** A paraphrase whose JSON does not parse is retried at a larger
+token budget, then recorded as `error: "paraphrase_failed"`; one that parses but
+fails a gate is `"paraphrase_infidelity"` with the gate's reason. Rows whose
+chunks cannot be refetched are `"chunks_not_found"`. **Failed and rejected
+variants are excluded from denominators, never counted as flips** — a parse
+failure or a broken rewrite is evidence of nothing about stability, and their
+counts are reported separately so each probe's health stays visible. Item
+sampling is deterministic per seed (`random.Random(seed).sample`).
 
-**Design rationale.** Paraphrases are sampled at nonzero temperature so the
-k variants actually differ, while answering and matching stay at temperature
-0 like the production path — the *system under test* is unchanged, only the
-input moves. The swap is a regex precisely so that it cannot drift meaning:
-any label change under it isolates the effect of the lab's *name*. And
-`θ = 1.0` is the strictest default — any single paraphrase flip flags the
-item; the config comment says to relax it if paraphrase noise is high.
+**Design rationale.** Paraphrases are sampled at nonzero temperature so the k
+variants actually differ, while answering and matching stay at temperature 0
+like the production path — the *system under test* is unchanged, only the input
+moves. 0.7 rather than a higher setting because the gates now guarantee the
+variants differ from their source, so extra sampling temperature buys only
+drift. And `θ = 1.0` is the strictest default — any single paraphrase flip flags
+the item; the config comment says to relax it if paraphrase noise is high.
 
-**Interpretation.** A paraphrase flip and a swap flip mean different
-things: a paraphrase flip says the label is not robust to meaning-preserving
-rewording; a swap flip says the label changed when only the lab's *name*
-changed — evidence the model keys on its prior about the lab rather than on
-the text.
+**Interpretation.** The four numbers say different things. A **control flip**
+says nothing about the model's grounding — it is the measurement error of the
+instrument, and every other rate should be read as a distance above it. A
+**paraphrase flip** says the label is not robust to rewording. A **surviving
+ablation** says the answer did not need the evidence it quoted. A **prior leak**
+says the label came back from text that does not support it — the closest thing
+this pipeline has to a positive hallucination detection.
 
-**Limitations.** The check is *self-referential*: the same model generates
-the paraphrases and classifies them (see §16), so "meaning-preserving" is
-only as good as the model's own judgment — paraphrase fidelity is attested
-by the prompt, not verified, and flagged flips should be human-audited
-against `variants.jsonl` before the aggregates are read as evidence. At
-`k = 3`, per-item stability is coarse-grained (steps of 1/3).
+**Why the lab-name swap was removed.** An earlier version of this check
+included a fifth arm: a deterministic regex rewriting every alias of the lab
+throughout the excerpts and the question (OpenAI → DeepMind → Anthropic →
+OpenAI), on the premise that a grounded label should survive a change of name.
+That premise does not hold, for two independent reasons.
+
+1. **The perturbation is not meaning-preserving.** These three labs are the
+   subject of the question, not incidental strings in it. Asking what
+   "DeepMind" says about its obligations, over text describing OpenAI's
+   decisions, is a different question — not the same question in different
+   words. An invariance relation requires that the perturbation leave the
+   intended output unchanged, and this one does not.
+2. **The variant context was self-contradictory.** The regex renamed only the
+   lab aliases; product names, people, and events stayed put, so a swapped
+   excerpt still read "Anthropic's GPT-4 launch". A label change under that
+   perturbation is confounded between the effect of the name and the model
+   reacting to an incoherent document, and the two cannot be separated after
+   the fact.
+
+The worry the swap was built to test — *is the label coming from the model's
+prior about this lab rather than from the text?* — is real, and it is
+unanswerable by trying to talk the model out of a prior it certainly has about
+three of the best-documented organizations in its training data. The
+`distractor` probe tests it the other way round: hold the lab's identity fixed
+and correct, take the *supporting evidence* away, and see whether the label
+comes back regardless. Everything it shows the model is real corpus text with
+real names, so its number needs no caveat about coherence.
+
+**Limitations.** The fidelity gates verify facts, wording and topic; they do not
+catch subtle shifts of emphasis, so a rewrite can pass and still read a little
+differently — flagged items are worth a human look, and the GUI shows each
+original next to its rewrite for exactly that. The distractor probe measures
+behaviour on *unrelated* evidence, which is a harder test than the merely thin
+evidence a real run meets, so `prior_leak_rate` is an upper bound on the
+tendency rather than its rate in production. At `k = 3`, per-item stability is
+coarse-grained (steps of 1/3), so the aggregates are the readable numbers.
 
 **Basis in the literature.**
 
-- *Testing output relations under input transformations when no oracle
-  exists* is **metamorphic testing** (Chen, Cheung & Yiu, 1998; surveyed by
-  Segura et al., 2016). This pipeline has no gold labels — exactly the
-  no-oracle setting the technique was built for.
-- *Label-preserving perturbations, including name substitutions,* follow the
-  **invariance tests** of CheckList (Ribeiro et al., 2020): replacing
-  surface forms that should not matter must not change the prediction.
+- *Testing output relations under input transformations when no oracle exists*
+  is **metamorphic testing** (Chen, Cheung & Yiu, 1998; surveyed by Segura et
+  al., 2016). This pipeline has no gold labels — exactly the no-oracle setting
+  the technique was built for. The `paraphrase` probe is an *invariance*
+  relation; `ablation` and `distractor` are *directional* relations, where the
+  expected effect on the output has a known sign.
+- *Label-preserving perturbations* follow the **invariance tests** of CheckList
+  (Ribeiro et al., 2020): surface forms that should not matter must not change
+  the prediction.
 - *Prediction consistency under paraphrase* as a model-quality probe follows
   Elazar et al. (2021).
 - *Metamorphic relations for LLM hallucination detection* follow **MetaQA**
-  (Yang et al., FSE 2025), which detects hallucinations via
-  paraphrase-based metamorphic relations without external resources.
+  (Yang et al., FSE 2025), which detects hallucinations via paraphrase-based
+  metamorphic relations without external resources.
+- *Abstaining when the retrieved evidence does not support an answer* is the
+  behaviour SQuAD 2.0 was built to measure (Rajpurkar, Jia & Liang, 2018); the
+  `distractor` probe is that test applied post-hoc to a RAG pipeline.
+- *Reading a surviving label as the model preferring its parametric knowledge
+  over the context it was given* follows the knowledge-conflict setting of
+  Longpre et al. (2021).
+- *Re-running an unchanged input to establish a consistency baseline* follows
+  sampling-based consistency checking, **SelfCheckGPT** (Manakul, Liusie &
+  Gales, 2023).
 
 **References**
 
@@ -611,6 +731,16 @@ against `variants.jsonl` before the aggregates are read as evidence. At
   in Pretrained Language Models. *Transactions of the Association for
   Computational Linguistics*, 9, 1012–1031.
   <https://aclanthology.org/2021.tacl-1.60/>
+- Longpre, S., Perisetla, K., Chen, A., Ramesh, N., DuBois, C., & Singh, S.
+  (2021). Entity-Based Knowledge Conflicts in Question Answering.
+  *EMNLP 2021*. <https://aclanthology.org/2021.emnlp-main.565/>
+- Manakul, P., Liusie, A., & Gales, M. J. F. (2023). SelfCheckGPT:
+  Zero-Resource Black-Box Hallucination Detection for Generative Large
+  Language Models. *EMNLP 2023*.
+  <https://aclanthology.org/2023.emnlp-main.557/>
+- Rajpurkar, P., Jia, R., & Liang, P. (2018). Know What You Don't Know:
+  Unanswerable Questions for SQuAD. *ACL 2018*.
+  <https://aclanthology.org/P18-2124/>
 - Ribeiro, M. T., Wu, T., Guestrin, C., & Singh, S. (2020). Beyond
   Accuracy: Behavioral Testing of NLP Models with CheckList. *ACL 2020*.
   <https://aclanthology.org/2020.acl-main.442/>
@@ -626,15 +756,24 @@ against `variants.jsonl` before the aggregates are read as evidence. At
 
 - `variants.jsonl` — one row per variant (resumable audit trail):
   `org, source_type, qid, category, variant, variant_kind
-  ("paraphrase" | "lab_swap"), variant_idx, original_label`, plus on success
-  `question, answer, abstain, weights, reasoning, label,
-  label_matches_original` (and `swap_to` for swaps), or on failure an
-  `error` field (`"paraphrase_failed" | "no_swap_target" |
-  "chunks_not_found"`).
+  ("control" | "paraphrase" | "ablation" | "distractor"), variant_idx,
+  original_label`, plus on success `question, answer, abstain, weights,
+  reasoning, label, label_matches_original`, or on failure an `error` field
+  (`"paraphrase_failed" | "paraphrase_infidelity" | "ablation_no_remainder" |
+  "distractor_relevant" | "distractor_empty" | "chunks_not_found"`). Per-probe
+  extras: paraphrases carry a `fidelity` block (`ok, reason, attempts,
+  divergence, missing_numbers, missing_entities, min_cosine`) plus
+  `source_context` and `context` — the originals and the rewrites, so a flagged
+  item can be audited without refetching; ablations carry `ablation_basis` and
+  `ablation_removed_id`; distractors carry `distractor_category`,
+  `distractor_grounding` and `distractor_ids`.
 - `stability.json` — `{"summary": {...}, "per_item": [...]}`; each per-item
   record carries `org, source_type, qid, category, original_label,
-  n_paraphrases, n_paraphrases_ok, label_stability, unstable, swap_to,
-  swap_label, swap_label_changed` (+ `grounding_bucket` when present).
+  control_label, control_flipped, n_paraphrases, n_paraphrases_ok,
+  n_paraphrases_rejected, label_stability, unstable, paraphrase_divergence,
+  paraphrase_cosine, ablation_label, ablation_basis, label_survived_ablation,
+  distractor_label, distractor_category, distractor_committed, prior_keyed`
+  (+ `grounding_bucket` when present).
 
 ### 9.4 Embedding agreement (`il_rag/embedding_agreement.py`, `scripts/04_run_embedding_agreement.py`)
 
@@ -960,7 +1099,7 @@ il_rag/
   profile_harness.py     run the questionnaire, aggregate to % profiles
   runs.py                immutable per-run snapshots + resumability
   grounding.py           (check) retrieval-grounding buckets
-  metamorphic.py         (check) paraphrase + lab-swap label stability
+  metamorphic.py         (check) control / paraphrase / ablation / distractor
   embedding_agreement.py (check) non-LLM second judge
   quote_provenance.py    (check) graded quote provenance x veracity
   bootstrap_ci.py        confidence intervals over the profiles
@@ -981,8 +1120,11 @@ Dockerfile, fly.toml, DEPLOY.md   deployment
 - **Small instrument.** ~27 questions per profile → wide confidence intervals.
   Dominant-logic rankings are trustworthy; exact percentages are not.
 - **Self-referential checks.** The metamorphic paraphraser and the answer model
-  are the same model; stability numbers should be anchored by hand-reviewing a
-  few variants.
+  are the same model. Fidelity is no longer taken on trust — §9.3's three gates
+  verify in code that facts, wording and topic survived a rewrite, and rewrites
+  that fail are discarded rather than scored — but shifts of emphasis subtle
+  enough to clear all three gates would still go unnoticed, so hand-reviewing a
+  few flagged variants remains worthwhile.
 - **Embedding agreement is weak here** by design of the medium — whole-answer
   embeddings track topic more than institutional stance. It is a triangulation
   signal, not ground truth.

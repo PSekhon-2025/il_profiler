@@ -34,7 +34,7 @@ BUCKETS = (BUCKET_RETRIEVAL_MISSED, BUCKET_ABSTAINED, BUCKET_COMMITTED)
 
 # Minimal English stopword list: enough to keep function words from inflating
 # overlap, small enough to need no dependency.
-_STOPWORDS = frozenset("""
+STOPWORDS = frozenset("""
 a an the and or but if of to in on for with by at from as is are was were be
 been being it its this that these those do does did done what which who whom
 when where how why not no nor so than then there their they them he she his
@@ -46,12 +46,18 @@ per via also
 """.split())
 
 
-def _content_tokens(text: str) -> set[str]:
+def content_tokens(text: str) -> set[str]:
     """Lowercased alphanumeric tokens minus stopwords and short fragments."""
     return {
         t for t in re.findall(r"[a-z0-9]+", text.lower())
-        if t not in _STOPWORDS and len(t) > 2
+        if t not in STOPWORDS and len(t) > 2
     }
+
+
+# Kept as private aliases: these were the original names, and other modules
+# (the metamorphic paraphrase gates) now import the public ones.
+_STOPWORDS = STOPWORDS
+_content_tokens = content_tokens
 
 
 def lexical_overlap(question: str, chunk_text: str) -> float:
@@ -59,10 +65,10 @@ def lexical_overlap(question: str, chunk_text: str) -> float:
 
     overlap(q, c) = |T(q) ∩ T(c)| / |T(q)|   (0 if T(q) is empty)
     """
-    q = _content_tokens(question)
+    q = content_tokens(question)
     if not q:
         return 0.0
-    return len(q & _content_tokens(chunk_text)) / len(q)
+    return len(q & content_tokens(chunk_text)) / len(q)
 
 
 def grounding_scores(question: str, chunks) -> dict:
