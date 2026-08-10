@@ -1228,14 +1228,62 @@ with tab_results:
                     "than averaged in as zeros."
                 )
             st.markdown(
-                "Run replicates from the CLI (each is a full run, so R×the "
-                "usual cost):\n\n"
-                "```bash\n"
-                ".venv/bin/python scripts/08_run_replicates.py run --n 3\n"
-                "# or average runs you already have:\n"
-                ".venv/bin/python scripts/08_run_replicates.py aggregate \\\n"
-                "    --runs <run_a> <run_b> <run_c>\n"
-                "```")
+                "**Run replicates.** Each replicate is a *complete* run of the "
+                "questionnaire, so the cost is R× a normal run — scope it down "
+                "while iterating.")
+            rc1, rc2 = st.columns(2)
+            rep_orgs = rc1.multiselect("Labs", ORGS, default=ORGS,
+                                       key="rep_orgs")
+            rep_sources = rc2.multiselect("Source types", SOURCE_TYPES,
+                                          default=SOURCE_TYPES, key="rep_sources")
+            n_reps = st.slider(
+                "Number of replicate runs", min_value=2, max_value=10, value=3,
+                key="rep_n",
+                help="3 is the minimum that yields a standard deviation (2 runs "
+                     "leave it a single degree of freedom, so only the range is "
+                     "reported). The mean's standard error falls as 1/sqrt(R), "
+                     "so the gain per extra run shrinks quickly.")
+            rep_label = st.text_input(
+                "Label (optional)", placeholder="e.g. finalized questionnaire",
+                key="rep_label",
+                help="Each replicate is saved as its own run snapshot, "
+                     "numbered i/R.")
+            _n_q = runs.QUESTIONS_PER_ORG
+            _pairs = len(rep_orgs) * len(rep_sources)
+            _calls = _pairs * _n_q * n_reps
+            st.caption(
+                f"**{n_reps} replicates × {_pairs} profile(s) × {_n_q} "
+                f"questions = {_calls} answer + {_calls} matcher calls.** "
+                f"Standard error of the mean shrinks to "
+                f"{1 / n_reps ** 0.5:.0%} of a single run's."
+            )
+            if n_reps < 3:
+                st.warning(
+                    "With 2 replicates the standard deviation has one degree "
+                    "of freedom and is withheld — you get the observed range "
+                    "only. Use 3+ for an SD.", icon="⚠️")
+            if st.button("Run replicates", type="primary",
+                         disabled=not api_key_present() or not rep_orgs
+                         or not rep_sources, key="rep_run_btn"):
+                args = [PYTHON, "scripts/08_run_replicates.py", "run",
+                        "--n", str(n_reps),
+                        "--orgs", *rep_orgs, "--sources", *rep_sources]
+                if rep_label.strip():
+                    args += ["--label", rep_label.strip()]
+                with st.status(f"Running {n_reps} replicates…",
+                               expanded=True) as status:
+                    rc = stream_subprocess(args, st.empty())
+                    status.update(
+                        label=("Replicates complete ✅" if rc == 0
+                               else f"Failed (exit {rc})"),
+                        state="complete" if rc == 0 else "error")
+                load_replicate_reports.clear()
+                st.rerun()
+            st.caption(
+                "Equivalent CLI: "
+                f"`scripts/08_run_replicates.py run --n {n_reps}` · to average "
+                "runs you already have: `scripts/08_run_replicates.py "
+                "aggregate --runs <a> <b> <c>`")
             rep = load_replicate_reports()
             if not rep:
                 st.info("No replicate report yet.", icon="🔁")
