@@ -91,6 +91,31 @@ by email, revoke individually, no shared secret):
 4. Once Access is enforcing, you can `fly secrets unset APP_PASSWORD` to drop the
    redundant password gate.
 
+## Shipping the topic layer (optional)
+
+The inductive topic layer (`il_rag/topics.py`) is fitted **locally** — BERTopic
+pulls UMAP/HDBSCAN/scikit-learn, and UMAP on 15.5k × 1024 vectors peaks well
+above this machine's 1 GB. Only the small JSON results are shipped; the app
+reads them and never imports BERTopic.
+
+```bash
+# local, one-off (needs: pip install -r requirements-topics.txt)
+python scripts/07_run_topics.py fit
+python scripts/07_run_topics.py crosstab --run <run_id>
+
+# ship the results (~75 KB) to the volume
+RUN=<run_id>
+tar czf /tmp/topics_payload.tgz data/topics "data/profiles/runs/$RUN/topics"
+fly sftp put /tmp/topics_payload.tgz /app/topics_payload.tgz
+fly ssh console -C "sh -c 'cd /app && tar xzf topics_payload.tgz && rm topics_payload.tgz'"
+fly apps restart il-profiler
+```
+
+The payload contains chunk **ids**, topic keywords and aggregate percentages —
+no article text — so it carries none of the corpus's copyright exposure.
+Re-fit and re-ship whenever the index is rebuilt, since topics are keyed to
+chunk ids.
+
 ## Updating the app
 
 Code changes: `git push` then `fly deploy`. The volume (index + runs) persists

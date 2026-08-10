@@ -1,0 +1,12 @@
+# LOCAL-ONLY extras for the topic-modeling layer (il_rag/topics.py).
+#
+# Deliberately NOT in requirements.txt: BERTopic pulls UMAP, HDBSCAN,
+# scikit-learn and sentence-transformers (which pulls torch). Adding that to
+# the container would bloat every deploy, and UMAP on 15.5k x 1024 vectors
+# peaks well above the 1 GB cloud machine's memory. Topics are fitted on a
+# workstation and only the small JSON results are shipped; the app reads those
+# and never imports anything from this file.
+#
+#   .venv/bin/pip install -r requirements-topics.txt
+#   .venv/bin/python scripts/07_run_topics.py fit
+bertopic>=0.16.0

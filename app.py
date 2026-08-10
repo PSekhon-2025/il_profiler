@@ -38,7 +38,7 @@ import streamlit as st
 PROJECT_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from il_rag import runs
+from il_rag import runs, topics as topics_mod
 from il_rag.config import (
     CHROMA_DIR,
     CHUNK_OVERLAP,
@@ -691,8 +691,10 @@ with st.sidebar:
         st.caption(f"Active run: **{runs.display_name(cur_meta)}**  \n"
                    f"{len(all_metas)} run(s) saved")
 
-tab_run, tab_results, tab_audit, tab_halluc, tab_compare = st.tabs(
-    ["▶️ Run", "📊 Results", "🔍 Audit", "🚨 Hallucination", "🆚 Compare runs"])
+(tab_run, tab_results, tab_audit, tab_halluc, tab_topics,
+ tab_compare) = st.tabs(
+    ["▶️ Run", "📊 Results", "🔍 Audit", "🚨 Hallucination", "🧭 Topics",
+     "🆚 Compare runs"])
 
 # ---------------------------------------------------------------------------
 # Run tab
@@ -2710,6 +2712,237 @@ with tab_halluc:
                 dle2.download_button("similarities.jsonl",
                                      (edir / "similarities.jsonl").read_bytes(),
                                      file_name=f"embedding_rows_{hal_run}.jsonl")
+
+# ---------------------------------------------------------------------------
+# Topics tab — the inductive layer: what the corpus talks about, and how those
+# topics relate to the deductive logic scores. Read-only: fitting happens
+# locally (BERTopic is not installed in the container).
+# ---------------------------------------------------------------------------
+with tab_topics:
+    # Imported here explicitly: other tabs import altair inside conditional
+    # branches, so it is not guaranteed to be bound when this tab renders.
+    import altair as alt
+
+    st.header("Topic layer (inductive)")
+    st.caption(
+        "Everything else here is deductive — it scores the corpus against "
+        "Thornton & Ocasio's seven logics. This layer clusters the corpus "
+        "with **no knowledge of the taxonomy**, then compares the two."
+    )
+
+    with st.expander("ℹ️ How the topic layer is computed", expanded=False):
+        st.markdown(
+            "Fitted with **BERTopic** (Grootendorst, 2022) in "
+            "`il_rag/topics.py`, reusing the chunk embeddings already stored "
+            "in Chroma — so it costs **no API calls** and nothing is "
+            "re-embedded. Three stages:"
+        )
+        st.markdown(
+            "**Stage 1 — reduce.** UMAP projects each 1024-dim chunk embedding "
+            "to 5 dimensions under cosine distance, because density clustering "
+            "degrades badly in high dimensions. UMAP is stochastic, so a fixed "
+            "`random_state` is used and recorded — without it the topics move "
+            "between runs.\n\n"
+            "**Stage 2 — cluster.** HDBSCAN groups the reduced points. It does "
+            "**not** force every chunk into a topic: points in no dense region "
+            "are labelled $-1$ (*unclustered*) and are reported separately "
+            "rather than being padded into a topic they don't belong to.\n\n"
+            "**Stage 3 — name.** Each cluster is described by **c-TF-IDF**: "
+            "term frequency computed per *topic* (all its chunks concatenated) "
+            "rather than per document, so the words that come out are the ones "
+            "distinctive to that topic rather than common across the corpus:"
+        )
+        st.latex(
+            r"\mathrm{c\text{-}TF\text{-}IDF}(t, k)=f_{t,k}\;\cdot\;"
+            r"\log\!\left(1+\frac{A}{\sum_{j} f_{t,j}}\right)"
+        )
+        st.markdown(
+            "where $f_{t,k}$ is the frequency of term $t$ in topic $k$ and $A$ "
+            "the average number of words per topic."
+        )
+        st.markdown(
+            "**Topic × logic cross-tab.** Every answered question recorded the "
+            "ids of the $k$ chunks it was answered from, and each chunk now has "
+            "a topic. So a row's logic weights can be attributed back to the "
+            "topics of its evidence. Each chunk receives $1/k$ of the row's "
+            "credit, so every row contributes a total mass of exactly 1 "
+            "regardless of how much evidence it used:"
+        )
+        st.latex(
+            r"M_{k,\ell} \;=\; \sum_{i \in A}\;\sum_{c \,\in\, R(i)}"
+            r"\frac{1}{|R(i)|}\; w^{(i)}_{\ell}\;"
+            r"\mathbb{1}\bigl[\mathrm{topic}(c)=k\bigr]"
+        )
+        st.markdown(
+            "Each topic's row is then normalized to a percentage distribution "
+            "over the logics — *when evidence of this topic was used, the "
+            "resulting answers scored like this*:"
+        )
+        st.latex(r"P^{\text{topic }k}_{\ell}=\frac{100\,M_{k,\ell}}"
+                 r"{\sum_{m} M_{k,m}}")
+        st.markdown(
+            "**Coverage audit.** Topics that appear in **no** row's retrieved "
+            "evidence are corpus regions the questionnaire never reaches — a "
+            "structural blind spot of the instrument, not of the corpus."
+        )
+        st.markdown(
+            "**Design decisions**\n"
+            "- *A topic is not a logic.* Topics are **subject matter** (export "
+            "controls, lawsuits, funding); a logic is an **ordering principle** "
+            "(what confers legitimacy, who holds authority) that cuts across "
+            "subject matter. A clean topic→logic mapping is therefore not "
+            "expected, and its absence falsifies neither layer. This cross-tab "
+            "describes how they co-occur; it does not claim they are the same "
+            "thing.\n"
+            "- *Why this layer exists.* It is the answer to the circularity "
+            "objection: the deductive pipeline was told which seven logics to "
+            "look for. BERTopic was told nothing, so where the two agree, the "
+            "agreement is **convergent validity** from an independent method.\n"
+            "- *Why uniform $1/k$ attribution?* The pipeline does not record "
+            "which retrieved chunk actually drove the answer, so any weighting "
+            "by rank or cosine would invent precision that isn't there. Uniform "
+            "is the honest default.\n"
+            "- *Why it runs locally.* UMAP on 15.5k × 1024 vectors peaks well "
+            "above the 1 GB cloud machine, and the dependencies (UMAP, HDBSCAN, "
+            "scikit-learn) would bloat every deploy. Topics are fitted on a "
+            "workstation; only the small JSON results are shipped and read here."
+        )
+
+    tinfo = topics_mod.load_topic_info()
+    if tinfo is None:
+        st.info(
+            "No topic model on disk yet. It is fitted **locally** (not in this "
+            "hosted app):\n\n"
+            "```bash\n"
+            ".venv/bin/pip install -r requirements-topics.txt\n"
+            ".venv/bin/python scripts/07_run_topics.py fit\n"
+            ".venv/bin/python scripts/07_run_topics.py crosstab\n"
+            "```\n"
+            "Then ship `data/topics/` alongside the index (see DEPLOY.md).",
+            icon="🧭")
+    else:
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Topics found", tinfo["n_topics"])
+        c2.metric("Chunks clustered",
+                  f"{tinfo['n_chunks'] - tinfo['n_outliers']:,}",
+                  delta=f"{tinfo['n_outliers']:,} unclustered",
+                  delta_color="off")
+        c3.metric("Min topic size", tinfo["min_topic_size"])
+        c4.metric("Seed", tinfo["seed"],
+                  help="UMAP random_state — fixed so topics reproduce")
+        st.caption(f"Fitted {tinfo.get('fitted_at', '?')}")
+
+        tdf = pd.DataFrame([
+            {"topic": r["topic"], "size": r["size"], "label": r["label"],
+             **{f"n_{o}": r["by_org"].get(o, 0) for o in ORGS},
+             **{f"n_{s}": r["by_source"].get(s, 0) for s in SOURCE_TYPES}}
+            for r in tinfo["topics"] if not r["is_outlier"]
+        ])
+
+        st.subheader("What the corpus is about")
+        show_n = st.slider("Show top N topics by size", 5,
+                           min(60, max(5, len(tdf))), min(20, len(tdf)),
+                           key="topics_n")
+        top_tdf = tdf.nlargest(show_n, "size")
+        chart = (
+            alt.Chart(top_tdf)
+            .mark_bar()
+            .encode(
+                x=alt.X("size:Q", title="chunks"),
+                y=alt.Y("label:N", title=None, sort="-x"),
+                tooltip=["topic", "label", "size",
+                         *[f"n_{o}" for o in ORGS],
+                         *[f"n_{s}" for s in SOURCE_TYPES]],
+            )
+            .properties(height=min(24 * show_n + 40, 900))
+        )
+        st.altair_chart(chart, width="stretch")
+        with st.expander("All topics (table)", expanded=False):
+            st.dataframe(tdf.sort_values("size", ascending=False),
+                         hide_index=True, width="stretch")
+
+        # --- cross-tab against a run ---
+        st.subheader("Topic × logic")
+        topic_run = run_selectbox("Run to cross-tab", key="topics_run",
+                                  default_run_id=runs.get_current())
+        xtab = topics_mod.load_crosstab(topic_run)
+        if xtab is None:
+            st.info(
+                "No cross-tab for this run yet. Locally:\n\n"
+                "```bash\n"
+                f".venv/bin/python scripts/07_run_topics.py crosstab --run {topic_run}\n"
+                "```", icon="🔗")
+        else:
+            recs = xtab["topics"]
+            st.caption(
+                f"{len(recs)} topics appeared in this run's retrieved evidence. "
+                "Each row shows how answers grounded in that topic scored "
+                "across the logics — attribution is "
+                f"{xtab.get('attribution', 'uniform')}."
+            )
+            min_hits = st.slider(
+                "Minimum retrievals (filters out thinly-evidenced topics)",
+                1, 50, 5, key="topics_min_hits")
+            shown = [r for r in recs if r["retrievals"] >= min_hits
+                     and r["topic"] != topics_mod.OUTLIER_TOPIC]
+            if not shown:
+                st.warning("No topic meets that retrieval threshold.")
+            else:
+                heat = pd.DataFrame([
+                    {"topic": f"{r['topic']}: {r['label'][:34]}",
+                     "logic": logic, "pct": r["logic_pct"][logic],
+                     "retrievals": r["retrievals"]}
+                    for r in shown for logic in LOGICS
+                ])
+                hchart = (
+                    alt.Chart(heat)
+                    .mark_rect()
+                    .encode(
+                        x=alt.X("logic:N", sort=LOGICS, title=None),
+                        y=alt.Y("topic:N", title=None,
+                                sort=[f"{r['topic']}: {r['label'][:34]}"
+                                      for r in shown]),
+                        color=alt.Color("pct:Q", title="% of logic mass",
+                                        scale=alt.Scale(scheme="blues")),
+                        tooltip=["topic", "logic",
+                                 alt.Tooltip("pct:Q", format=".1f"),
+                                 "retrievals"],
+                    )
+                    .properties(height=min(26 * len(shown) + 40, 900))
+                )
+                st.altair_chart(hchart, width="stretch")
+                st.caption(
+                    "Read a row, not a column: each row sums to 100%. A row "
+                    "concentrated on one logic means evidence of that topic "
+                    "consistently produced answers scored that way."
+                )
+
+            # --- coverage audit ---
+            cov = xtab["coverage"]
+            st.subheader("Coverage audit — what the questionnaire never asks about")
+            k1, k2, k3 = st.columns(3)
+            k1.metric("Topics reached",
+                      f"{cov['n_topics_retrieved']}/{cov['n_topics']}")
+            k2.metric("Never retrieved", cov["n_topics_never_retrieved"])
+            k3.metric("Of clustered corpus",
+                      f"{cov['chunks_never_retrieved_share']:.1%}",
+                      help="share of clustered chunks in topics no question "
+                           "ever retrieved")
+            if cov["never_retrieved"]:
+                st.markdown(
+                    "These topics exist in the corpus but **no question ever "
+                    "retrieved them** — the instrument is structurally blind "
+                    "to them. This is a limitation of the 27-question "
+                    "questionnaire, not of the corpus:")
+                st.dataframe(
+                    pd.DataFrame(cov["never_retrieved"])[
+                        ["topic", "size", "label"]],
+                    hide_index=True, width="stretch")
+            else:
+                st.success("Every topic was reached by at least one question.")
+
+            st.caption(xtab.get("note", ""))
+
 
 # ---------------------------------------------------------------------------
 # Compare tab — diff two run snapshots (the point of saving runs)
