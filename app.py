@@ -2928,6 +2928,70 @@ with tab_topics:
                       f"{cov['chunks_never_retrieved_share']:.1%}",
                       help="share of clustered chunks in topics no question "
                            "ever retrieved")
+            with st.expander("ℹ️ What “topics reached” actually means",
+                             expanded=False):
+                n_q = cov.get("questions")
+                slots = cov.get("retrieval_slots")
+                distinct = cov.get("distinct_chunks_retrieved")
+                corpus_n = cov.get("corpus_chunks")
+                st.markdown(
+                    "**Step 1 — the corpus was grouped into themes.** BERTopic "
+                    f"clustered all {corpus_n:,} chunks into "
+                    f"**{cov['n_topics']} topics**, each a bundle of chunks "
+                    "about the same thing (one is export controls, another "
+                    "copyright settlements, another chain-of-thought "
+                    "faithfulness)."
+                    if corpus_n else
+                    "**Step 1 — the corpus was grouped into themes** by "
+                    "BERTopic."
+                )
+                if n_q and slots and distinct and corpus_n:
+                    st.markdown(
+                        "**Step 2 — the questionnaire only ever sees what "
+                        f"retrieval hands it.** This run asked **{n_q} "
+                        f"questions**, each retrieving evidence — "
+                        f"**{slots:,} retrieval slots** in total. But the same "
+                        "useful chunks get pulled repeatedly across questions, "
+                        f"so those slots were filled by only **{distinct:,} "
+                        f"distinct chunks — {distinct / corpus_n:.1%} of the "
+                        "corpus.**"
+                    )
+                st.markdown(
+                    "**Step 3 — map those chunks back to their topics.** They "
+                    f"come from **{cov['n_topics_retrieved']} of "
+                    f"{cov['n_topics']}** topics. So chunks belonging to the "
+                    f"other **{cov['n_topics_never_retrieved']} topics were "
+                    "never retrieved even once** by any question. That is what "
+                    "“topics reached” counts: a topic is *reached* if it "
+                    "contributed at least one chunk of evidence anywhere in "
+                    "the run."
+                )
+                st.markdown(
+                    "**Why the topic count is the meaningful number, not the "
+                    "chunk percentage.** “Only a small % of chunks were read” "
+                    "is trivially true — 27 questions physically cannot touch "
+                    "a corpus this size, and a questionnaire is *supposed* to "
+                    "be selective. The topic view says something sharper: it "
+                    "is not that the corpus was sampled thinly and evenly, it "
+                    "is that **entire coherent subject areas are invisible to "
+                    "the instrument** — zero chunks from them, not a few."
+                )
+                st.markdown(
+                    "**Why it happens.** Retrieval is driven by question "
+                    "wording. These questions ask about governance — "
+                    "obligations, authority, legitimacy, funding, oversight — "
+                    "so they retrieve governance-flavoured evidence. A chunk "
+                    "about a technical safety method sits far from all of them "
+                    "in embedding space and never lands in any top-$k$."
+                )
+                st.markdown(
+                    "**Why it matters.** It *bounds the claim*: the profiles "
+                    "do not characterise “the corpus”, they characterise the "
+                    "part of it this questionnaire reaches. That is a "
+                    "limitation worth stating outright — and it doubles as a "
+                    "roadmap, since the list below names exactly which subject "
+                    "areas new questions would have to target."
+                )
             if cov["never_retrieved"]:
                 st.markdown(
                     "These topics exist in the corpus but **no question ever "

@@ -311,6 +311,13 @@ def build_crosstab(run_id: str | None = None) -> dict:
             "dominant_logic": max(m, key=m.get),
         })
 
+    # Counts behind the coverage story: the same good chunks are retrieved by
+    # many questions, so the number of DISTINCT chunks seen is far smaller than
+    # the number of retrieval slots. Stored so the UI (and the download) can
+    # state the chain rather than just the conclusion.
+    all_retrieved = [cid for r in rows for cid in (r.get("retrieved_ids") or [])]
+    distinct_retrieved = set(all_retrieved)
+
     retrieved_topics = {t for t, n in hits.items() if n > 0}
     never = [
         {"topic": r["topic"], "label": r["label"], "size": r["size"],
@@ -327,6 +334,10 @@ def build_crosstab(run_id: str | None = None) -> dict:
         "attribution": "uniform 1/k across each row's retrieved chunks",
         "topics": records,
         "coverage": {
+            "questions": len(rows),
+            "retrieval_slots": len(all_retrieved),
+            "distinct_chunks_retrieved": len(distinct_retrieved),
+            "corpus_chunks": info["n_chunks"],
             "n_topics": info["n_topics"],
             "n_topics_retrieved": len([t for t in retrieved_topics
                                        if t != OUTLIER_TOPIC]),
