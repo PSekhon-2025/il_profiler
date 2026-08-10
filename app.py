@@ -143,6 +143,35 @@ def save_api_key(key: str) -> None:
     ENV_PATH.write_text(f"TOGETHER_API_KEY={key.strip()}\n", encoding="utf-8")
 
 
+@st.cache_data(ttl=300)
+def fetch_chunks(chunk_ids: tuple[str, ...]) -> dict:
+    """Look up the ACTUAL TEXT of retrieved chunks, by id, from Chroma.
+
+    The audit rows persist only chunk ids, so without this the evidence behind
+    every answer is unreadable. Fetched in ONE batched get for the whole
+    filtered view (ids need no embedding, so this is cheap) and cached, rather
+    than per row. Returns {id: {"text","filename","org","source_type"}};
+    missing ids (e.g. after a --fresh reingest re-minted them) are simply absent.
+    """
+    if not chunk_ids:
+        return {}
+    try:
+        import chromadb
+        from chromadb.config import Settings
+        client = chromadb.PersistentClient(
+            path=str(CHROMA_DIR), settings=Settings(anonymized_telemetry=False))
+        col = client.get_collection(COLLECTION_NAME)
+        res = col.get(ids=list(chunk_ids), include=["documents", "metadatas"])
+    except Exception:
+        return {}
+    out = {}
+    for cid, doc, meta in zip(res["ids"], res["documents"], res["metadatas"]):
+        out[cid] = {"text": doc, "filename": meta.get("filename", ""),
+                    "org": meta.get("org", ""),
+                    "source_type": meta.get("source_type", "")}
+    return out
+
+
 @st.cache_data(ttl=30)
 def index_counts() -> pd.DataFrame | None:
     """Chunk counts per (org, source_type), or None if no index exists yet."""
@@ -907,6 +936,45 @@ with tab_results:
                 f"{res_meta.get('abstained', 0)} abstained"
             )
 
+        with st.expander("🧾 Run provenance — exactly what produced these numbers",
+                         expanded=False):
+            st.caption(
+                "Recorded in the run's meta.json when it was created. Kept "
+                "because a percentage is only interpretable alongside the "
+                "configuration that generated it."
+            )
+            prov = {
+                "run id": res_meta.get("run_id", "—"),
+                "label": res_meta.get("label") or "(none)",
+                "status": res_meta.get("status", "—"),
+                "created": res_meta.get("created_at", "—"),
+                "last updated": res_meta.get("updated_at", "—"),
+                "answering + matching model": res_meta.get("generation_model", "—"),
+                "embedding model": res_meta.get("embedding_model", "—"),
+                "chunks retrieved per question (k)": res_meta.get("k", "—"),
+                "labs": ", ".join(res_meta.get("orgs") or []) or "—",
+                "source types": ", ".join(res_meta.get("source_types") or []) or "—",
+                "questions recorded": res_meta.get("questions", "—"),
+                "answered / abstained": (f"{res_meta.get('answered', 0)} / "
+                                         f"{res_meta.get('abstained', 0)}"),
+            }
+            # Values are deliberately stringified: the column mixes ints (k,
+            # question counts) with text, and a mixed-type object column fails
+            # Arrow serialization.
+            st.dataframe(
+                pd.DataFrame({"setting": list(prov),
+                              "value": [str(v) for v in prov.values()]}),
+                hide_index=True, width="stretch")
+            st.caption(
+                "All LLM calls ran at temperature 0. That is greedy decoding, "
+                "not a bit-reproducibility guarantee: on shared GPU "
+                "infrastructure batching and floating-point ordering can still "
+                "flip a near-tie token, so a re-run of the identical "
+                "questionnaire can move a profile by a few points. Compare any "
+                "difference against the confidence intervals below before "
+                "reading it as a real change."
+            )
+
         with st.expander("ℹ️ How the profile percentages are computed",
                          expanded=False):
             st.markdown(
@@ -1050,6 +1118,41 @@ with tab_results:
                            f"{ci_data['iterations']} resamples · seed "
                            f"{ci_data['seed']} — error bars shown on the charts "
                            "below; full table in the download.")
+                ci_rows = []
+                for _org, _by_st in ci_data["profiles"].items():
+                    for _st, _by_logic in _by_st.items():
+                        for _logic, s in _by_logic.items():
+                            ci_rows.append({
+                                "lab": _org, "source": _st, "logic": _logic,
+                                "mean %": s["mean"], "CI low": s["lo"],
+                                "CI high": s["hi"],
+                                "width": round(s["hi"] - s["lo"], 2),
+                                "std err": s["std"], "n questions": s["n"],
+                            })
+                if ci_rows:
+                    st.markdown("**Full interval table** — the numbers behind "
+                                "the whiskers, including the bootstrap "
+                                "standard error and the sample size each "
+                                "interval rests on:")
+                    ci_df = pd.DataFrame(ci_rows)
+                    fc1, fc2 = st.columns(2)
+                    f_lab = fc1.multiselect("Lab", sorted(ci_df["lab"].unique()),
+                                            key="ci_tbl_lab")
+                    f_src = fc2.multiselect("Source",
+                                            sorted(ci_df["source"].unique()),
+                                            key="ci_tbl_src")
+                    v = ci_df
+                    if f_lab:
+                        v = v[v["lab"].isin(f_lab)]
+                    if f_src:
+                        v = v[v["source"].isin(f_src)]
+                    st.dataframe(v, hide_index=True, width="stretch")
+                    st.caption(
+                        "`width` is how many percentage points the interval "
+                        "spans — the honest precision of that estimate. A "
+                        "logic whose interval overlaps another's cannot be "
+                        "ranked against it from this run alone."
+                    )
                 ci_csv = runs.run_dir(res_run) / "bootstrap_ci" / "ci.csv"
                 if ci_csv.exists():
                     st.download_button("ci.csv", ci_csv.read_bytes(),
@@ -1241,6 +1344,12 @@ with tab_audit:
         cat_f = f3.multiselect("Category", [c for c in CATEGORIES
                                             if c in set(dfq["category"])])
         only_abstain = f4.checkbox("Abstentions only")
+        show_evidence = st.checkbox(
+            "Show the retrieved evidence each answer was written from",
+            value=False, key="audit_show_evidence",
+            help="Fetches the actual chunk text by id from the vector index "
+                 "(one batched lookup for the filtered rows — no API calls). "
+                 "Off by default because it makes the page much longer.")
 
         view = dfq
         if orgs_f:
@@ -1254,6 +1363,22 @@ with tab_audit:
 
         st.caption(f"{len(view)} of {len(dfq)} rows "
                    f"({int(dfq['abstain'].sum())} abstentions overall)")
+
+        # One batched lookup for every chunk in the filtered view, plus the
+        # topic map if the inductive layer has been fitted — so each piece of
+        # evidence can be labelled with the theme it belongs to.
+        evidence: dict = {}
+        chunk_topic_map: dict = {}
+        topic_label_map: dict = {}
+        if show_evidence and len(view):
+            ids = tuple(sorted({cid for r in view["retrieved_ids"]
+                                if isinstance(r, list) for cid in r}))
+            evidence = fetch_chunks(ids)
+            chunk_topic_map = topics_mod.load_chunk_topics() or {}
+            tinfo_a = topics_mod.load_topic_info()
+            if tinfo_a:
+                topic_label_map = {r["topic"]: r["label"]
+                                   for r in tinfo_a["topics"]}
 
         for _, row in view.iterrows():
             top = ("ABSTAINED" if row["abstain"] else
@@ -1286,6 +1411,23 @@ with tab_audit:
                                f"{row.get('retrieval_grounding_score', 0):.2f} · "
                                f"cosine {row.get('retrieval_cosine_top', 0):.2f}")
                 st.caption("retrieved: " + ", ".join(row["retrieved_ids"][:5]))
+                if show_evidence:
+                    st.markdown("**Evidence the answer was written from** "
+                                "(the only text the answering model saw):")
+                    for i, cid in enumerate(row["retrieved_ids"], 1):
+                        ch = evidence.get(cid)
+                        tag = (f"[{i}] {ch['filename']}" if ch
+                               else f"[{i}] {cid}")
+                        if chunk_topic_map:
+                            t = chunk_topic_map.get(cid)
+                            if t is not None:
+                                tag += f"  ·  topic {t}: {topic_label_map.get(t, '')}"
+                        if ch:
+                            with st.expander(tag, expanded=False):
+                                st.text(ch["text"])
+                        else:
+                            st.caption(f"{tag} — not in the current index "
+                                       "(re-ingested since this run?)")
 
 # ---------------------------------------------------------------------------
 # Hallucination tab — the five opt-in checks, with alerts when one fires
@@ -2701,6 +2843,41 @@ with tab_halluc:
                                  "embedding_nearest": "embedding says",
                              }),
                         hide_index=True, width="stretch")
+
+            if erows is not None and not erows.empty:
+                with st.expander("Per-question similarities (the raw numbers)",
+                                 expanded=False):
+                    st.caption(
+                        "Every row's seven cosine similarities, and the "
+                        "min-shifted closeness shares derived from them. These "
+                        "are the inputs to every aggregate above — shown "
+                        "because the aggregates are otherwise unauditable. "
+                        "Remember the absolute cosines are not interpretable "
+                        "on their own (e5 compresses them into a narrow band); "
+                        "the ranking and the shares are."
+                    )
+                    which = st.radio(
+                        "Show", ["cosine similarities", "closeness shares"],
+                        horizontal=True, key="emb_raw_which")
+                    col = ("similarities" if which == "cosine similarities"
+                           else "embedding_shares")
+                    if col not in erows.columns:
+                        st.info(
+                            "Closeness shares are not in this run's file — it "
+                            "predates the graded metrics. Recompute the check "
+                            "above to add them.")
+                    else:
+                        wide = pd.DataFrame([
+                            {"lab": r["org"], "source": r["source_type"],
+                             "qid": r["qid"],
+                             "matcher": r["matcher_top"],
+                             "embedding": r["embedding_nearest"],
+                             "margin": r["margin"],
+                             **{logic: (r[col] or {}).get(logic)
+                                for logic in LOGICS}}
+                            for _, r in erows.iterrows()
+                        ])
+                        st.dataframe(wide, hide_index=True, width="stretch")
 
             edir = runs.run_dir(hal_run) / "embedding_agreement"
             dle1, dle2 = st.columns(2)
