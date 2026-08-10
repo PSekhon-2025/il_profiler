@@ -260,6 +260,23 @@ def load_variants(run_id: str | None) -> pd.DataFrame | None:
     return pd.DataFrame(rows) if rows else None
 
 
+@st.cache_data(ttl=30)
+def load_replicate_reports() -> dict:
+    """All replicate-average reports on disk, newest group first."""
+    from il_rag.replicates import REPLICATES_DIR, REPORT_JSON
+    if not REPLICATES_DIR.exists():
+        return {}
+    out = {}
+    for d in sorted(REPLICATES_DIR.iterdir(), reverse=True):
+        p = d / REPORT_JSON
+        if d.is_dir() and p.exists():
+            try:
+                out[d.name] = json.loads(p.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                continue
+    return out
+
+
 def load_bootstrap_ci(run_id: str | None) -> dict | None:
     """The bootstrap-CI result for a run, if computed."""
     if not run_id:
@@ -1157,6 +1174,106 @@ with tab_results:
                 if ci_csv.exists():
                     st.download_button("ci.csv", ci_csv.read_bytes(),
                                        file_name=f"bootstrap_ci_{res_run}.csv")
+
+        # --- Replicate runs: decoding noise, averaged and measured ---
+        with st.expander("Replicate runs (decoding noise)", expanded=False):
+            st.caption(
+                "Temperature 0 is greedy decoding, but not bit-reproducible on "
+                "shared GPUs — re-asking the identical questionnaire moves the "
+                "profiles. Averaging replicates cancels that; the spread across "
+                "them measures how big it is."
+            )
+            with st.expander("ℹ️ How replicate averaging works", expanded=False):
+                st.markdown(
+                    "Implemented in `il_rag/replicates.py`. For one "
+                    "(lab, source, logic) observed across $R$ replicate runs "
+                    "as $P_1..P_R$:"
+                )
+                st.latex(r"\bar{P}=\frac{1}{R}\sum_{r=1}^{R}P_r, \qquad "
+                         r"s=\sqrt{\frac{\sum_r (P_r-\bar{P})^2}{R-1}}, \qquad "
+                         r"\mathrm{SEM}=\frac{s}{\sqrt{R}}")
+                st.markdown(
+                    "The mean's standard error shrinks as $1/\\sqrt{R}$, so "
+                    "3–4 replicates roughly halve the jitter of a single run. "
+                    "The SD is withheld below 3 replicates — with two runs it "
+                    "has a single degree of freedom and would be misleading; "
+                    "the observed range is shown instead."
+                )
+                st.markdown(
+                    "**Two different uncertainties — report both.**\n\n"
+                    "| | question |\n|---|---|\n"
+                    "| **bootstrap CI** | how much would this move if we had "
+                    "asked a *different sample of questions*? |\n"
+                    "| **between-run SD** | how much does it move if we ask "
+                    "the *same* questions again? |\n\n"
+                    "Neither substitutes for the other. Combining them in "
+                    "quadrature, $\\sqrt{\\mathrm{SE}_{\\text{boot}}^2 + "
+                    "\\mathrm{SEM}^2}$, assumes they are independent — a "
+                    "reasonable but stated assumption."
+                )
+                st.markdown(
+                    "**Design decisions**\n"
+                    "- *Only same-questionnaire runs may be averaged.* "
+                    "Reference wording changes what the matcher grades "
+                    "against, so mixing question sets averages two different "
+                    "measurements. Each run stores the questionnaire that "
+                    "produced it; the tool fingerprints it (SHA-256 of "
+                    "canonical JSON) and refuses mismatches unless forced.\n"
+                    "- *`dominant agreement`* is label-level stability: the "
+                    "share of replicates whose top logic matched the top logic "
+                    "of the averaged profile. It often holds at 100% even when "
+                    "the percentages move — which is why rankings are the "
+                    "safer claim.\n"
+                    "- *Profiles that abstained everywhere are excluded* rather "
+                    "than averaged in as zeros."
+                )
+            st.markdown(
+                "Run replicates from the CLI (each is a full run, so R×the "
+                "usual cost):\n\n"
+                "```bash\n"
+                ".venv/bin/python scripts/08_run_replicates.py run --n 3\n"
+                "# or average runs you already have:\n"
+                ".venv/bin/python scripts/08_run_replicates.py aggregate \\\n"
+                "    --runs <run_a> <run_b> <run_c>\n"
+                "```")
+            rep = load_replicate_reports()
+            if not rep:
+                st.info("No replicate report yet.", icon="🔁")
+            else:
+                pick = st.selectbox(
+                    "Replicate group", list(rep),
+                    format_func=lambda g: (
+                        f"{g} — {rep[g]['n_replicates']} runs"),
+                    key="rep_group")
+                r = rep[pick]
+                st.caption(
+                    f"Runs averaged: {', '.join(r['run_ids'])} · "
+                    f"questionnaire fingerprint `{r.get('questionnaire_fingerprint')}`"
+                    + ("  ⚠️ MIXED questionnaires" if r.get("mixed_questionnaires")
+                       else ""))
+                rep_rows = []
+                for _org, _by in r["profiles"].items():
+                    for _st, d in _by.items():
+                        for _logic, s in d["logics"].items():
+                            rep_rows.append({
+                                "lab": _org, "source": _st, "logic": _logic,
+                                "mean %": s["mean"], "sd": s["sd"],
+                                "sem": s["sem"], "min": s["min"],
+                                "max": s["max"], "range": s["range"],
+                                "runs": d["replicates"],
+                            })
+                st.dataframe(pd.DataFrame(rep_rows), hide_index=True,
+                             width="stretch")
+                dom = [{"lab": o, "source": s,
+                        "averaged dominant": d["mean_dominant"],
+                        "agreed in": (f"{d['dominant_agreement']:.0%}"
+                                      if d.get("dominant_agreement") is not None
+                                      else "—"),
+                        "per run": ", ".join(d["dominant_per_run"])}
+                       for o, by in r["profiles"].items() for s, d in by.items()]
+                st.markdown("**Label stability** — did each replicate agree on "
+                            "the dominant logic?")
+                st.dataframe(pd.DataFrame(dom), hide_index=True, width="stretch")
 
         # ci_long: lo/hi per (lab, source, logic) for error-bar overlays.
         ci_recs = []
