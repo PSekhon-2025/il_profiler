@@ -116,6 +116,30 @@ no article text — so it carries none of the corpus's copyright exposure.
 Re-fit and re-ship whenever the index is rebuilt, since topics are keyed to
 chunk ids.
 
+## Source PDF links — deliberately local-only
+
+The Audit tab can turn each `[excerpt N]` citation into a link to the PDF it
+names (see the README). That feature is **off in the cloud, and must stay off.**
+
+Streamlit serves `<app dir>/static` at `/app/static/...` over plain HTTP with
+`Access-Control-Allow-Origin: *`, and that route is handled *below* the Python
+app — the password gate in `app.py` does not cover it. Anything in `static/` is
+readable by anyone who guesses the URL. Publishing the corpus there would
+publish copyrighted PDFs.
+
+Two independent things prevent that, and neither is redundant:
+
+1. `IL_PROFILER_CLOUD=1` (set in `fly.toml`) makes `pdf_url()` in `app.py`
+   return before it touches the filesystem, so a cloud instance never publishes
+   a PDF. Note this stops *publishing*, not *serving* — a file already sitting
+   in `static/` would still be served, which is why (2) matters.
+2. `static/` is in `.dockerignore`, so locally-published PDFs are never baked
+   into the image. The cloud filesystem has no `static/` directory at all.
+
+Also leave `IL_PROFILER_DATASET_ROOT` unset in the cloud (it is not a Fly
+secret, and there is no dataset there to point at). If you ever add a corpus to
+the volume, do not point this at it.
+
 ## Updating the app
 
 Code changes: `git push` then `fly deploy`. The volume (index + runs) persists

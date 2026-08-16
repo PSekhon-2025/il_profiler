@@ -10,6 +10,10 @@ venv/
 # generated data (vector store + results)
 data/
 
+# corpus PDFs published for the audit tab's excerpt links, copied on first
+# reference from IL_PROFILER_DATASET_ROOT — derived, and not ours to ship
+static/
+
 # python
 __pycache__/
 *.pyc

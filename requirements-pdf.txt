@@ -1,0 +1,11 @@
+# LOCAL-ONLY extra for the excerpt page map (scripts/09_build_pdf_pages.py).
+#
+# Deliberately NOT in requirements.txt, for the same reason as
+# requirements-topics.txt: the container ships no corpus, so it has nothing to
+# extract pages from. The map is built once on a workstation that has the
+# dataset, and only the small JSON result (data/pdf_pages.json) is read by the
+# app — which never imports pypdf.
+#
+#   .venv/Scripts/python -m pip install -r requirements-pdf.txt
+#   .venv/Scripts/python scripts/09_build_pdf_pages.py
+pypdf>=5.0

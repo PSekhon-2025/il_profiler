@@ -1047,6 +1047,57 @@ resampling of the questions rather than from re-rolling the model.
 - **Compare** — diff two run snapshots: profile deltas, question-wording diff,
   and per-question label changes.
 
+### 12.1 Source links in the audit trail (`il_rag/pdf_sources.py`)
+
+A supporting quote is displayed as `[excerpt 3] "…"`. The number alone is not
+auditable — checking it meant opening the evidence list, counting down it, and
+finding the file by hand. When `IL_PROFILER_DATASET_ROOT` points at the raw
+dataset, the number becomes a link to the PDF.
+
+**Resolution.** A chunk's metadata carries a bare basename, never a path
+(`ingest.py` reads it from the corpus text file's `FILE:` header), so the join
+is by normalized basename — lowercase, alphanumerics only — over one walk of
+the dataset tree. Across the 98 published documents that resolves all of them:
+97 match exactly and one needs the normalization (the corpus writes
+`Inside Google_s AGI Strategy.pdf` where the disk has an apostrophe). Two
+basenames occur twice in the tree; preferring a path under the chunk's own
+`org` decides both, and is exhaustively correct here rather than a heuristic,
+since every document does sit under its own lab.
+
+**Delivery.** Streamlit only serves files beneath `<app dir>/static`, and its
+path check resolves symlinks before testing containment, so a junction into the
+dataset is rejected — the bytes must be reachable through a real path. Cited
+PDFs are therefore hard-linked (falling back to a copy) into `static/` on first
+reference, so only documents actually cited are ever published.
+
+**What the link claims.** It names the document the answer *cited*, which is
+what `[excerpt N]` says. It is not evidence the span is there: §9.2 verifies a
+quote against **any** retrieved chunk, deliberately, so a ✅ beside a link
+certifies "this text is in the sources", not "in this PDF". Where the span is
+really in a different retrieved document, the row names and links that one too
+— the same normalized-substring test §9.2 uses, over the row's own ≤5 chunks,
+so nothing expensive runs while rendering.
+
+**Page anchors.** `scripts/09_build_pdf_pages.py` writes
+`data/pdf_pages.json` = `{chunk_id: page}`. It reconstructs ids by re-running
+ingestion's own splitting and chunking over `pdf_corpus.txt`, so no vector
+index is needed, then aligns each PDF's pages against the document body:
+proportional cumulative page length as a first estimate, refined by searching
+for real page text nearby. Anchoring on a page's *opening* text alone fails
+here — pypdf emits the printed page number first, where the corpus converter
+did not — which is why the estimate exists. Two refusals keep it honest: a
+document whose PDF yields no text at all (21 are recorded in the dataset's own
+manifests as `method: ocr` — web pages saved as images) and one where fewer
+than 60% of pages could be confirmed by real text are both skipped entirely,
+and their links open at page 1. Coverage is 89% of chunks; on a 335-chunk
+audit, 99% of the anchors placed land on the correct page.
+
+**Scope and safety.** Published (PDF) evidence only — third-party RTF chunks
+bundle many articles per file, so a file-level link would point at the bundle,
+not the article. Every unresolvable case falls back to the exact plain text the
+UI showed before, so the feature is invisible without a dataset. It is off in
+the cloud by two independent mechanisms; see DEPLOY.md.
+
 ---
 
 ## 13. Running it
@@ -1102,12 +1153,13 @@ il_rag/
   metamorphic.py         (check) control / paraphrase / ablation / distractor
   embedding_agreement.py (check) non-LLM second judge
   quote_provenance.py    (check) graded quote provenance x veracity
+  pdf_sources.py         chunk → source PDF, for the audit trail's links (§12.1)
   bootstrap_ci.py        confidence intervals over the profiles
   json_utils.py, llm.py  shared JSON extraction; Together chat/embed wrappers
 scripts/
   01_ingest.py  02_run_profiles.py  03_run_metamorphic_eval.py
   04_run_embedding_agreement.py  05_run_bootstrap_ci.py
-  06_run_quote_provenance.py
+  06_run_quote_provenance.py  09_build_pdf_pages.py
 app.py                   Streamlit GUI (Run / Results / Audit / Hallucination / Compare)
 tests/                   offline unit tests
 Dockerfile, fly.toml, DEPLOY.md   deployment

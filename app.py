@@ -38,7 +38,7 @@ import streamlit as st
 PROJECT_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from il_rag import runs, topics as topics_mod
+from il_rag import pdf_sources, runs, topics as topics_mod
 from il_rag.config import (
     CHROMA_DIR,
     CHUNK_OVERLAP,
@@ -53,11 +53,13 @@ from il_rag.config import (
     ORGS,
     PARAPHRASE_MAX_TOKEN_OVERLAP,
     PARAPHRASE_MIN_COSINE,
+    PDF_DATASET_ROOT,
     QUOTE_MIN_SPAN_TOKENS,
     QUOTE_NEAR_VERBATIM_THRESHOLD,
     QUOTE_PARAPHRASE_COS_THRESHOLD,
     QUOTE_PARAPHRASE_LEX_THRESHOLD,
     SOURCE_TYPES,
+    STATIC_DIR,
     TOP_K,
 )
 from il_rag.questionnaire import CATEGORIES, LOGICS
@@ -170,6 +172,54 @@ def fetch_chunks(chunk_ids: tuple[str, ...]) -> dict:
                     "org": meta.get("org", ""),
                     "source_type": meta.get("source_type", "")}
     return out
+
+
+@st.cache_data(ttl=300)
+def pdf_index() -> dict:
+    """Normalized-basename -> dataset PDF paths, from one walk of the tree.
+
+    Cached with a TTL rather than forever so a PDF dropped into the dataset is
+    picked up without restarting the app.
+    """
+    return pdf_sources.build_index(PDF_DATASET_ROOT)
+
+
+@st.cache_data(ttl=300)
+def chunk_pages() -> dict:
+    """{chunk_id: page number} for #page= deep links, or {} if never built."""
+    return pdf_sources.load_chunk_pages()
+
+
+@st.cache_data(ttl=300)
+def pdf_url(filename: str, org: str, chunk_id: str | None = None) -> str | None:
+    """URL a browser can open for this chunk's source PDF, or None.
+
+    SECURITY INVARIANT. Streamlit serves /app/static over HTTP with
+    `Access-Control-Allow-Origin: *`, and that route is NOT behind
+    _require_password() below — it is handled beneath the Python app entirely,
+    so anything in static/ is readable by anyone who guesses the URL. Two
+    things keep the copyrighted corpus out of it, and BOTH are needed:
+
+      1. the guard below, which returns before touching the filesystem, so a
+         cloud instance never publishes a PDF (note it stops PUBLISHING, not
+         serving — a file already in static/ would still be served);
+      2. `static/` in .dockerignore, so no locally-published PDF is ever baked
+         into the image. The cloud filesystem therefore has no static/ at all.
+
+    Do not weaken either one. See DEPLOY.md.
+
+    Note this memoizes an idempotent SIDE EFFECT: the first call for a document
+    publishes it into static/. Correctness never depends on the cache —
+    materialize() re-checks the destination on every miss, and the cache only
+    spares repeated stat() calls while a view renders hundreds of quotes.
+    """
+    if CLOUD_MODE or PDF_DATASET_ROOT is None:
+        return None
+    src = pdf_sources.resolve(filename, org, pdf_index())
+    if src is None:
+        return None
+    page = chunk_pages().get(chunk_id) if chunk_id else None
+    return pdf_sources.materialize(src, org, STATIC_DIR, page=page)
 
 
 @st.cache_data(ttl=30)
@@ -1494,7 +1544,12 @@ with tab_audit:
                 "and quote-provenance checks refetch exactly these chunks.\n"
                 "- **Supporting quotes** (only when the run used `--quotes`) — "
                 "spans the model claims to have copied, each ✅/❌ by a "
-                "code-side verbatim check after whitespace normalization.\n"
+                "code-side verbatim check after whitespace normalization. The "
+                "excerpt number links to the source PDF when the raw dataset "
+                "is available locally; because a span verifies against *any* "
+                "retrieved excerpt, a ✅ does not certify it is in the linked "
+                "document, and where it isn't, the row names the one that "
+                "actually holds it.\n"
                 "- **grounding** (only when the run used `--grounding`) — the "
                 "row's lexical grounding score, best cosine, and bucket.\n\n"
                 "**Abstentions** carry an all-zero weight vector and are "
@@ -1532,13 +1587,23 @@ with tab_audit:
         # One batched lookup for every chunk in the filtered view, plus the
         # topic map if the inductive layer has been fitted — so each piece of
         # evidence can be labelled with the theme it belongs to.
+        #
+        # The chunk lookup now feeds TWO things: the evidence list below, and
+        # the [excerpt N] links in the quote block, which need each cited
+        # chunk's filename and org. So it is no longer gated on show_evidence —
+        # it is gated on there being something to use it for, which keeps a run
+        # without quotes exactly as cheap as before. Ids need no embedding, so
+        # this stays one local sqlite get, cached (see fetch_chunks).
         evidence: dict = {}
         chunk_topic_map: dict = {}
         topic_label_map: dict = {}
-        if show_evidence and len(view):
+        has_quote_rows = "quotes" in view.columns and view["quotes"].apply(
+            lambda q: isinstance(q, list) and bool(q)).any()
+        if len(view) and (show_evidence or has_quote_rows):
             ids = tuple(sorted({cid for r in view["retrieved_ids"]
                                 if isinstance(r, list) for cid in r}))
             evidence = fetch_chunks(ids)
+        if show_evidence and len(view):
             chunk_topic_map = topics_mod.load_chunk_topics() or {}
             tinfo_a = topics_mod.load_topic_info()
             if tinfo_a:
@@ -1566,10 +1631,30 @@ with tab_audit:
                     st.markdown("**Supporting quotes:** "
                                 + ("✅ all verified in sources" if ok
                                    else "⚠️ not verified"))
+                    linked = False
                     for q in row["quotes"]:
                         mark = "✅" if q.get("verified") else "❌"
-                        st.markdown(f"> {mark} [excerpt {q.get('excerpt', '?')}] "
-                                    f"“{q.get('quote', '')}”")
+                        # The excerpt number becomes a link to the PDF it names;
+                        # `note` calls out the case where the span is real but
+                        # lives in a different document than the one cited.
+                        cite = pdf_sources.excerpt_citation(
+                            q.get("excerpt"), row.get("retrieved_ids"),
+                            evidence, pdf_url)
+                        note = pdf_sources.misattribution_note(
+                            q.get("quote", ""), q.get("excerpt"),
+                            row.get("retrieved_ids"), evidence, pdf_url)
+                        # A linked citation opens the markdown link "[";
+                        # the plain fallback opens the escaped bracket "\[".
+                        linked = linked or cite.startswith("[")
+                        st.markdown(f"> {mark} {cite} "
+                                    f"“{q.get('quote', '')}”{note}")
+                    if linked:
+                        st.caption(
+                            "Excerpt numbers link to the PDF the answer CITED. "
+                            "Verification runs against every retrieved excerpt, "
+                            "not just the cited one, so ✅ does not certify the "
+                            "span is in the linked document — where they "
+                            "differ, the real source is named above.")
                 gb = row.get("grounding_bucket")
                 if isinstance(gb, str):
                     st.caption(f"grounding: {gb} · score "
@@ -1589,6 +1674,13 @@ with tab_audit:
                                 tag += f"  ·  topic {t}: {topic_label_map.get(t, '')}"
                         if ch:
                             with st.expander(tag, expanded=False):
+                                # In the body, not the label: a click on a link
+                                # inside an expander header also toggles it.
+                                doc = (pdf_url(ch["filename"], ch["org"], cid)
+                                       if ch.get("source_type") == "published"
+                                       else None)
+                                if doc:
+                                    st.markdown(f"[📄 open {ch['filename']}]({doc})")
                                 st.text(ch["text"])
                         else:
                             st.caption(f"{tag} — not in the current index "
@@ -1986,6 +2078,13 @@ with tab_halluc:
             m3.metric("∅ no quotes returned", len(noq_rows),
                       help="empty quote list — expected for abstentions")
             if len(fab_rows):
+                # Same batched by-id lookup as the Audit tab, over the failing
+                # rows only, so each [excerpt N] can link to the PDF it names.
+                # fetch_chunks caches per id-tuple, so ids shared with the Audit
+                # tab's view cost nothing.
+                fab_ev = fetch_chunks(tuple(sorted(
+                    {cid for r in fab_rows["retrieved_ids"]
+                     if isinstance(r, list) for cid in r})))
                 for _, r in fab_rows.iterrows():
                     with st.expander(f"❌ {r['org']} · {r['source_type']} · "
                                      f"{r['qid']}"):
@@ -1993,8 +2092,14 @@ with tab_halluc:
                         st.markdown(f"**Answer:** {r['answer']}")
                         for q in r["quotes"]:
                             mark = "✅" if q.get("verified") else "❌"
-                            st.markdown(f"> {mark} [excerpt {q.get('excerpt', '?')}]"
-                                        f" “{q.get('quote', '')}”")
+                            cite = pdf_sources.excerpt_citation(
+                                q.get("excerpt"), r.get("retrieved_ids"),
+                                fab_ev, pdf_url)
+                            note = pdf_sources.misattribution_note(
+                                q.get("quote", ""), q.get("excerpt"),
+                                r.get("retrieved_ids"), fab_ev, pdf_url)
+                            st.markdown(f"> {mark} {cite}"
+                                        f" “{q.get('quote', '')}”{note}")
             else:
                 st.caption("Every quoted span was found verbatim in its retrieved "
                            "sources.")

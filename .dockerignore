@@ -14,6 +14,11 @@ __pycache__/
 # Generated data — lives on the persistent Fly volume, not in the image.
 data/
 
+# Corpus PDFs published locally for the audit tab's excerpt links. The raw
+# corpus is never shipped, and /app/static is served without authentication —
+# baking these in would publish them. See DEPLOY.md.
+static/
+
 # Local-only launchers and OS cruft.
 Launch IL Profiler.command
 Launch IL Profiler.bat

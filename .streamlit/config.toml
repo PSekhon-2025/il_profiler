@@ -1,0 +1,11 @@
+# Serve <repo>/static at /app/static, so the Audit tab's [excerpt N] citations
+# can link to the actual source PDF (see il_rag/pdf_sources.py). Every launcher
+# — the .bat, the .command, .claude/launch.json, and the Docker WORKDIR — starts
+# in the repo root, which is where Streamlit looks for this file, so this one
+# setting covers all of them.
+#
+# Inert in the cloud: that image ships no corpus, and pdf_sources' callers
+# return before touching the filesystem when IL_PROFILER_CLOUD=1, so no static/
+# directory is ever created there. See DEPLOY.md.
+[server]
+enableStaticServing = true
