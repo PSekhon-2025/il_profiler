@@ -30,6 +30,32 @@ PROFILES_DIR = DATA_DIR / "profiles"
 for _d in (DATA_DIR, CHROMA_DIR, PROFILES_DIR):
     _d.mkdir(parents=True, exist_ok=True)
 
+# Where the RAW dataset tree lives, so the audit trail's [excerpt N] citations
+# can link to the PDF the answer was written from (see il_rag/pdf_sources.py):
+#     <root>/<Org>/<Category>/<name>.pdf
+# Deliberately NOT derived from CORPUS_ROOT above. That path is relative to this
+# file and on the current workstation resolves to a directory holding no corpus
+# at all, so deriving from it would produce links to nothing — or worse, to the
+# wrong document. This is a machine-specific absolute path, which makes it a
+# setting; unset means "no dataset here" (a fresh checkout, or the cloud) and
+# the links simply don't render. No guessing: a wrong guess is worse than none.
+#     .env:  IL_PROFILER_DATASET_ROOT=C:/path/to/dataset
+_dataset_root = os.environ.get("IL_PROFILER_DATASET_ROOT", "").strip()
+PDF_DATASET_ROOT = Path(_dataset_root) if _dataset_root else None
+
+# Streamlit serves <app dir>/static at /app/static when server.enableStaticServing
+# is on (.streamlit/config.toml). Cited PDFs are published here on first
+# reference — created lazily, never at import, so the container never grows one.
+STATIC_DIR = PROJECT_ROOT / "static"
+
+# Where scripts/10_build_article_pdfs.py writes one PDF per third-party press
+# record, so RTF-backed citations can link to the article rather than to the
+# 45 MB bundle it came from. Derived, gitignored, and never shipped. Overridable
+# because ~3,000 files inside a cloud-synced repo is a real cost — the map keys
+# paths relative to this directory, so moving it does not invalidate anything.
+ARTICLE_PDF_DIR = Path(os.environ.get("IL_PROFILER_ARTICLE_DIR", "").strip()
+                       or DATA_DIR / "articles")
+
 # ---------------------------------------------------------------------------
 # API / models
 # ---------------------------------------------------------------------------
@@ -134,6 +160,12 @@ SOURCE_TYPES = ["published", "thirdparty"]
 
 # Published-document corpora: each is one big text file produced by converting
 # the lab's PDFs; documents inside are delimited by "FILE:" header blocks.
+# NOTE: these paths are stale — the dataset has since been reorganized to
+# <root>/<Org>/8 - Corpus/pdf_corpus.txt and <root>/<Org>/9 - Articles/. Left
+# alone on purpose: repointing them changes which pdf_corpus.txt ingestion
+# reads, and a published chunk id embeds the POSITION of its FILE: header, so
+# every id would be silently re-minted. Fix it together with a reingest. The
+# excerpt links do not depend on this — see PDF_DATASET_ROOT above.
 PUBLISHED_CORPUS = {
     "OpenAI":    CORPUS_ROOT / "OpenAI"    / "OpenAI PDF's"   / "pdf_corpus.txt",
     "DeepMind":  CORPUS_ROOT / "DM"        / "Deepmind PDF's" / "pdf_corpus.txt",

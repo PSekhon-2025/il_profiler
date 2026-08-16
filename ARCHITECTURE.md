@@ -1047,6 +1047,97 @@ resampling of the questions rather than from re-rolling the model.
 - **Compare** — diff two run snapshots: profile deltas, question-wording diff,
   and per-question label changes.
 
+### 12.1 Source links in the audit trail (`il_rag/pdf_sources.py`)
+
+A supporting quote is displayed as `[excerpt 3] "…"`. The number alone is not
+auditable — checking it meant opening the evidence list, counting down it, and
+finding the file by hand. When `IL_PROFILER_DATASET_ROOT` points at the raw
+dataset, the number becomes a link to the PDF.
+
+**Resolution.** A chunk's metadata carries a bare basename, never a path
+(`ingest.py` reads it from the corpus text file's `FILE:` header), so the join
+is by normalized basename — lowercase, alphanumerics only — over one walk of
+the dataset tree. Across the 98 published documents that resolves all of them:
+97 match exactly and one needs the normalization (the corpus writes
+`Inside Google_s AGI Strategy.pdf` where the disk has an apostrophe). Two
+basenames occur twice in the tree; preferring a path under the chunk's own
+`org` decides both, and is exhaustively correct here rather than a heuristic,
+since every document does sit under its own lab.
+
+**Delivery.** Streamlit only serves files beneath `<app dir>/static`, and its
+path check resolves symlinks before testing containment, so a junction into the
+dataset is rejected — the bytes must be reachable through a real path. Cited
+PDFs are therefore hard-linked (falling back to a copy) into `static/` on first
+reference, so only documents actually cited are ever published.
+
+**What the link claims.** It names the document the answer *cited*, which is
+what `[excerpt N]` says. It is not evidence the span is there: §9.2 verifies a
+quote against **any** retrieved chunk, deliberately, so a ✅ beside a link
+certifies "this text is in the sources", not "in this PDF". Where the span is
+really in a different retrieved document, the row names and links that one too
+— the same normalized-substring test §9.2 uses, over the row's own ≤5 chunks,
+so nothing expensive runs while rendering.
+
+**Page anchors.** `scripts/09_build_pdf_pages.py` writes
+`data/pdf_pages.json` = `{chunk_id: page}`. It reconstructs ids by re-running
+ingestion's own splitting and chunking over `pdf_corpus.txt`, so no vector
+index is needed, then aligns each PDF's pages against the document body:
+proportional cumulative page length as a first estimate, refined by searching
+for real page text nearby. Anchoring on a page's *opening* text alone fails
+here — pypdf emits the printed page number first, where the corpus converter
+did not — which is why the estimate exists. Two refusals keep it honest: a
+document whose PDF yields no text at all (21 are recorded in the dataset's own
+manifests as `method: ocr` — web pages saved as images) and one where fewer
+than 60% of pages could be confirmed by real text are both skipped entirely,
+and their links open at page 1. Coverage is 89% of chunks; on a 335-chunk
+audit, 99% of the anchors placed land on the correct page.
+
+**Safety.** Every unresolvable case falls back to the exact plain text the UI
+showed before, so the feature is invisible without a dataset. It is off in the
+cloud by two independent mechanisms; see DEPLOY.md.
+
+### 12.2 Press records (`il_rag/article_pdfs.py`, `scripts/10_build_article_pdfs.py`)
+
+Third-party chunks name only `O1.RTF` — a 45 MB Nexis export holding 500
+records — so a file-level link identifies nothing. Stage 10 splits each bundle
+into one PDF per record ahead of time, and the citation resolves through the map
+it leaves behind (`data/article_sources.json`).
+
+**Which record a chunk belongs to.** `ARTICLE_SPLIT_RE` lists seven markers but
+five can never fire: `Title:`/`Headline:`/`Byline:`/`Publication-Date:` are each
+followed by `:` then U+00A0, and the pattern ends in `\b`, which needs a word
+boundary that is not there (`Byline:` occurs 140 times in O1.RTF and causes zero
+splits). The accident is load-bearing — it means every record splits into
+exactly two fragments in strict alternation: an identity block (headline,
+publication, date) and a body. The body is what gets indexed, so **a chunk's
+identity lives in the preceding fragment**, which is why these citations looked
+anonymous. Articles are recovered by walking the fragment list, not by parity:
+13 identity fragments in A1 survive the 200-character filter and parity would
+mis-assign them. Two shapes are special — a Nexis job header at fragment 0
+(whose own chunks are a search-results index belonging to no article, and stay
+unlinked) and, in the Anthropic exports, no job header at all.
+
+**Identity parsing.** The date line must match *in full*: News Bites headlines
+begin with a date (`May 06, 2026: EVE Online and…`), and prefix-matching there
+mistakes the headline for the date and shifts every field. Measured, that
+distinction is worth 93.45% → 99.67%, and five date-format variants close the
+rest. Headline is the first line; publication is everything between it and the
+date, which handles two-line publisher blocks.
+
+**Rendering.** A PDF core font under cp1252, embedding no font at all. Measured
+across all six dumps, after a six-character normalization only 67 characters in
+15.8 million fall outside cp1252 (runes, three CJK ideographs, arrows) — and
+those are folded or replaced *and counted*. Embedding a subsetted Unicode TTF
+would add 12-25 KB to each of ~3,000 files; core fonts keep the whole corpus at
+21 MB. Page anchors are exact rather than estimated: pages are recorded as each
+visual line is drawn, and a chunk is located in *its own source fragment* (not
+in the rendered text, of which it is only a line-subsequence), so the match is
+exact. Measured 639/649 sampled chunks on the stated page, zero wrong.
+
+**What the link claims.** It opens *our rendering* of the press record the index
+was built from — not the publisher's page. The exports contain no URL field
+anywhere, so there is nothing else to point at, and the UI says so.
+
 ---
 
 ## 13. Running it
@@ -1102,12 +1193,14 @@ il_rag/
   metamorphic.py         (check) control / paraphrase / ablation / distractor
   embedding_agreement.py (check) non-LLM second judge
   quote_provenance.py    (check) graded quote provenance x veracity
+  pdf_sources.py         chunk → source PDF, for the audit trail's links (§12.1)
+  article_pdfs.py        (local) RTF press dumps → one PDF per record (§12.2)
   bootstrap_ci.py        confidence intervals over the profiles
   json_utils.py, llm.py  shared JSON extraction; Together chat/embed wrappers
 scripts/
   01_ingest.py  02_run_profiles.py  03_run_metamorphic_eval.py
   04_run_embedding_agreement.py  05_run_bootstrap_ci.py
-  06_run_quote_provenance.py
+  06_run_quote_provenance.py  09_build_pdf_pages.py  10_build_article_pdfs.py
 app.py                   Streamlit GUI (Run / Results / Audit / Hallucination / Compare)
 tests/                   offline unit tests
 Dockerfile, fly.toml, DEPLOY.md   deployment
