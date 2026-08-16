@@ -40,6 +40,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from il_rag import pdf_sources, runs, topics as topics_mod
 from il_rag.config import (
+    ARTICLE_PDF_DIR,
     CHROMA_DIR,
     CHUNK_OVERLAP,
     CHUNK_SIZE,
@@ -166,11 +167,21 @@ def fetch_chunks(chunk_ids: tuple[str, ...]) -> dict:
         res = col.get(ids=list(chunk_ids), include=["documents", "metadatas"])
     except Exception:
         return {}
+    # Display labels are attached HERE because this is the single place chunk
+    # metadata is assembled for the UI — so the evidence list, the excerpt
+    # links and the mis-citation note all get them without a second lookup.
+    # For third-party evidence `filename` is the RTF bundle ("O1.RTF"), which
+    # names 500 articles and identifies none; `label` carries the headline.
+    articles = article_sources()
     out = {}
     for cid, doc, meta in zip(res["ids"], res["documents"], res["metadatas"]):
+        record = articles.get((pdf_sources.article_key(cid) or ("",))[0])
         out[cid] = {"text": doc, "filename": meta.get("filename", ""),
                     "org": meta.get("org", ""),
-                    "source_type": meta.get("source_type", "")}
+                    "source_type": meta.get("source_type", ""),
+                    "label": (pdf_sources.article_label(record) if record
+                              else meta.get("filename", "")),
+                    "sublabel": pdf_sources.article_sublabel(record) if record else ""}
     return out
 
 
@@ -191,8 +202,20 @@ def chunk_pages() -> dict:
 
 
 @st.cache_data(ttl=300)
-def pdf_url(filename: str, org: str, chunk_id: str | None = None) -> str | None:
+def article_sources() -> dict:
+    """{fragment prefix: press-record metadata + page map}, or {} if never built."""
+    return pdf_sources.load_article_sources()
+
+
+@st.cache_data(ttl=300)
+def pdf_url(filename: str, org: str, chunk_id: str | None = None,
+            source_type: str = "published") -> str | None:
     """URL a browser can open for this chunk's source PDF, or None.
+
+    Two sources, one return type. Published chunks resolve against the raw
+    dataset; third-party chunks resolve against the per-article PDFs that
+    scripts/10_build_article_pdfs.py generated, because their `filename` is a
+    45 MB bundle of 500 records rather than a document.
 
     SECURITY INVARIANT. Streamlit serves /app/static over HTTP with
     `Access-Control-Allow-Origin: *`, and that route is NOT behind
@@ -205,6 +228,9 @@ def pdf_url(filename: str, org: str, chunk_id: str | None = None) -> str | None:
          serving — a file already in static/ would still be served);
       2. `static/` in .dockerignore, so no locally-published PDF is ever baked
          into the image. The cloud filesystem therefore has no static/ at all.
+         `data/` is dockerignored too, so the generated article PDFs and their
+         map are absent there as well — the cloud has nothing to publish even
+         before the guard fires.
 
     Do not weaken either one. See DEPLOY.md.
 
@@ -213,7 +239,18 @@ def pdf_url(filename: str, org: str, chunk_id: str | None = None) -> str | None:
     materialize() re-checks the destination on every miss, and the cache only
     spares repeated stat() calls while a view renders hundreds of quotes.
     """
-    if CLOUD_MODE or PDF_DATASET_ROOT is None:
+    if CLOUD_MODE:
+        return None
+    if source_type == "thirdparty":
+        # Needs no dataset root — the article PDFs were generated ahead of time.
+        found = pdf_sources.resolve_article(chunk_id, article_sources(),
+                                            ARTICLE_PDF_DIR)
+        if found is None:
+            return None
+        src, page, _ = found
+        return pdf_sources.materialize(src, org, STATIC_DIR, page=page,
+                                       subdir=pdf_sources.ARTICLES_SUBDIR)
+    if PDF_DATASET_ROOT is None:
         return None
     src = pdf_sources.resolve(filename, org, pdf_index())
     if src is None:
@@ -1650,11 +1687,14 @@ with tab_audit:
                                     f"“{q.get('quote', '')}”{note}")
                     if linked:
                         st.caption(
-                            "Excerpt numbers link to the PDF the answer CITED. "
-                            "Verification runs against every retrieved excerpt, "
-                            "not just the cited one, so ✅ does not certify the "
-                            "span is in the linked document — where they "
-                            "differ, the real source is named above.")
+                            "Excerpt numbers link to the source the answer "
+                            "CITED. Verification runs against every retrieved "
+                            "excerpt, not just the cited one, so ✅ does not "
+                            "certify the span is in the linked document — "
+                            "where they differ, the real source is named "
+                            "above. Press-clipping links open **our rendering "
+                            "of the record the index was built from**, not the "
+                            "publisher's page; the exports carry no URL.")
                 gb = row.get("grounding_bucket")
                 if isinstance(gb, str):
                     st.caption(f"grounding: {gb} · score "
@@ -1666,8 +1706,13 @@ with tab_audit:
                                 "(the only text the answering model saw):")
                     for i, cid in enumerate(row["retrieved_ids"], 1):
                         ch = evidence.get(cid)
-                        tag = (f"[{i}] {ch['filename']}" if ch
+                        # `label` is the headline for press records and the
+                        # filename for published docs — "O1.RTF" named 500
+                        # articles and identified none of them.
+                        tag = (f"[{i}] {ch['label'] or ch['filename']}" if ch
                                else f"[{i}] {cid}")
+                        if ch and ch.get("sublabel"):
+                            tag += f"  ·  {ch['sublabel']}"
                         if chunk_topic_map:
                             t = chunk_topic_map.get(cid)
                             if t is not None:
@@ -1676,11 +1721,12 @@ with tab_audit:
                             with st.expander(tag, expanded=False):
                                 # In the body, not the label: a click on a link
                                 # inside an expander header also toggles it.
-                                doc = (pdf_url(ch["filename"], ch["org"], cid)
-                                       if ch.get("source_type") == "published"
-                                       else None)
+                                doc = pdf_url(ch["filename"], ch["org"], cid,
+                                              ch.get("source_type", ""))
                                 if doc:
-                                    st.markdown(f"[📄 open {ch['filename']}]({doc})")
+                                    name = pdf_sources.md_escape(
+                                        ch["label"] or ch["filename"])
+                                    st.markdown(f"[📄 open {name}]({doc})")
                                 st.text(ch["text"])
                         else:
                             st.caption(f"{tag} — not in the current index "

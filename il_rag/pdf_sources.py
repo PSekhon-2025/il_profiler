@@ -26,10 +26,18 @@ Three facts make the join non-trivial, and each maps to one function here:
      `load_chunk_pages` reads the offline-built map that scripts/09_build_pdf_pages.py
      produces, exactly as the app reads topics.load_chunk_topics().
 
-Scope: PUBLISHED (PDF-backed) evidence only. Third-party chunks come from
-concatenated RTF press dumps in which one file holds many articles, so a
-file-level link would point at a bundle rather than at the article quoted;
-those render unchanged until they have a referencing scheme of their own.
+Two kinds of evidence, resolved differently:
+
+  PUBLISHED   the chunk names a PDF that exists in the dataset; we find it and
+              publish it.
+  THIRDPARTY  the chunk names an RTF bundle holding 500 press records, which
+              identifies nothing. scripts/10_build_article_pdfs.py splits that
+              bundle into one PDF per record ahead of time, and we look the
+              chunk up in the map it leaves behind (see article_pdfs.py).
+
+The second carries an extra caveat the UI must state: that link opens OUR
+RENDERING of the press record the index was built from, not the publisher's
+own page. There is no URL anywhere in the Nexis exports to link to instead.
 
 Nothing here imports streamlit — the caching and the CLOUD_MODE guard live at
 the call site in app.py, which keeps this module testable under pytest.
@@ -61,6 +69,9 @@ CORPUS_FILENAME = "pdf_corpus.txt"
 # server.enableStaticServing is on (see .streamlit/config.toml).
 APP_STATIC_URL_PREFIX = "/app/static"
 STATIC_SUBDIR = "corpus"
+# Generated press-record PDFs publish to their own subtree, so a Nexis headline
+# can never collide with a corpus filename.
+ARTICLES_SUBDIR = "articles"
 
 # Streamlit's static route refuses anything at or above its own size cap
 # (MAX_APP_STATIC_FILE_SIZE in streamlit/web/server/starlette/starlette_server_config.py)
@@ -71,6 +82,13 @@ MAX_SERVABLE_BYTES = 200 * 1024 * 1024
 
 # {chunk_id: 1-based page number}, built offline by scripts/09_build_pdf_pages.py.
 PDF_PAGES_PATH = DATA_DIR / "pdf_pages.json"
+
+# {fragment prefix: article record}, built offline by
+# scripts/10_build_article_pdfs.py. Kept separate from PDF_PAGES_PATH rather
+# than folded into it: that file's contract is a flat {chunk_id: int}, the two
+# are built by different scripts from different halves of the dataset, and a
+# missing one must degrade independently of the other.
+ARTICLE_SOURCES_PATH = DATA_DIR / "article_sources.json"
 
 
 def normalize_name(name: str) -> str:
@@ -141,14 +159,15 @@ def resolve(filename: str, org: str,
     return Path(candidates[0])
 
 
-def static_url(org: str, name: str, page: int | None = None) -> str:
+def static_url(org: str, name: str, page: int | None = None,
+               subdir: str = STATIC_SUBDIR) -> str:
     """URL for a materialized PDF, percent-encoded segment by segment.
 
     Encoding is not optional: real corpus filenames contain spaces, an
     apostrophe, `&`, `$`, and an en-dash, and an unencoded `)` would terminate
     the surrounding markdown link early.
     """
-    path = "/".join(quote(part) for part in (STATIC_SUBDIR, org, name))
+    path = "/".join(quote(part) for part in (subdir, org, name))
     url = f"{APP_STATIC_URL_PREFIX}/{path}"
     return f"{url}#page={page}" if page else url
 
@@ -188,7 +207,8 @@ def _publish(src: Path, dest: Path) -> bool:
 
 
 def materialize(src: Path, org: str, static_root: Path,
-                page: int | None = None) -> str | None:
+                page: int | None = None,
+                subdir: str = STATIC_SUBDIR) -> str | None:
     """Publish one PDF under `static_root` and return the URL that serves it.
 
     Streamlit resolves symlinks before checking that a requested file lives
@@ -201,19 +221,19 @@ def materialize(src: Path, org: str, static_root: Path,
     inside a render loop and the correct degradation is the plain text the UI
     showed before this feature existed.
     """
-    dest = static_root / STATIC_SUBDIR / org / src.name
+    dest = static_root / subdir / org / src.name
     try:
         size = src.stat().st_size
         if size >= MAX_SERVABLE_BYTES:
             return None  # the static route would 404 it
         if dest.is_file() and dest.stat().st_size == size:
-            return static_url(org, src.name, page)  # already published
+            return static_url(org, src.name, page, subdir)  # already published
         dest.parent.mkdir(parents=True, exist_ok=True)
     except OSError:
         return None
     if not _publish(src, dest):
         return None
-    return static_url(org, src.name, page)
+    return static_url(org, src.name, page, subdir)
 
 
 def load_chunk_pages() -> dict:
@@ -424,6 +444,93 @@ def save_page_map(page_map: dict) -> Path:
     return PDF_PAGES_PATH
 
 
+def load_article_sources() -> dict:
+    """{fragment prefix: article record}, or {} when never built.
+
+    Mirrors load_chunk_pages(): the expensive work happens offline
+    (scripts/10_build_article_pdfs.py, which needs fpdf2 and the raw press
+    dumps) and the app only ever reads the small JSON result. Absent means
+    third-party citations render as plain text, exactly as before the articles
+    existed.
+    """
+    if not ARTICLE_SOURCES_PATH.exists():
+        return {}
+    try:
+        data = json.loads(ARTICLE_SOURCES_PATH.read_text(encoding="utf-8"))
+        return data.get("articles", {}) if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def article_key(chunk_id: str) -> tuple[str, int] | None:
+    """Split a third-party chunk id into (fragment prefix, chunk index).
+
+    `{org}|thirdparty|{stem}|{ai}|{ci}` — the article map is keyed by the first
+    four fields, because only the page varies with `ci`. Anything that is not a
+    well-formed third-party id returns None, so published ids and malformed
+    bookkeeping both fall through to the published path.
+    """
+    if not isinstance(chunk_id, str):
+        return None
+    parts = chunk_id.split("|")
+    if len(parts) != 5 or parts[1] != "thirdparty":
+        return None
+    try:
+        return "|".join(parts[:4]), int(parts[4])
+    except ValueError:
+        return None
+
+
+def resolve_article(chunk_id: str, sources: dict,
+                    root: Path | None) -> tuple[Path, int, dict] | None:
+    """Locate the generated PDF for a third-party chunk: (path, page, record).
+
+    The `file` field is read from a JSON artifact and then joined to a
+    directory whose contents get published into an unauthenticated static
+    route, so a path escaping `root` is refused outright rather than trusted.
+    A chunk with no page recorded opens at page 1 — the article is still right,
+    only the offset within it is unknown.
+    """
+    key = article_key(chunk_id)
+    if key is None or root is None:
+        return None
+    prefix, ci = key
+    record = sources.get(prefix)
+    if not isinstance(record, dict) or not record.get("file"):
+        return None
+    path = (root / record["file"]).resolve()
+    try:
+        path.relative_to(root.resolve())
+    except ValueError:
+        return None
+    if not path.is_file():
+        return None
+    page = record.get("pages", {}).get(str(ci), 1)
+    return path, int(page or 1), record
+
+
+def article_label(record: dict) -> str:
+    """The article's headline, trimmed to fit a UI line."""
+    headline = str(record.get("headline") or "").strip()
+    return headline[:97] + "…" if len(headline) > 98 else headline
+
+
+def article_sublabel(record: dict) -> str:
+    """`Publication · Date`, for the evidence list."""
+    return " · ".join(p for p in (str(record.get("publication") or "").strip(),
+                                  str(record.get("date") or "").strip()) if p)
+
+
+def md_escape(text: str) -> str:
+    """Escape markdown link-text metacharacters.
+
+    Required for article headlines and not for filenames: Nexis headlines
+    genuinely contain brackets ("OpenAI [sic] files"), which would otherwise
+    terminate the surrounding [label](url) early and leak raw url text.
+    """
+    return re.sub(r"([\\\[\]])", r"\\\1", text or "")
+
+
 def _cited_id(excerpt, retrieved_ids) -> str | None:
     """Dereference the model's 1-based excerpt number to a chunk id.
 
@@ -438,6 +545,19 @@ def _cited_id(excerpt, retrieved_ids) -> str | None:
     except (TypeError, ValueError):
         return None
     return retrieved_ids[idx] if 0 <= idx < len(retrieved_ids) else None
+
+
+def _document_key(chunk_id, chunk: dict) -> tuple:
+    """What SOURCE a chunk came from, for "is this the same document?" tests.
+
+    For a press record that is the article, not the RTF bundle — every chunk of
+    every article in O1.RTF shares a filename, so filename alone would call 500
+    unrelated articles one document.
+    """
+    key = article_key(chunk_id) if chunk_id else None
+    if key is not None:
+        return ("article", key[0])
+    return ("file", chunk.get("org", ""), chunk.get("filename", ""))
 
 
 def containing_ids(quote: str, retrieved_ids, evidence: dict) -> list[str]:
@@ -471,18 +591,25 @@ def excerpt_citation(excerpt, retrieved_ids, evidence: dict, url_for) -> str:
     always shown, and the linked form puts the whole bracketed token inside the
     anchor.
 
-    Falls back to that plain label whenever the chunk is missing from the index,
-    is third-party RTF evidence, or has no resolvable PDF. See the module
-    docstring on what the link does and does not attest.
+    Falls back to that plain label whenever the chunk is missing from the index
+    or has no resolvable document — a published PDF absent from disk, or a
+    third-party chunk with no generated article. See the module docstring on
+    what the link does and does not attest.
     """
     label = f"\\[excerpt {excerpt if excerpt is not None else '?'}\\]"
     cid = _cited_id(excerpt, retrieved_ids)
     if cid is None:
         return label
     chunk = evidence.get(cid)
-    if not chunk or chunk.get("source_type") != "published":
+    if not chunk:
         return label
-    url = url_for(chunk.get("filename", ""), chunk.get("org", ""), cid)
+    # No source-type test here on purpose: `url_for` already returns None for
+    # anything it cannot resolve — a published doc missing from disk, a
+    # third-party chunk with no generated article — and the plain label is the
+    # fallback either way. Duplicating that policy here is what made adding
+    # third-party support a two-place change the first time.
+    url = url_for(chunk.get("filename", ""), chunk.get("org", ""), cid,
+                  chunk.get("source_type", ""))
     return f"[{label}]({url})" if url else label
 
 
@@ -504,14 +631,28 @@ def misattribution_note(quote: str, excerpt, retrieved_ids, evidence: dict,
     holders = containing_ids(quote, retrieved_ids, evidence)
     if not holders or cited in holders:
         return ""
+    # Compare DOCUMENTS, not chunks. Consecutive chunks of one source overlap
+    # by design, and a press record routinely contributes several — so a span
+    # can sit in a different chunk of the very document we just linked. Saying
+    # "found in X" beside a link to X is noise, not a finding.
+    cited_doc = _document_key(cited, evidence.get(cited, {}))
     parts = []
     for cid in holders:
         chunk = evidence.get(cid, {})
-        name = chunk.get("filename", "")
-        if not name or chunk.get("source_type") != "published":
+        if _document_key(cid, chunk) == cited_doc:
             continue
-        url = url_for(name, chunk.get("org", ""), cid)
-        parts.append(f"[{name}]({url})" if url else name)
+        # Prefer the display label: for third-party evidence `filename` is the
+        # RTF bundle ("O1.RTF"), which names 500 articles and identifies none
+        # of them. `label` carries the headline when one is known.
+        name = chunk.get("label") or chunk.get("filename", "")
+        if not name:
+            continue
+        # Resolve with the filename, display with the label — they differ for
+        # third-party evidence and the resolver wants the former.
+        url = url_for(chunk.get("filename", ""), chunk.get("org", ""), cid,
+                      chunk.get("source_type", ""))
+        safe = md_escape(name)
+        parts.append(f"[{safe}]({url})" if url else safe)
     # Duplicates are real: consecutive chunks of one document overlap by design,
     # so a span near a boundary is genuinely in two chunks of the same file.
     seen = list(dict.fromkeys(parts))

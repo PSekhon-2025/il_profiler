@@ -21,7 +21,7 @@ def _pdf(root, *parts):
     return path
 
 
-def _url_for(filename, org, chunk_id):
+def _url_for(filename, org, chunk_id, source_type="published"):
     return f"/app/static/corpus/{org}/{filename}"
 
 
@@ -146,16 +146,29 @@ def test_citation_plain_when_chunk_missing_from_index():
     assert ps.excerpt_citation(1, ["c1"], {}, _url_for) == PLAIN
 
 
-def test_citation_plain_for_thirdparty_and_never_asks_for_a_url():
+def test_citation_links_a_thirdparty_chunk_and_routes_by_source_type():
+    # Third-party evidence used to be out of scope; it now resolves through the
+    # generated per-article PDFs. The source_type argument is what routes it,
+    # so assert it was passed — without that check this test would still pass
+    # if the routing argument were dropped.
     calls = []
 
-    def spy(*args):
-        calls.append(args)
-        return "/should/not/happen"
+    def spy(filename, org, chunk_id, source_type):
+        calls.append((filename, org, chunk_id, source_type))
+        return "/app/static/articles/OpenAI/O1__0025.pdf#page=2"
 
     evidence = _evidence(source_type="thirdparty", filename="O1.RTF")
-    assert ps.excerpt_citation(1, ["c1"], evidence, spy) == PLAIN
-    assert calls == []          # the scope boundary, encoded
+    got = ps.excerpt_citation(1, ["c1"], evidence, spy)
+
+    assert got == f"[{PLAIN}](/app/static/articles/OpenAI/O1__0025.pdf#page=2)"
+    assert calls == [("O1.RTF", "OpenAI", "c1", "thirdparty")]
+
+
+def test_citation_plain_when_the_article_pdf_was_never_generated():
+    # The fallback the whole module exists for: no generated article, no link,
+    # and the citation reads exactly as it did before this feature.
+    evidence = _evidence(source_type="thirdparty", filename="O1.RTF")
+    assert ps.excerpt_citation(1, ["c1"], evidence, lambda *a: None) == PLAIN
 
 
 @pytest.mark.parametrize("excerpt", [None, "?", 0, 2, -1])
@@ -210,6 +223,39 @@ def test_misattribution_note_points_at_the_real_document():
     assert note.startswith(" · found in [planning for agi and beyond.pdf](")
 
 
+def test_misattribution_note_silent_when_the_span_is_elsewhere_in_the_same_article():
+    # Chunks overlap by design and a press record contributes several, so a
+    # span often sits in a different CHUNK of the document we just linked.
+    # Saying "found in X" beside a link to X is noise, not a finding.
+    evidence = {
+        "OpenAI|thirdparty|O1|3|0": {
+            "text": "the opening of the article", "filename": "O1.RTF",
+            "org": "OpenAI", "source_type": "thirdparty", "label": "Singapore signs MOU"},
+        "OpenAI|thirdparty|O1|3|2": {
+            "text": "a later passage of the same article", "filename": "O1.RTF",
+            "org": "OpenAI", "source_type": "thirdparty", "label": "Singapore signs MOU"},
+    }
+    note = ps.misattribution_note(
+        "later passage of the same", 1,
+        ["OpenAI|thirdparty|O1|3|0", "OpenAI|thirdparty|O1|3|2"], evidence, _url_for)
+    assert note == ""
+
+
+def test_misattribution_note_still_fires_across_two_articles():
+    evidence = {
+        "OpenAI|thirdparty|O1|3|0": {
+            "text": "the cited article", "filename": "O1.RTF", "org": "OpenAI",
+            "source_type": "thirdparty", "label": "Singapore signs MOU"},
+        "OpenAI|thirdparty|O1|5|0": {
+            "text": "Florida became the first state to sue", "filename": "O1.RTF",
+            "org": "OpenAI", "source_type": "thirdparty", "label": "Florida sues OpenAI"},
+    }
+    note = ps.misattribution_note(
+        "first state to sue", 1,
+        ["OpenAI|thirdparty|O1|3|0", "OpenAI|thirdparty|O1|5|0"], evidence, _url_for)
+    assert "Florida sues OpenAI" in note
+
+
 def test_misattribution_note_deduplicates_overlapping_chunks():
     # Consecutive chunks of one document overlap by 150 chars, so a span near a
     # boundary really is in two chunks of the same file — name it once.
@@ -224,6 +270,128 @@ def test_misattribution_note_deduplicates_overlapping_chunks():
     }
     note = ps.misattribution_note(shared, 1, ["c1", "c2", "c3"], evidence, _url_for)
     assert note.count("b.pdf](") == 1
+
+
+# --- third-party article resolution -----------------------------------------
+
+def _sources(**over):
+    rec = {"file": "OpenAI/O1__0025.pdf", "headline": "Florida sues OpenAI",
+           "publication": "The Center Square", "date": "June 6, 2026",
+           "pages": {"0": 1, "1": 2}}
+    rec.update(over)
+    return {"OpenAI|thirdparty|O1|25": rec}
+
+
+def test_article_key_parses_a_thirdparty_chunk_id():
+    assert ps.article_key("OpenAI|thirdparty|O1|25|1") == ("OpenAI|thirdparty|O1|25", 1)
+
+
+@pytest.mark.parametrize("cid", [
+    "OpenAI|published|29|1",        # published ids must fall through
+    "OpenAI|thirdparty|O1|25",      # too few fields
+    "OpenAI|thirdparty|O1|25|x",    # non-integer chunk index
+    "", None, 17,
+])
+def test_article_key_rejects_anything_else(cid):
+    assert ps.article_key(cid) is None
+
+
+def test_resolve_article_returns_path_page_and_record(tmp_path):
+    pdf = tmp_path / "OpenAI" / "O1__0025.pdf"
+    pdf.parent.mkdir(parents=True)
+    pdf.write_bytes(b"%PDF-1.4")
+
+    path, page, rec = ps.resolve_article("OpenAI|thirdparty|O1|25|1",
+                                         _sources(), tmp_path)
+    assert path == pdf
+    assert page == 2
+    assert rec["headline"] == "Florida sues OpenAI"
+
+
+def test_resolve_article_defaults_to_page_one_for_an_unmapped_chunk(tmp_path):
+    pdf = tmp_path / "OpenAI" / "O1__0025.pdf"
+    pdf.parent.mkdir(parents=True)
+    pdf.write_bytes(b"%PDF-1.4")
+    _, page, _ = ps.resolve_article("OpenAI|thirdparty|O1|25|9", _sources(), tmp_path)
+    assert page == 1
+
+
+def test_resolve_article_none_when_the_pdf_was_not_generated(tmp_path):
+    assert ps.resolve_article("OpenAI|thirdparty|O1|25|0", _sources(), tmp_path) is None
+
+
+def test_resolve_article_none_for_an_unmapped_or_published_id(tmp_path):
+    assert ps.resolve_article("OpenAI|thirdparty|O9|1|0", _sources(), tmp_path) is None
+    assert ps.resolve_article("OpenAI|published|29|1", _sources(), tmp_path) is None
+    assert ps.resolve_article("OpenAI|thirdparty|O1|25|0", _sources(), None) is None
+
+
+def test_resolve_article_refuses_a_path_outside_the_article_root(tmp_path):
+    # The map is a JSON artifact whose paths get published into an
+    # unauthenticated static route, so traversal must be refused outright.
+    outside = tmp_path.parent / "secrets.pdf"
+    outside.write_bytes(b"%PDF-1.4")
+    sources = _sources(file=f"../{outside.name}")
+    assert ps.resolve_article("OpenAI|thirdparty|O1|25|0", sources, tmp_path) is None
+
+
+def test_load_article_sources_empty_when_absent_or_corrupt(tmp_path, monkeypatch):
+    monkeypatch.setattr(ps, "ARTICLE_SOURCES_PATH", tmp_path / "nope.json")
+    assert ps.load_article_sources() == {}
+    bad = tmp_path / "article_sources.json"
+    bad.write_text("{not json", encoding="utf-8")
+    monkeypatch.setattr(ps, "ARTICLE_SOURCES_PATH", bad)
+    assert ps.load_article_sources() == {}
+
+
+def test_article_label_and_sublabel():
+    rec = _sources()["OpenAI|thirdparty|O1|25"]
+    assert ps.article_label(rec) == "Florida sues OpenAI"
+    assert ps.article_sublabel(rec) == "The Center Square · June 6, 2026"
+    assert ps.article_label({"headline": "x" * 200}).endswith("…")
+    assert ps.article_sublabel({}) == ""
+
+
+def test_md_escape_survives_a_headline_with_brackets():
+    # Nexis headlines really do contain brackets; unescaped they terminate the
+    # surrounding [label](url) early and leak the raw url into the page.
+    assert ps.md_escape("OpenAI [sic] launches (again)") == \
+        "OpenAI \\[sic\\] launches (again)"
+
+
+# --- mis-citation labelling for press records --------------------------------
+
+def test_misattribution_note_names_the_article_not_the_rtf():
+    # Every press chunk's `filename` is the same 45 MB bundle, so the bundle
+    # name must never be what the reader is shown.
+    evidence = {
+        "OpenAI|thirdparty|O1|3|0": {
+            "text": "cited chunk, unrelated", "filename": "O1.RTF",
+            "org": "OpenAI", "source_type": "thirdparty", "label": "Cited piece"},
+        "OpenAI|thirdparty|O1|9|0": {
+            "text": "the span actually lives here", "filename": "O1.RTF",
+            "org": "OpenAI", "source_type": "thirdparty",
+            "label": "Anthropic wants to tame workplace AI"},
+    }
+
+    def url_for(filename, org, chunk_id, source_type="published"):
+        return f"/app/static/articles/{org}/O1__0009.pdf"
+
+    note = ps.misattribution_note(
+        "span actually lives", 1,
+        ["OpenAI|thirdparty|O1|3|0", "OpenAI|thirdparty|O1|9|0"], evidence, url_for)
+    assert "Anthropic wants to tame workplace AI" in note
+    assert "O1.RTF" not in note      # the bundle name must not reach the UI
+
+
+def test_misattribution_note_falls_back_to_filename_without_a_label():
+    evidence = _evidence()
+    evidence["c2"] = {"text": "a wholly different passage about governance",
+                      "filename": "planning for agi and beyond.pdf",
+                      "org": "OpenAI", "source_type": "published"}
+    note = ps.misattribution_note("wholly different passage", 1, ["c1", "c2"],
+                                  evidence, _url_for)
+    assert "planning for agi and beyond.pdf" in note
 
 
 # --- page alignment ---------------------------------------------------------

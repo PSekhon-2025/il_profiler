@@ -1092,11 +1092,51 @@ than 60% of pages could be confirmed by real text are both skipped entirely,
 and their links open at page 1. Coverage is 89% of chunks; on a 335-chunk
 audit, 99% of the anchors placed land on the correct page.
 
-**Scope and safety.** Published (PDF) evidence only — third-party RTF chunks
-bundle many articles per file, so a file-level link would point at the bundle,
-not the article. Every unresolvable case falls back to the exact plain text the
-UI showed before, so the feature is invisible without a dataset. It is off in
-the cloud by two independent mechanisms; see DEPLOY.md.
+**Safety.** Every unresolvable case falls back to the exact plain text the UI
+showed before, so the feature is invisible without a dataset. It is off in the
+cloud by two independent mechanisms; see DEPLOY.md.
+
+### 12.2 Press records (`il_rag/article_pdfs.py`, `scripts/10_build_article_pdfs.py`)
+
+Third-party chunks name only `O1.RTF` — a 45 MB Nexis export holding 500
+records — so a file-level link identifies nothing. Stage 10 splits each bundle
+into one PDF per record ahead of time, and the citation resolves through the map
+it leaves behind (`data/article_sources.json`).
+
+**Which record a chunk belongs to.** `ARTICLE_SPLIT_RE` lists seven markers but
+five can never fire: `Title:`/`Headline:`/`Byline:`/`Publication-Date:` are each
+followed by `:` then U+00A0, and the pattern ends in `\b`, which needs a word
+boundary that is not there (`Byline:` occurs 140 times in O1.RTF and causes zero
+splits). The accident is load-bearing — it means every record splits into
+exactly two fragments in strict alternation: an identity block (headline,
+publication, date) and a body. The body is what gets indexed, so **a chunk's
+identity lives in the preceding fragment**, which is why these citations looked
+anonymous. Articles are recovered by walking the fragment list, not by parity:
+13 identity fragments in A1 survive the 200-character filter and parity would
+mis-assign them. Two shapes are special — a Nexis job header at fragment 0
+(whose own chunks are a search-results index belonging to no article, and stay
+unlinked) and, in the Anthropic exports, no job header at all.
+
+**Identity parsing.** The date line must match *in full*: News Bites headlines
+begin with a date (`May 06, 2026: EVE Online and…`), and prefix-matching there
+mistakes the headline for the date and shifts every field. Measured, that
+distinction is worth 93.45% → 99.67%, and five date-format variants close the
+rest. Headline is the first line; publication is everything between it and the
+date, which handles two-line publisher blocks.
+
+**Rendering.** A PDF core font under cp1252, embedding no font at all. Measured
+across all six dumps, after a six-character normalization only 67 characters in
+15.8 million fall outside cp1252 (runes, three CJK ideographs, arrows) — and
+those are folded or replaced *and counted*. Embedding a subsetted Unicode TTF
+would add 12-25 KB to each of ~3,000 files; core fonts keep the whole corpus at
+21 MB. Page anchors are exact rather than estimated: pages are recorded as each
+visual line is drawn, and a chunk is located in *its own source fragment* (not
+in the rendered text, of which it is only a line-subsequence), so the match is
+exact. Measured 639/649 sampled chunks on the stated page, zero wrong.
+
+**What the link claims.** It opens *our rendering* of the press record the index
+was built from — not the publisher's page. The exports contain no URL field
+anywhere, so there is nothing else to point at, and the UI says so.
 
 ---
 
@@ -1154,12 +1194,13 @@ il_rag/
   embedding_agreement.py (check) non-LLM second judge
   quote_provenance.py    (check) graded quote provenance x veracity
   pdf_sources.py         chunk → source PDF, for the audit trail's links (§12.1)
+  article_pdfs.py        (local) RTF press dumps → one PDF per record (§12.2)
   bootstrap_ci.py        confidence intervals over the profiles
   json_utils.py, llm.py  shared JSON extraction; Together chat/embed wrappers
 scripts/
   01_ingest.py  02_run_profiles.py  03_run_metamorphic_eval.py
   04_run_embedding_agreement.py  05_run_bootstrap_ci.py
-  06_run_quote_provenance.py  09_build_pdf_pages.py
+  06_run_quote_provenance.py  09_build_pdf_pages.py  10_build_article_pdfs.py
 app.py                   Streamlit GUI (Run / Results / Audit / Hallucination / Compare)
 tests/                   offline unit tests
 Dockerfile, fly.toml, DEPLOY.md   deployment

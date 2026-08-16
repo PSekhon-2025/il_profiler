@@ -48,6 +48,14 @@ PDF_DATASET_ROOT = Path(_dataset_root) if _dataset_root else None
 # reference — created lazily, never at import, so the container never grows one.
 STATIC_DIR = PROJECT_ROOT / "static"
 
+# Where scripts/10_build_article_pdfs.py writes one PDF per third-party press
+# record, so RTF-backed citations can link to the article rather than to the
+# 45 MB bundle it came from. Derived, gitignored, and never shipped. Overridable
+# because ~3,000 files inside a cloud-synced repo is a real cost — the map keys
+# paths relative to this directory, so moving it does not invalidate anything.
+ARTICLE_PDF_DIR = Path(os.environ.get("IL_PROFILER_ARTICLE_DIR", "").strip()
+                       or DATA_DIR / "articles")
+
 # ---------------------------------------------------------------------------
 # API / models
 # ---------------------------------------------------------------------------

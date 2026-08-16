@@ -119,9 +119,23 @@ Two things to know:
   excerpt, so a ✅ next to a link does not mean the span is in *that* PDF. When
   the span is really in a different document, the row says so and links there
   too.
-- **Scope.** Published (PDF) evidence only. Third-party chunks come from RTF
-  press dumps where one file bundles many articles, so a file-level link would
-  point at the bundle rather than the article; those render unchanged.
+- **Third-party evidence needs one extra step.** Those chunks name only the RTF
+  bundle (`O1.RTF`), which holds 500 press records and identifies none of them.
+  Split it into one PDF per record first, and the citations link — and the
+  evidence list shows the headline, publication and date instead of the
+  filename:
+
+  ```bash
+  .venv/Scripts/python scripts/10_build_article_pdfs.py --dry-run
+  .venv/Scripts/python scripts/10_build_article_pdfs.py
+  ```
+
+  This writes ~3,000 PDFs (~21 MB) to `data/articles/` plus the map
+  `data/article_sources.json`. Set `IL_PROFILER_ARTICLE_DIR` to put them
+  somewhere other than inside the repo. A press link opens **our rendering of
+  the record the index was built from**, not the publisher's page — the Nexis
+  exports carry no URL to link to. Run with `--check-ids` after a re-ingest to
+  confirm the map still matches the ids in the index.
 
 Unset the variable — or run with `IL_PROFILER_CLOUD=1` — and every citation
 falls back to the plain text above. The cloud deployment ships no corpus, so
@@ -541,6 +555,8 @@ il_rag/
   quote_provenance.py opt-in: graded quote provenance x veracity (2x2 verdict)
   pdf_sources.py      opt-in: resolve a chunk back to its source PDF, so the
                       audit trail's [excerpt N] citations become links
+  article_pdfs.py     LOCAL: split the RTF press dumps into one PDF per record
+                      (what makes third-party citations linkable)
   bootstrap_ci.py     confidence intervals over the profiles (seeded, no API)
   profile_harness.py  orchestration, aggregation, outputs, report
   runs.py             run snapshots: archive/list/compare, legacy migration
@@ -552,6 +568,8 @@ scripts/
   05_run_bootstrap_ci.py      stage 5 (optional): bootstrap error bars
   06_run_quote_provenance.py  stage 6 (optional): graded quote provenance
   09_build_pdf_pages.py       stage 9 (optional, local): chunk -> PDF page map
+  10_build_article_pdfs.py    stage 10 (optional, local): RTF dumps -> one PDF
+                              per press record, + the chunk -> article map
 tests/                offline unit tests (pytest; all API calls stubbed)
 app.py                Streamlit GUI (Run / Results / Audit / Hallucination / Compare)
 Launch IL Profiler.command   double-clickable launcher (macOS)

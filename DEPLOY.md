@@ -135,6 +135,8 @@ Two independent things prevent that, and neither is redundant:
    in `static/` would still be served, which is why (2) matters.
 2. `static/` is in `.dockerignore`, so locally-published PDFs are never baked
    into the image. The cloud filesystem has no `static/` directory at all.
+   `data/` is dockerignored too, which covers the generated press-record PDFs
+   and their map — the cloud has nothing to publish even before (1) fires.
 
 Also leave `IL_PROFILER_DATASET_ROOT` unset in the cloud (it is not a Fly
 secret, and there is no dataset there to point at). If you ever add a corpus to

@@ -8,4 +8,12 @@
 #
 #   .venv/Scripts/python -m pip install -r requirements-pdf.txt
 #   .venv/Scripts/python scripts/09_build_pdf_pages.py
+#   .venv/Scripts/python scripts/10_build_article_pdfs.py
 pypdf>=5.0
+
+# Renders one PDF per third-party press record (scripts/10_build_article_pdfs.py).
+# Pure Python, so there is no wheel to go missing on a new interpreter. We use
+# its CORE fonts under cp1252 and embed no font at all: measured over the whole
+# press corpus, only 67 characters in 15.8 million fall outside cp1252, while
+# embedding a subsetted Unicode TTF would add 12-25 KB to each of ~3,000 files.
+fpdf2>=2.8
