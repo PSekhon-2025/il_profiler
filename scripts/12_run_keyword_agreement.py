@@ -1,9 +1,9 @@
-"""Stage 11 (optional): keyword agreement — the lexical third judge.
+"""Stage 12 (optional): keyword agreement — the lexical third judge.
 
 Usage:
-    python scripts/11_run_keyword_agreement.py                 # CURRENT run
-    python scripts/11_run_keyword_agreement.py --run 2026-07-13_210346
-    python scripts/11_run_keyword_agreement.py --max-df 1      # stricter keywords
+    python scripts/12_run_keyword_agreement.py                 # CURRENT run
+    python scripts/12_run_keyword_agreement.py --run 2026-07-13_210346
+    python scripts/12_run_keyword_agreement.py --max-df 1      # stricter keywords
 
 Reduces each question's seven reference answers to distinctive keyword sets,
 reduces every committed RAG answer to its content tokens, and grades by set

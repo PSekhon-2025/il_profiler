@@ -3617,7 +3617,7 @@ with tab_halluc:
                      help="Pure computation over the saved run — no API calls. "
                           "Recomputing overwrites the previous result.",
                      key="kw_run_btn"):
-            args = [PYTHON, "scripts/11_run_keyword_agreement.py",
+            args = [PYTHON, "scripts/12_run_keyword_agreement.py",
                     "--run", hal_run]
             with st.status("Computing keyword agreement…",
                            expanded=True) as status:
