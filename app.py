@@ -772,6 +772,32 @@ def run_selectbox(label: str, key: str, default_run_id: str | None = None) -> st
                         format_func=lambda r: names.get(r, r), key=key)
 
 
+def symbol_glossary(pairs: list[tuple[str, str]], note: str | None = None) -> None:
+    """Render the 'what the symbols mean' table under a formula block.
+
+    Every explainer that states a formula defines its notation this way, so a
+    reader never has to infer what a subscript stands for. Centralised so the
+    presentation stays identical across all of them.
+    """
+    st.markdown("**What the symbols mean**")
+    st.markdown("\n".join(
+        ["| symbol | meaning |", "|---|---|"]
+        + [f"| {sym} | {desc} |" for sym, desc in pairs]))
+    if note:
+        st.caption(note)
+
+
+# Notation shared by several explainers, defined once.
+_SET_NOTATION = [
+    (r"$\lvert\,S\,\rvert$", "the **size** of set $S$ — how many items it holds"),
+    (r"$\cap$", "**intersection** — the items two sets have in common"),
+    (r"$\in$", "**is a member of**"),
+    (r"$\sum$", "**sum over** whatever the subscript ranges across"),
+    (r"$\arg\max$", "returns **which** item scores highest (not the score "
+                    "itself — $\\max$ would give the value)"),
+]
+
+
 def word_diff_md(old: str, new: str) -> str:
     """Inline word-level diff as markdown: ~~removed~~ then **added**."""
     import difflib
@@ -987,6 +1013,32 @@ with tab_run:
                 r"\Bigl[\textstyle\sum_m \tilde{w}_m \le 0\Bigr]"
                 r"\;\Longrightarrow\; w=\mathbf{0}"
             )
+            symbol_glossary([
+                (r"$L$", f"the **chunk size** in characters "
+                         f"(`CHUNK_SIZE` = {CHUNK_SIZE})"),
+                (r"$O$", f"the **overlap** between consecutive chunks "
+                         f"(`CHUNK_OVERLAP` = {CHUNK_OVERLAP})"),
+                (r"$L-O$", "the **stride** — how far the window advances, so "
+                           "consecutive chunks share $O$ characters"),
+                (r"$k$", f"the number of **chunks retrieved per question** "
+                         f"(`TOP_K` = {TOP_K})"),
+                (r"$q,\;c$", "**a question** and **a chunk**"),
+                (r"$v_q,\;v_c$", "their **embeddings** (1024 numbers each)"),
+                (r"$d_{\cos}$", "**cosine distance**, which Chroma returns; "
+                                "similarity is $1-d_{\\cos}$"),
+                (r"$\hat{w}_k$", "the **raw weight** the matcher returned for "
+                                 "logic $k$ — untrusted until checked"),
+                (r"$\tilde{w}_k$", "the weight after **clamping** negatives to "
+                                   "zero (tilde = *partly processed*)"),
+                (r"$w_k$", "the **final weight** after renormalizing so the "
+                           "seven sum to 1"),
+                (r"$\mathbf{0}$", "the **all-zero vector** — what an "
+                                  "abstention stores, so 'no evidence' can "
+                                  "never leak weight into a logic"),
+                (r"$\vee$", "**logical OR**"),
+                (r"$\Longrightarrow$", "**implies** / therefore"),
+                *_SET_NOTATION,
+            ])
             st.markdown(
                 "**Design decisions**\n"
                 "- *Why two separate LLM calls rather than one?* Asking a "
@@ -1141,6 +1193,29 @@ with tab_results:
             )
             st.latex(r"P^{(c)}_k \;=\; \frac{100}{|A_c|}\sum_{i \in A_c} "
                      r"w^{(i)}_k, \qquad A_c=\{i \in A: \mathrm{cat}(i)=c\}")
+            symbol_glossary([
+                (r"$i$", "**a question** — one row of the audit trail "
+                         "(one lab × source × question)"),
+                (r"$k$", "**a logic** — one of the seven"),
+                (r"$w^{(i)}_k$", "the **weight** the matcher gave logic $k$ on "
+                                 "question $i$; the superscript in brackets is "
+                                 "a label (*which question*), not a power"),
+                (r"$A$", "the set of **answered** questions for this "
+                         "(lab, source) pair"),
+                (r"$B$", "the set of **abstained** questions — counted, but "
+                         "excluded from every denominator"),
+                (r"$\lvert A\rvert$", "**how many** questions were answered — "
+                                      "the denominator, and the $n$ that drives "
+                                      "confidence-interval width"),
+                (r"$P_k$", "the **profile percentage** for logic $k$ — what the "
+                           "bar chart plots"),
+                (r"$A_c$", "the answered questions **belonging to category "
+                           "$c$** — used for the per-category breakdown"),
+                (r"$P^{(c)}_k$", "the same percentage computed **within one "
+                                 "category** (parenthesised superscript = a "
+                                 "label, not a power)"),
+                *_SET_NOTATION,
+            ])
             st.markdown(
                 "**Design decisions**\n"
                 "- *Why exclude abstentions instead of scoring them as zeros?* "
@@ -1215,6 +1290,38 @@ with tab_results:
                     r"\mathrm{CI}_k=\Bigl[\,Q_{\alpha/2}\bigl(\hat{P}^{*}_k\bigr),"
                     r"\;Q_{1-\alpha/2}\bigl(\hat{P}^{*}_k\bigr)\,\Bigr]"
                 )
+                symbol_glossary([
+                    (r"$n$", "the number of **answered questions** for this "
+                             "(lab, source) pair — the sample being resampled"),
+                    (r"$W$", "the $n \\times 7$ **matrix** of weight vectors: "
+                             "one row per answered question, one column per "
+                             "logic"),
+                    (r"$W_{ik}$", "the weight in **row $i$, column $k$** — "
+                                  "question $i$'s weight on logic $k$"),
+                    (r"$\hat{P}_k$", "the **point estimate** — the percentage "
+                                     "actually plotted (hat = *estimated from "
+                                     "data*)"),
+                    (r"$B$", "the number of **bootstrap resamples** "
+                             "(`iterations`, default 2000)"),
+                    (r"$b$", "**which** resample, from 1 to $B$"),
+                    (r"$I^{(b)}_j$", "the $j$-th **randomly drawn row index** "
+                                     "in resample $b$ — drawn *with "
+                                     "replacement*, so rows can repeat"),
+                    (r"$\hat{P}^{*(b)}_k$", "the percentage recomputed from "
+                                            "resample $b$; the asterisk marks "
+                                            "it as a **bootstrap replicate**, "
+                                            "not a real observation"),
+                    (r"$\alpha$", "**1 − confidence level** (0.05 for a 95% "
+                                  "interval)"),
+                    (r"$Q_p$", "the **$p$-th quantile** — the value below which "
+                               "that fraction of the resamples fall"),
+                    (r"$\mathrm{CI}_k$", "the resulting **interval** for logic "
+                                         "$k$: the whisker on the chart"),
+                    (r"$\sim \mathrm{Uniform}$", "**drawn at random**, every "
+                                                 "row equally likely"),
+                    (r"$\text{iid}$", "each draw is **independent** and from "
+                                      "the same distribution"),
+                ])
                 st.markdown(
                     "The reported `std` is the standard deviation of those "
                     "same $B$ replicates (the bootstrap standard error). With "
@@ -1311,6 +1418,25 @@ with tab_results:
                 st.latex(r"\bar{P}=\frac{1}{R}\sum_{r=1}^{R}P_r, \qquad "
                          r"s=\sqrt{\frac{\sum_r (P_r-\bar{P})^2}{R-1}}, \qquad "
                          r"\mathrm{SEM}=\frac{s}{\sqrt{R}}")
+                symbol_glossary([
+                    (r"$R$", "the **number of replicate runs** (the slider "
+                             "below; default 3)"),
+                    (r"$r$", "**which** replicate, from 1 to $R$"),
+                    (r"$P_r$", "the percentage this logic scored **in run $r$**"),
+                    (r"$\bar{P}$", "the **mean** across replicates — the bar "
+                                   "over a letter means *average of*"),
+                    (r"$s$", "the **standard deviation** between runs: the "
+                             "typical distance of a single run from the mean, "
+                             "i.e. the size of the decoding noise"),
+                    (r"$R-1$", "**degrees of freedom** — dividing by $R-1$ "
+                               "rather than $R$ corrects the bias of estimating "
+                               "spread around a mean you also estimated; at "
+                               "$R=2$ this is 1, which is why the SD is "
+                               "withheld"),
+                    (r"$\mathrm{SEM}$", "the **standard error of the mean** — "
+                                        "how precise the *average* is, which "
+                                        "shrinks as $1/\\sqrt{R}$"),
+                ])
                 st.markdown(
                     "The mean's standard error shrinks as $1/\\sqrt{R}$, so "
                     "3–4 replicates roughly halve the jitter of a single run. "
@@ -1599,6 +1725,15 @@ with tab_audit:
             st.latex(r"\mathrm{label}=\begin{cases}"
                      r"\texttt{ABSTAINED} & \text{if the row abstained}\\[2pt]"
                      r"\arg\max_k w_k & \text{otherwise}\end{cases}")
+            symbol_glossary([
+                (r"$k$", "**a logic** — one of the seven"),
+                (r"$w_k$", "the **weight** this row's answer earned on logic "
+                           "$k$; the seven sum to 1"),
+                (r"$\arg\max_k w_k$", "**which** logic carries the largest "
+                                      "weight — the row's dominant label"),
+                (r"$\mathrm{label}$", "what the row header displays"),
+            ], note="Ties break by the fixed logic order, so the label is "
+                    "deterministic for a given weight vector.")
             st.markdown(
                 "**Fields**\n"
                 "- **Weights** — the matcher's distribution over the seven "
@@ -1967,6 +2102,28 @@ with tab_halluc:
                 r"\texttt{committed} & \text{otherwise}"
                 r"\end{cases}"
             )
+            symbol_glossary([
+                (r"$q$", "**the question** being scored"),
+                (r"$c$", "**a retrieved chunk** — one excerpt of evidence"),
+                (r"$R(q)$", "the **set of chunks retrieved** for question $q$ "
+                            "(normally $k=5$ of them)"),
+                (r"$T(x)$", "the **content tokens** of text $x$: lowercased "
+                            "words, minus stopwords and ≤2-character tokens"),
+                (r"$\mathrm{overlap}(q,c)$", "the share of the question's "
+                                             "content words that appear in "
+                                             "chunk $c$, in $[0,1]$"),
+                (r"$g(q)$", "the **grounding score** — the *best* overlap "
+                            "across all retrieved chunks"),
+                (r"$\tau$", f"the **threshold** below which retrieval counts as "
+                            f"having missed (`GROUNDING_LOW_THRESHOLD`, "
+                            f"currently **{GROUNDING_LOW_THRESHOLD}**)"),
+                (r"$\max$", "the **largest** value over whatever follows — here "
+                            "over the retrieved chunks"),
+                (r"$\cos_c$", "the retriever's **cosine score** for chunk $c$, "
+                              "kept as a diagnostic but never thresholded"),
+                (r"$\mathrm{clip}(x,0,1)$", "force $x$ into the range $[0,1]$"),
+                *_SET_NOTATION,
+            ])
             st.markdown(
                 "`retrieval_missed` deliberately takes precedence over "
                 "`abstained`: when retrieval never surfaced relevant text, "
@@ -2089,6 +2246,25 @@ with tab_halluc:
                 r"\mathrm{verified}(q)=\big(\mathrm{norm}(q)\neq\text{``''}\big)"
                 r"\ \wedge\ \exists\,c\in R:\ \mathrm{norm}(q)\sqsubseteq\mathrm{norm}(c)"
             )
+            symbol_glossary([
+                (r"$q$", "**a quoted span** the model claims to have copied"),
+                (r"$Q$", "the **set of all quotes** returned for one answer"),
+                (r"$c$", "**a retrieved chunk** — one piece of source evidence"),
+                (r"$R$", "the **set of chunks** this answer was written from"),
+                (r"$\mathrm{norm}(x)$", "**normalized** text: lowercased with "
+                                        "runs of whitespace collapsed, so "
+                                        "formatting differences don't cause "
+                                        "false failures"),
+                (r"$\sqsubseteq$", "**is a substring of** — appears verbatim "
+                                   "inside"),
+                (r"$\wedge$", "**logical AND** (both must hold)"),
+                (r"$\exists\,c\in R$", "**there exists** at least one chunk $c$ "
+                                       "in $R$ for which this is true"),
+                (r"$\forall\,q\in Q$", "**for every** quote $q$ in $Q$"),
+                (r"$\lvert Q\rvert>0$", "at least one quote was returned — the "
+                                        "guard that stops an **empty** list "
+                                        "counting as 'all verified'"),
+            ])
             st.markdown(
                 "The cited excerpt *number* is displayed but deliberately "
                 "**not** used for matching: the auditable claim is \"this "
@@ -2252,6 +2428,38 @@ with tab_halluc:
                 "0.849, a wholly unrelated claim 0.807 — 0.04 apart), so a "
                 "cosine gate is far less discriminative than it looks."
             )
+            symbol_glossary([
+                (r"$s$", "**a quoted span** being graded"),
+                (r"$c$", "**a retrieved chunk** it might have come from"),
+                (r"$w$", "a **sliding window** of $c$ the span is compared "
+                         "against when hunting for a drifted copy"),
+                (r"$\mathrm{norm}(x)$", "**normalized** text (lowercased, "
+                                        "whitespace collapsed)"),
+                (r"$\mathrm{strip}(x)$", "normalized text with **punctuation "
+                                         "also removed** — catches curly "
+                                         "quotes and stray dashes"),
+                (r"$\sqsubseteq$", "**is a substring of**"),
+                (r"$\mathrm{ratio}(s,w)$", "**character similarity** between "
+                                           "span and window, in $[0,1]$ "
+                                           "(difflib)"),
+                (r"$\mathrm{overlap}(s,c)$", "**token overlap** — the share of "
+                                             "the span's content words present "
+                                             "in the chunk"),
+                (r"$\cos(s,c)$", "**cosine similarity** of their embeddings"),
+                (r"$\tau_{\text{near}}$", f"the **near-verbatim** bar "
+                                          f"({QUOTE_NEAR_VERBATIM_THRESHOLD}) "
+                                          "— above it, a drifted copy"),
+                (r"$\tau_{\text{lex}}$", f"the **paraphrase** lexical bar "
+                                         f"({QUOTE_PARAPHRASE_LEX_THRESHOLD})"),
+                (r"$\tau_{\text{cos}}$", f"the paraphrase **cosine** bar "
+                                         f"({QUOTE_PARAPHRASE_COS_THRESHOLD}), "
+                                         "set high so it fires only on "
+                                         "near-identity"),
+                (r"$\vee$", "**logical OR** — any one route clears the tier"),
+                *_SET_NOTATION,
+            ], note="Tiers are tried cheapest-first and the first to clear its "
+                    "bar wins, so a span is never graded by a more expensive "
+                    "test than it needs.")
             st.markdown(
                 "**Step 4 — veracity (LLM, flagged spans only).** Provenance "
                 "asks *does this text exist in the sources?*; veracity asks "
@@ -2624,6 +2832,35 @@ with tab_halluc:
                 r"\mathrm{label}(\mathrm{dis}_i)=\mathrm{label}_0(i)\neq"
                 r"\texttt{abstain}\,\}\right|}{n_{\mathrm{dis}}}"
             )
+            symbol_glossary([
+                (r"$i$", "**an item** — one answered question being re-tested"),
+                (r"$\mathrm{label}_0(i)$", "the item's **original** label from "
+                                           "the saved run (subscript 0 = "
+                                           "*baseline*)"),
+                (r"$\mathrm{label}(v)$", "the label a **variant** $v$ produced "
+                                         "when pushed back through the same "
+                                         "answer→match path"),
+                (r"$P_{\mathrm{ok}}$", "the item's **usable paraphrase "
+                                       "variants** — those that ran and passed "
+                                       "the fidelity gates"),
+                (r"$\mathrm{abl}_i,\ \mathrm{dis}_i$", "item $i$'s **ablation** "
+                                                       "and **distractor** "
+                                                       "variants"),
+                (r"$n_{\mathrm{abl}},\ n_{\mathrm{dis}}$", "**how many** of "
+                                                           "each ran usably — "
+                                                           "the denominators"),
+                (r"$\theta$", f"the **stability threshold** "
+                              f"(`METAMORPHIC_STABILITY_THRESHOLD` = "
+                              f"{METAMORPHIC_STABILITY_THRESHOLD}); below it an "
+                              "item is flagged unstable"),
+                (r"$\neq\texttt{abstain}$", "the variant **committed** to a "
+                                            "logic rather than abstaining — "
+                                            "which is what makes survival "
+                                            "suspicious on these two probes"),
+                *_SET_NOTATION,
+            ], note="Ablation and distractor are DIRECTIONAL probes: a label "
+                    "that survives them is the bad outcome, the opposite of "
+                    "the paraphrase probe.")
             st.markdown(
                 "**Design decisions**\n"
                 "- *Failed and rejected variants are excluded from every "
@@ -3039,6 +3276,30 @@ with tab_halluc:
                 r"\text{chance share}=\tfrac{1}{7}\approx 0.143, \qquad "
                 r"\text{uniform overlap}=\sum_{k}\min\bigl(\tfrac{1}{7},\,w_k\bigr)"
             )
+            symbol_glossary([
+                (r"$k$", "**a logic** — one of the seven"),
+                (r"$j,\;m$", "*other* logics — used when a formula holds $k$ "
+                             "fixed and ranges over all seven"),
+                (r"$v_{\text{answer}}$", "the answer's **embedding**: 1024 "
+                                         "numbers encoding its meaning"),
+                (r"$v_{\mathrm{ref}_k}$", "the **embedding of logic $k$'s "
+                                          "reference answer** for this question"),
+                (r"$s_k$", "**cosine similarity** between the answer and "
+                           "reference $k$, in $[-1,1]$ (in practice ≈0.78–0.87)"),
+                (r"$s_{(1)},\,s_{(2)}$", "the **highest and second-highest** "
+                                         "similarities, once sorted"),
+                (r"$\mathrm{margin}$", "$s_{(1)}-s_{(2)}$ — how **decisive** "
+                                       "the winning pick was; near 0 = a tie"),
+                (r"$\sigma_k$", "the **closeness share** after min-shifting, so "
+                                "the seven sum to 1"),
+                (r"$\hat{k}$", "the **nearest** logic (the hat means *chosen*)"),
+                (r"$w_k$", "the **LLM matcher's weight** for logic $k$"),
+                (r"$\lVert v \rVert$", "the **length (norm)** of vector $v$ — "
+                                       "dividing by it is what makes cosine "
+                                       "measure direction, not magnitude"),
+                (r"$\cdot$", "the **dot product** of two vectors"),
+                *_SET_NOTATION,
+            ])
             st.markdown(
                 "All five quantities are averaged for the overall summary and "
                 "for each category and lab×source slice.\n\n"
@@ -3300,6 +3561,35 @@ with tab_halluc:
                 "`no_overlap` and **excluded from the rates** rather than "
                 "forced to a uniform guess."
             )
+            symbol_glossary([
+                (r"$\ell$", "**a logic** — one of the seven (State, Profession, "
+                            "Market, Corporation, Family, Religion, Community)"),
+                (r"$m$", "*another* logic — a second letter exists only so a "
+                         "formula can hold $\\ell$ fixed while counting across "
+                         "all the others"),
+                (r"$t$", "**a token** — one content word, e.g. `investors`"),
+                (r"$T(x)$", "the **content tokens** of text $x$: lowercased "
+                            "words, minus stopwords and ≤2-character tokens"),
+                (r"$\mathrm{ref}_\ell$", "the **reference answer** written for "
+                                         "logic $\\ell$ for this question"),
+                (r"$\mathrm{df}(t)$", "**document frequency** — how many of "
+                                      "this question's 7 references contain "
+                                      "token $t$"),
+                (r"$\tau$", f"the **df cutoff** (`--max-df`, default "
+                            f"**{ka_mod.KEYWORD_MAX_LOGIC_DF}**): keep a token "
+                            "only if $\\mathrm{df}(t)\\le\\tau$"),
+                (r"$K_\ell$", "logic $\\ell$'s resulting **keyword set**"),
+                (r"$r_\ell$", "**keyword recall** — the share of $K_\\ell$ the "
+                              "answer contains, in $[0,1]$"),
+                (r"$\sigma_\ell$", "the **normalized share** — $r_\\ell$ as a "
+                                   "fraction of all seven, so they sum to 1"),
+                (r"$\hat{\ell}$", "the **predicted logic** (the hat means "
+                                  "*estimated*, vs plain $\\ell$ = any logic)"),
+                (r"$w_\ell$", "the **LLM matcher's weight** for logic $\\ell$ "
+                              "— what this judge is compared against"),
+                *_SET_NOTATION,
+            ], note="In the set-builder braces, the vertical bar reads “such "
+                    "that”, not division.")
             st.markdown(
                 "**Design decisions**\n"
                 "- *Keywords are derived, not hand-written (v1).* They come "
@@ -3502,6 +3792,35 @@ with tab_topics:
         )
         st.latex(r"P^{\text{topic }k}_{\ell}=\frac{100\,M_{k,\ell}}"
                  r"{\sum_{m} M_{k,m}}")
+        symbol_glossary([
+            (r"$t$", "**a term** (word) appearing in a topic"),
+            (r"$k$", "**a topic** — one cluster of chunks"),
+            (r"$f_{t,k}$", "how often term $t$ occurs **in topic $k$** (all its "
+                           "chunks treated as one document)"),
+            (r"$A$", "the **average number of words per topic** — the "
+                     "yardstick that stops a large topic winning on volume"),
+            (r"$\ell$", "**a logic** — one of the seven"),
+            (r"$m$", "*another* logic, used for the summing denominator"),
+            (r"$i$", "**a question** (an answered audit row)"),
+            (r"$A$ (in the cross-tab)", "the set of **answered** questions — "
+                                        "note this $A$ is unrelated to the $A$ "
+                                        "in c-TF-IDF above"),
+            (r"$R(i)$", "the **chunks retrieved** for question $i$"),
+            (r"$\lvert R(i)\rvert$", "**how many** — the $k$ in the $1/k$ "
+                                     "credit split"),
+            (r"$w^{(i)}_{\ell}$", "question $i$'s **matcher weight** on logic "
+                                  "$\\ell$"),
+            (r"$\mathbb{1}[\cdot]$", "the **indicator**: 1 when the condition "
+                                     "inside holds, 0 otherwise — here it "
+                                     "selects only chunks belonging to topic $k$"),
+            (r"$M_{k,\ell}$", "the **accumulated mass**: how much logic-$\\ell$ "
+                              "credit topic $k$ collected across the whole run"),
+            (r"$P^{\text{topic }k}_{\ell}$", "that mass as a **percentage** of "
+                                             "topic $k$'s row"),
+            *_SET_NOTATION,
+        ], note="Two different quantities are both conventionally written $A$; "
+                "the c-TF-IDF one is a word count, the cross-tab one is a set "
+                "of questions.")
         st.markdown(
             "**Coverage audit.** Topics that appear in **no** row's retrieved "
             "evidence are corpus regions the questionnaire never reaches — a "
@@ -3774,6 +4093,19 @@ with tab_compare:
                         "minus run A:"
                     )
                     st.latex(r"\Delta_k = P^{B}_k - P^{A}_k")
+                    symbol_glossary([
+                        (r"$k$", "**a logic** — one of the seven"),
+                        (r"$P^{A}_k$", "logic $k$'s percentage in run **A** "
+                                       "(the baseline); the superscript is a "
+                                       "label, not a power"),
+                        (r"$P^{B}_k$", "the same logic's percentage in run **B**"),
+                        (r"$\Delta_k$", "the **change** in percentage points — "
+                                        "delta is the standard symbol for a "
+                                        "difference"),
+                        (r"$\lvert\Delta_k\rvert$", "its **magnitude**, "
+                                                    "ignoring direction — what "
+                                                    "the bars are sorted by"),
+                    ])
                     st.markdown(
                         "Values are **percentage points**, not percentages of "
                         "a percentage: a bar reading $+8$ means that logic's "
