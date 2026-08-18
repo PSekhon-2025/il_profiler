@@ -116,31 +116,77 @@ no article text — so it carries none of the corpus's copyright exposure.
 Re-fit and re-ship whenever the index is rebuilt, since topics are keyed to
 chunk ids.
 
-## Source PDF links — deliberately local-only
+## Shipping the source documents (so `[excerpt N]` links work)
 
-The Audit tab can turn each `[excerpt N]` citation into a link to the PDF it
-names (see the README). That feature is **off in the cloud, and must stay off.**
+The Audit tab turns each `[excerpt N]` citation into a link to the document it
+names. That only works where the documents actually exist, and the image ships
+neither the corpus nor the generated press-record PDFs (`data/` and `static/`
+are both `.dockerignore`d). So they travel to the volume separately, like the
+prebuilt index and the topic layer.
 
-Streamlit serves `<app dir>/static` at `/app/static/...` over plain HTTP with
-`Access-Control-Allow-Origin: *`, and that route is handled *below* the Python
-app — the password gate in `app.py` does not cover it. Anything in `static/` is
-readable by anyone who guesses the URL. Publishing the corpus there would
-publish copyrighted PDFs.
+**Read this first.** Streamlit serves `<app dir>/static` at `/app/static/...`
+with `Access-Control-Allow-Origin: *`, and that route is handled *below* the
+Python app, so **`APP_PASSWORD` does not cover it**. Once the corpus is on the
+machine, any PDF a viewer has caused to be published is fetchable by anyone who
+reaches the hostname and guesses the path. What does cover it is **Cloudflare
+Access** (§5), which gates the whole hostname at the edge, static route
+included. If this instance is not behind Access, treat the corpus as reachable
+by anyone who knows the URL.
 
-Two independent things prevent that, and neither is redundant:
+`IL_PROFILER_DISABLE_SOURCE_LINKS=1` turns the links off again without a code
+change.
 
-1. `IL_PROFILER_CLOUD=1` (set in `fly.toml`) makes `pdf_url()` in `app.py`
-   return before it touches the filesystem, so a cloud instance never publishes
-   a PDF. Note this stops *publishing*, not *serving* — a file already sitting
-   in `static/` would still be served, which is why (2) matters.
-2. `static/` is in `.dockerignore`, so locally-published PDFs are never baked
-   into the image. The cloud filesystem has no `static/` directory at all.
-   `data/` is dockerignored too, which covers the generated press-record PDFs
-   and their map — the cloud has nothing to publish even before (1) fires.
+### 1. Build the archive locally
 
-Also leave `IL_PROFILER_DATASET_ROOT` unset in the cloud (it is not a Fly
-secret, and there is no dataset there to point at). If you ever add a corpus to
-the volume, do not point this at it.
+```bash
+# needs IL_PROFILER_DATASET_ROOT set and, for press links, stage 10 already run
+.venv/Scripts/python scripts/11_bundle_cloud_sources.py --dry-run   # check the size
+.venv/Scripts/python scripts/11_bundle_cloud_sources.py
+```
+
+Roughly **500 MB**: 98 corpus PDFs (489 MB — one of them, `oversight of ai.pdf`,
+is 161 MB on its own), 3,000 press-record PDFs (14 MB), and the two maps (1 MB).
+Only PDFs a chunk can actually cite are included.
+
+### 2. Make room on the volume
+
+The index is ~0.4 GB, so a 1 GB volume will not hold both. Check and extend:
+
+```bash
+fly volumes list
+fly volumes extend <volume-id> --size 3
+```
+
+### 3. Ship and unpack
+
+```bash
+fly sftp put dist/cloud_sources.tar /app/data/cloud_sources.tar
+fly ssh console -C "sh -c 'cd /app/data && tar xf cloud_sources.tar && rm cloud_sources.tar'"
+fly apps restart il-profiler
+```
+
+`fly.toml` already sets `IL_PROFILER_DATASET_ROOT=/app/data/corpus`; the article
+PDFs and both maps need no setting, because their defaults
+(`/app/data/articles`, `/app/data/pdf_pages.json`,
+`/app/data/article_sources.json`) are exactly where the archive unpacks them.
+
+### 4. Verify
+
+```bash
+fly ssh console -C "ls /app/data/corpus/OpenAI/Essays and Statements/"
+```
+
+Then open the Audit tab on a run with quotes: the excerpt numbers should be
+links. Cited PDFs are copied into `/app/static/` lazily, on first reference —
+that copy lives on the machine's ephemeral rootfs, not the volume, so it is
+rebuilt after each deploy and costs no volume space.
+
+**The ids must match.** The links resolve published documents by the filename in
+the chunk metadata, and press records by chunk id, so the maps are only correct
+if the deployed index was built from the same `pdf_corpus.txt` and the same
+RTFs. If you rebuild the index from a differently-ordered corpus, re-run stages
+10 and 11 and re-ship. `scripts/10_build_article_pdfs.py --check-ids` compares
+the press map against a local index.
 
 ## Updating the app
 

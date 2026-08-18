@@ -56,6 +56,14 @@ STATIC_DIR = PROJECT_ROOT / "static"
 ARTICLE_PDF_DIR = Path(os.environ.get("IL_PROFILER_ARTICLE_DIR", "").strip()
                        or DATA_DIR / "articles")
 
+# Kill switch for the audit trail's source links. They are ON wherever the
+# source documents are actually present, INCLUDING the cloud — see DEPLOY.md,
+# which spells out that /app/static is served without the APP_PASSWORD gate, so
+# a deployment serving the corpus is relying on Cloudflare Access (or on being
+# unlisted) for its access control. Set this to 1 to turn the links off again
+# without redeploying code.
+SOURCE_LINKS_DISABLED = os.environ.get("IL_PROFILER_DISABLE_SOURCE_LINKS") == "1"
+
 # ---------------------------------------------------------------------------
 # API / models
 # ---------------------------------------------------------------------------

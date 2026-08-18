@@ -12,6 +12,15 @@ primary_region = "iad"   # change to a region near your team (e.g. "lhr", "sjc")
   # Hide the ingest controls: the cloud instance has the index, not the corpus.
   IL_PROFILER_CLOUD = "1"
 
+  # Where the source documents live on the persistent volume, so the Audit
+  # tab's [excerpt N] citations can link to them. Shipped separately from the
+  # image by scripts/11_bundle_cloud_sources.py — see DEPLOY.md, including the
+  # note that /app/static is NOT behind APP_PASSWORD.
+  # The article PDFs and both maps need no setting: they default to
+  # /app/data/articles, /app/data/pdf_pages.json and /app/data/article_sources.json,
+  # which is where the archive unpacks them.
+  IL_PROFILER_DATASET_ROOT = "/app/data/corpus"
+
 [http_service]
   internal_port = 8080
   force_https = true

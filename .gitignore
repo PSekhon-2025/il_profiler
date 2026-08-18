@@ -14,6 +14,9 @@ data/
 # reference from IL_PROFILER_DATASET_ROOT — derived, and not ours to ship
 static/
 
+# deploy payloads built by scripts/11_bundle_cloud_sources.py (~500 MB of PDFs)
+dist/
+
 # python
 __pycache__/
 *.pyc
