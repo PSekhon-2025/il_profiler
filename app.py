@@ -38,7 +38,12 @@ import streamlit as st
 PROJECT_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from il_rag import pdf_sources, runs, topics as topics_mod
+from il_rag import (
+    keyword_agreement as ka_mod,
+    pdf_sources,
+    runs,
+    topics as topics_mod,
+)
 from il_rag.config import (
     ARTICLE_PDF_DIR,
     CHROMA_DIR,
@@ -382,6 +387,33 @@ def load_embedding_summary(run_id: str | None) -> dict | None:
     if not path.exists():
         return None
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def load_keyword_summary(run_id: str | None) -> dict | None:
+    """The lexical keyword judge's summary for a run, if computed."""
+    if not run_id:
+        return None
+    path = runs.run_dir(run_id) / "keyword_agreement" / "summary.json"
+    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
+
+
+def load_keyword_rows(run_id: str | None) -> pd.DataFrame | None:
+    """Per-question keyword scores + the matched words behind each verdict."""
+    if not run_id:
+        return None
+    path = runs.run_dir(run_id) / "keyword_agreement" / "rows.jsonl"
+    if not path.exists():
+        return None
+    rows = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    return pd.DataFrame(rows) if rows else None
 
 
 def load_embedding_rows(run_id: str | None) -> pd.DataFrame | None:
@@ -3205,6 +3237,203 @@ with tab_halluc:
                 dle2.download_button("similarities.jsonl",
                                      (edir / "similarities.jsonl").read_bytes(),
                                      file_name=f"embedding_rows_{hal_run}.jsonl")
+
+        # ---------------- 5 · Keyword agreement ----------------
+        st.subheader("5 · Keyword agreement (lexical third judge)")
+        st.caption(
+            "The bluntest and most transparent judge: each question's seven "
+            "reference answers are reduced to **distinctive keywords**, each "
+            "RAG answer to its content words, and the verdict is which logic's "
+            "keywords the answer actually contains. No LLM, no embeddings — "
+            "every verdict is a visible list of matched words."
+        )
+
+        with st.expander("ℹ️ How keyword agreement is computed", expanded=False):
+            st.markdown(
+                "Implemented in `il_rag/keyword_agreement.py`. Deterministic "
+                "and free: pure set arithmetic over words."
+            )
+            st.markdown(
+                "**Step 1 — derive distinctive keywords.** Take the content "
+                "tokens of each reference answer (lowercased, stopwords and "
+                "≤2-character tokens removed — the same tokenizer the grounding "
+                "check uses). Within one question the seven references share "
+                "framing vocabulary (*lab, conduct, appropriate*) that says "
+                "nothing about **which** logic, so a token is kept only if it "
+                "appears in at most $\\tau$ of the seven sets:"
+            )
+            st.latex(
+                r"K_\ell=\bigl\{\,t \in T(\mathrm{ref}_\ell)\;\big|\;"
+                r"\mathrm{df}(t)\le\tau\,\bigr\},\qquad "
+                r"\mathrm{df}(t)=\bigl|\{m : t \in T(\mathrm{ref}_m)\}\bigr|"
+            )
+            st.markdown(
+                f"$\\tau$ = `--max-df` (default "
+                f"**{ka_mod.KEYWORD_MAX_LOGIC_DF}**): 1 keeps strictly unique "
+                "tokens; 2 tolerates natural pairwise sharing (the *capitalism* "
+                "variants) without letting category-wide vocabulary through."
+            )
+            st.markdown(
+                "**Step 2 — score each logic by keyword recall.** What fraction "
+                "of a logic's keywords does the answer contain?"
+            )
+            st.latex(
+                r"r_\ell=\frac{\bigl|\,T(\text{answer})\cap K_\ell\,\bigr|}"
+                r"{\bigl|\,K_\ell\,\bigr|}"
+            )
+            st.markdown(
+                "Recall, not raw count, so a logic with many keywords is not "
+                "rewarded merely for having a longer list."
+            )
+            st.markdown(
+                "**Step 3 — normalize to shares and pick a winner.** Same shape "
+                "as the embedding judge, so the two are directly comparable:"
+            )
+            st.latex(
+                r"\sigma_\ell=\frac{r_\ell}{\sum_m r_m},\qquad "
+                r"\hat{\ell}=\arg\max_\ell r_\ell,\qquad "
+                r"\mathrm{overlap}=\sum_\ell \min(\sigma_\ell, w_\ell)"
+            )
+            st.markdown(
+                "**Rows with no overlap at all** — the answer shares not one "
+                "keyword with any logic — are reported separately as "
+                "`no_overlap` and **excluded from the rates** rather than "
+                "forced to a uniform guess."
+            )
+            st.markdown(
+                "**Design decisions**\n"
+                "- *Keywords are derived, not hand-written (v1).* They come "
+                "from the run's own questionnaire snapshot, honoring "
+                "per-question overrides, so they always describe the references "
+                "that actually graded that run. Hand-authored keyword sets can "
+                "replace them later without touching the scoring.\n"
+                "- *Why the distinctiveness filter is load-bearing.* Without "
+                "it, shared framing words would dominate every set and every "
+                "logic would score alike — the filter is what turns reference "
+                "text into a discriminating signal.\n"
+                "- *Its weakness is synonymy, and it is structural.* An answer "
+                "saying \"government\" earns nothing from a reference saying "
+                "\"state\". Misses are therefore common **by construction**; "
+                "this judge is here for transparency and triangulation, not "
+                "accuracy.\n"
+                "- *Why add a third judge at all.* The three fail in different "
+                "ways — the matcher can be swayed by rhetoric, embeddings by "
+                "topical similarity, keywords by wording. Where all three "
+                "agree, the classification is hard to dismiss; where they "
+                "split, the matched-word lists show exactly why."
+            )
+
+        if st.button("Compute keyword agreement",
+                     help="Pure computation over the saved run — no API calls. "
+                          "Recomputing overwrites the previous result.",
+                     key="kw_run_btn"):
+            args = [PYTHON, "scripts/11_run_keyword_agreement.py",
+                    "--run", hal_run]
+            with st.status("Computing keyword agreement…",
+                           expanded=True) as status:
+                rc = stream_subprocess(args, st.empty())
+                status.update(
+                    label=("Keyword agreement complete ✅" if rc == 0
+                           else f"Failed (exit {rc})"),
+                    state="complete" if rc == 0 else "error")
+            st.rerun()
+
+        kw = load_keyword_summary(hal_run)
+        if kw:
+            o = kw["overall"]
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Agreement with matcher",
+                      f"{o['rate']:.0%}" if o.get("rate") is not None else "—",
+                      delta=f"chance {1 / len(LOGICS):.0%}", delta_color="off")
+            m2.metric("Keyword share on matcher's pick",
+                      f"{o.get('mean_share_on_matcher_top', 0):.3f}",
+                      delta=f"chance {kw.get('share_chance_baseline', 1/7):.3f}",
+                      delta_color="off")
+            m3.metric("Distribution overlap",
+                      f"{o.get('mean_overlap', 0):.3f}")
+            m4.metric("No keyword overlap", o.get("n_no_overlap", 0),
+                      help="answers sharing no keyword with ANY logic — "
+                           "excluded from the rates rather than guessed")
+
+            # Head-to-head with the embedding judge when both have been run.
+            if emb and emb["overall"].get("rate") is not None:
+                cmp_rows = []
+                for cat, ks in kw.get("by_category", {}).items():
+                    es = emb.get("by_category", {}).get(cat, {})
+                    if ks.get("rate") is not None and es.get("rate") is not None:
+                        cmp_rows.append({"category": cat,
+                                         "embedding": es["rate"],
+                                         "keyword": ks["rate"]})
+                if cmp_rows:
+                    st.markdown("**The two non-LLM judges, side by side.** They "
+                                "fail differently — where one collapses the "
+                                "other often holds, which is the reason to run "
+                                "both:")
+                    cdf = pd.DataFrame(cmp_rows).melt(
+                        "category", var_name="judge", value_name="rate")
+                    ccht = (
+                        alt.Chart(cdf).mark_bar().encode(
+                            x=alt.X("rate:Q", title="agreement with matcher",
+                                    scale=alt.Scale(domain=[0, 1])),
+                            y=alt.Y("category:N", title=None,
+                                    sort=[c for c in CATEGORIES]),
+                            yOffset=alt.YOffset("judge:N"),
+                            color=alt.Color("judge:N", title="judge"),
+                            tooltip=["category", "judge",
+                                     alt.Tooltip("rate:Q", format=".0%")],
+                        ).properties(height=max(220, 30 * len(cmp_rows)))
+                    )
+                    st.altair_chart(ccht, width="stretch")
+
+            krows = load_keyword_rows(hal_run)
+            if krows is not None and not krows.empty:
+                with st.expander("Matched words behind every verdict",
+                                 expanded=False):
+                    st.caption(
+                        "The whole point of a lexical judge: each verdict is "
+                        "auditable by eye. Pick a row to see which of each "
+                        "logic's keywords the answer actually contained."
+                    )
+                    only_dis = st.checkbox("Only where it disagrees with the "
+                                           "matcher", value=False, key="kw_dis")
+                    kv = krows[krows["agree"] == False] if only_dis else krows  # noqa: E712
+                    st.dataframe(
+                        kv[["org", "source_type", "qid", "matcher_top",
+                            "keyword_top", "agree", "share_on_matcher_top",
+                            "overlap"]].rename(columns={
+                                "matcher_top": "matcher says",
+                                "keyword_top": "keywords say"}),
+                        hide_index=True, width="stretch")
+                    opts = [f"{r['org']} · {r['source_type']} · {r['qid']}"
+                            for _, r in kv.iterrows()]
+                    if opts:
+                        sel = st.selectbox("Inspect a row", opts, key="kw_pick")
+                        r = kv.iloc[opts.index(sel)]
+                        mw = r["matched_words"] or {}
+                        st.markdown(
+                            f"**Matcher:** {r['matcher_top']} "
+                            f"({100 * r['matcher_top_weight']:.0f}%) · "
+                            f"**Keywords:** {r['keyword_top'] or '—'}")
+                        if mw:
+                            st.dataframe(pd.DataFrame(
+                                [{"logic": k,
+                                  "keyword recall": r["keyword_scores"].get(k),
+                                  "matched words": ", ".join(v)}
+                                 for k, v in mw.items()]),
+                                hide_index=True, width="stretch")
+                        else:
+                            st.info("This answer matched no keyword of any "
+                                    "logic (`no_overlap`).")
+
+            kdir = runs.run_dir(hal_run) / "keyword_agreement"
+            d1, d2, d3 = st.columns(3)
+            for col, name, fname in (
+                    (d1, "summary.json", f"keyword_summary_{hal_run}.json"),
+                    (d2, "rows.jsonl", f"keyword_rows_{hal_run}.jsonl"),
+                    (d3, "keywords.json", f"keywords_{hal_run}.json")):
+                if (kdir / name).exists():
+                    col.download_button(name, (kdir / name).read_bytes(),
+                                        file_name=fname, key=f"kw_dl_{name}")
 
 # ---------------------------------------------------------------------------
 # Topics tab — the inductive layer: what the corpus talks about, and how those
