@@ -14,10 +14,11 @@ __pycache__/
 # Generated data — lives on the persistent Fly volume, not in the image.
 data/
 
-# Corpus PDFs published locally for the audit tab's excerpt links. The raw
-# corpus is never shipped, and /app/static is served without authentication —
-# baking these in would publish them. See DEPLOY.md.
+# Corpus PDFs published locally for the audit tab's excerpt links, and the
+# deploy payload that carries them. These reach the machine via the persistent
+# volume, never the image — keeping ~500 MB out of every build. See DEPLOY.md.
 static/
+dist/
 
 # Local-only launchers and OS cruft.
 Launch IL Profiler.command

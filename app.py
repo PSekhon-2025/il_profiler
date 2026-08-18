@@ -59,6 +59,7 @@ from il_rag.config import (
     QUOTE_NEAR_VERBATIM_THRESHOLD,
     QUOTE_PARAPHRASE_COS_THRESHOLD,
     QUOTE_PARAPHRASE_LEX_THRESHOLD,
+    SOURCE_LINKS_DISABLED,
     SOURCE_TYPES,
     STATIC_DIR,
     TOP_K,
@@ -217,29 +218,28 @@ def pdf_url(filename: str, org: str, chunk_id: str | None = None,
     scripts/10_build_article_pdfs.py generated, because their `filename` is a
     45 MB bundle of 500 records rather than a document.
 
-    SECURITY INVARIANT. Streamlit serves /app/static over HTTP with
-    `Access-Control-Allow-Origin: *`, and that route is NOT behind
-    _require_password() below — it is handled beneath the Python app entirely,
-    so anything in static/ is readable by anyone who guesses the URL. Two
-    things keep the copyrighted corpus out of it, and BOTH are needed:
+    ACCESS NOTE, deliberately not a guard. Streamlit serves /app/static over
+    HTTP with `Access-Control-Allow-Origin: *`, and that route is handled
+    beneath the Python app, so it is NOT behind _require_password(). Anything
+    published into static/ is therefore readable by anyone who reaches the
+    hostname and guesses the path. A deployment that serves the corpus is
+    relying on Cloudflare Access — which gates the whole hostname at the edge,
+    static route included — or on the host being unlisted. `APP_PASSWORD` alone
+    does NOT cover it. This was a deliberate choice for a private instance; see
+    DEPLOY.md. `IL_PROFILER_DISABLE_SOURCE_LINKS=1` turns it all off again
+    without a code change.
 
-      1. the guard below, which returns before touching the filesystem, so a
-         cloud instance never publishes a PDF (note it stops PUBLISHING, not
-         serving — a file already in static/ would still be served);
-      2. `static/` in .dockerignore, so no locally-published PDF is ever baked
-         into the image. The cloud filesystem therefore has no static/ at all.
-         `data/` is dockerignored too, so the generated article PDFs and their
-         map are absent there as well — the cloud has nothing to publish even
-         before the guard fires.
-
-    Do not weaken either one. See DEPLOY.md.
+    There is intentionally no CLOUD_MODE test here any more. What gates the
+    links is whether the source documents are actually present: on a machine
+    without them every lookup below returns None, which is the same plain-text
+    fallback the guard used to produce.
 
     Note this memoizes an idempotent SIDE EFFECT: the first call for a document
     publishes it into static/. Correctness never depends on the cache —
     materialize() re-checks the destination on every miss, and the cache only
     spares repeated stat() calls while a view renders hundreds of quotes.
     """
-    if CLOUD_MODE:
+    if SOURCE_LINKS_DISABLED:
         return None
     if source_type == "thirdparty":
         # Needs no dataset root — the article PDFs were generated ahead of time.
