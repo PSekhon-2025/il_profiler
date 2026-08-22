@@ -39,6 +39,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from il_rag import (
+    adhoc as adhoc_mod,
     keyword_agreement as ka_mod,
     pdf_sources,
     runs,
@@ -882,10 +883,10 @@ with st.sidebar:
         st.caption(f"Active run: **{runs.display_name(cur_meta)}**  \n"
                    f"{len(all_metas)} run(s) saved")
 
-(tab_run, tab_results, tab_audit, tab_halluc, tab_topics,
+(tab_run, tab_results, tab_audit, tab_halluc, tab_topics, tab_adhoc,
  tab_compare) = st.tabs(
     ["▶️ Run", "📊 Results", "🔍 Audit", "🚨 Hallucination", "🧭 Topics",
-     "🆚 Compare runs"])
+     "📄 Analyse a document", "🆚 Compare runs"])
 
 # ---------------------------------------------------------------------------
 # Run tab
@@ -4047,6 +4048,192 @@ with tab_topics:
                 st.success("Every topic was reached by at least one question.")
 
             st.caption(xtab.get("note", ""))
+
+
+# ---------------------------------------------------------------------------
+# Ad-hoc tab — drop in documents and run the questionnaire against them alone.
+# Deliberately isolated from the corpus: nothing here is written to Chroma.
+# ---------------------------------------------------------------------------
+with tab_adhoc:
+    import altair as alt
+
+    st.header("Analyse a document")
+    st.caption(
+        "Drop in one or more documents and run the same 27-question "
+        "questionnaire against **only those files**. Nothing is added to the "
+        "vector index — the six research profiles cannot be affected by "
+        "anything you upload here."
+    )
+
+    with st.expander("ℹ️ How this differs from a corpus run", expanded=False):
+        st.markdown(
+            "**Same measurement, different evidence.** From retrieval onward "
+            "this is the production path — the identical questionnaire, the "
+            "identical answering prompt, the identical graded matcher, the "
+            "identical aggregation. Only the source of evidence changes, so a "
+            "percentage here means what it means on the Results tab."
+        )
+        st.markdown(
+            "**Retrieval is exhaustive, not indexed.** Uploaded text is "
+            "chunked with the same splitter as ingest, embedded once, and held "
+            "**in memory**. Each question then scores every chunk by cosine "
+            "similarity and takes the top $k$:"
+        )
+        st.latex(r"\mathrm{score}(q,c)=\frac{v_q\cdot v_c}"
+                 r"{\lVert v_q\rVert\,\lVert v_c\rVert},\qquad "
+                 r"R(q)=\operatorname*{top-}k_c\ \mathrm{score}(q,c)")
+        symbol_glossary([
+            (r"$q,\;c$", "**a question** and **an uploaded chunk**"),
+            (r"$v_q,\;v_c$", "their **embeddings** (1024 numbers each)"),
+            (r"$k$", "how many chunks are given to the answering model"),
+            (r"$R(q)$", "the **evidence set** for question $q$"),
+        ])
+        st.markdown(
+            "**Design decisions**\n"
+            "- *Why no Chroma.* The six profiles are the study's result, and a "
+            "stray upload must never be able to contaminate the index they are "
+            "computed from. Not writing at all is a stronger guarantee than "
+            "writing carefully and cleaning up afterwards.\n"
+            "- *Why exhaustive search is fine.* A handful of documents is a few "
+            "hundred chunks; comparing against all of them is instant and "
+            "needs no collection lifecycle.\n"
+            "- *Why a subject name is required.* The questions literally ask "
+            "what \"{org}\" does. Answering them about an unnamed entity would "
+            "change what is being measured, so the name is an input, not a "
+            "label.\n"
+            "- *Scope.* Results live in this browser session and can be "
+            "downloaded. They are not saved as a run snapshot, so they never "
+            "appear in Results, Compare, or the other checks."
+        )
+
+    ad1, ad2 = st.columns([2, 1])
+    subject = ad1.text_input(
+        "Subject name — the organisation these documents are about",
+        placeholder="e.g. OpenAI, or Acme Corp",
+        help="Substituted into every question, so it must name the entity the "
+             "documents describe.")
+    adhoc_k = ad2.slider("Chunks per question (k)", 3, 10, TOP_K, key="adhoc_k")
+
+    uploads = st.file_uploader(
+        "Drag and drop documents here",
+        type=["pdf", "txt", "md", "rtf"], accept_multiple_files=True,
+        help="PDF, TXT, Markdown or RTF. Scanned PDFs need OCR first — there "
+             "is no text layer to extract.")
+
+    if uploads:
+        docs = [adhoc_mod.extract_text(f.name, f.getvalue()) for f in uploads]
+        ok = [d for d in docs if not d.error]
+        bad = [d for d in docs if d.error]
+        for d in bad:
+            st.warning(f"**{d.filename}** — {d.error}", icon="⚠️")
+        if ok:
+            chunks_preview = adhoc_mod.build_chunks(ok, subject or "SUBJECT")
+            n_q = runs.QUESTIONS_PER_ORG
+            st.dataframe(
+                pd.DataFrame([{"file": d.filename, "characters": d.n_chars,
+                               "chunks": sum(1 for c in chunks_preview
+                                             if c.filename == d.filename)}
+                              for d in ok]),
+                hide_index=True, width="stretch")
+            st.caption(
+                f"**{len(chunks_preview)} chunks** to embed, then {n_q} "
+                f"questions × (1 answer + 1 matcher call) = **{2 * n_q} LLM "
+                f"calls**, run sequentially — expect **3-5 minutes**. "
+                f"Keep this tab open; closing it loses the run."
+            )
+            can_run = bool(subject.strip()) and api_key_present()
+            if not subject.strip():
+                st.info("Enter a subject name above to enable the run.",
+                        icon="✏️")
+            if st.button("Run the questionnaire on these documents",
+                         type="primary", disabled=not can_run,
+                         key="adhoc_run"):
+                chunks = adhoc_mod.build_chunks(ok, subject.strip())
+                bar = st.progress(0.0, text="Embedding uploaded text…")
+                try:
+                    vecs = adhoc_mod.embed_chunks(
+                        chunks,
+                        progress=lambda i, n: bar.progress(
+                            i / n, text=f"Embedding {i}/{n} chunks…"))
+                    result = adhoc_mod.analyze(
+                        chunks, vecs, subject.strip(), k=adhoc_k,
+                        progress=lambda i, n: bar.progress(
+                            i / n, text=f"Question {i}/{n}…"))
+                except Exception as e:  # noqa: BLE001 — surface, don't crash the tab
+                    bar.empty()
+                    st.error(f"Analysis failed: {e}")
+                    result = None
+                else:
+                    bar.empty()
+                    st.session_state["adhoc_result"] = result
+                    st.success("Done.")
+
+    res = st.session_state.get("adhoc_result")
+    if res:
+        prof = res["profile"]
+        st.subheader(f"Profile — {res['subject']}")
+        st.caption(f"{prof['answered']} answered · {prof['abstained']} "
+                   "abstained (abstentions are excluded from the percentages)")
+        if prof["answered"]:
+            pdf_ = pd.DataFrame([{"logic": k, "pct": v}
+                                 for k, v in prof["logic_pct"].items()])
+            st.altair_chart(
+                alt.Chart(pdf_).mark_bar().encode(
+                    x=alt.X("logic:N", sort=LOGICS, title=None),
+                    y=alt.Y("pct:Q", title="% of profile",
+                            scale=alt.Scale(domain=[0, 100])),
+                    color=alt.Color("logic:N", legend=None,
+                                    scale=alt.Scale(
+                                        domain=list(LOGIC_COLORS),
+                                        range=list(LOGIC_COLORS.values()))),
+                    tooltip=["logic", alt.Tooltip("pct:Q", format=".1f")],
+                ).properties(height=280), width="stretch")
+            sanity = max(prof["logic_pct"].get("Family", 0),
+                         prof["logic_pct"].get("Religion", 0))
+            if sanity > 15:
+                st.warning(f"Family/Religion reach {sanity:.1f}% — with a small "
+                           "document set this is easily noise, but worth "
+                           "reading the answers below before trusting it.")
+            st.caption(
+                "One document set is a much smaller sample than a corpus "
+                "profile, so treat the ranking as indicative and the exact "
+                "percentages as soft."
+            )
+
+        with st.expander("Every question, its answer and its evidence",
+                         expanded=False):
+            for row in res["rows"]:
+                top = ("ABSTAINED" if row["abstain"]
+                       else max(row["weights"], key=row["weights"].get))
+                with st.expander(f"{row['qid']} → {top}"):
+                    st.markdown(f"**Q:** {row['question']}")
+                    st.markdown(f"**Answer:**\n\n{row['answer']}")
+                    if not row["abstain"]:
+                        st.dataframe(pd.DataFrame(
+                            [{"logic": k, "weight": round(v, 3)}
+                             for k, v in row["weights"].items() if v > 0]
+                        ).sort_values("weight", ascending=False),
+                            hide_index=True)
+                    st.markdown(f"**Matcher reasoning:** {row['reasoning']}")
+                    st.markdown("**Evidence used:**")
+                    for i, ev in enumerate(row["retrieved"], 1):
+                        with st.expander(f"[{i}] {ev['filename']} "
+                                         f"(similarity {ev['score']:.3f})"):
+                            st.text(ev["text"])
+
+        dl1, dl2 = st.columns(2)
+        dl1.download_button(
+            "profile.json",
+            json.dumps({"subject": res["subject"], "profile": prof},
+                       ensure_ascii=False, indent=2),
+            file_name=f"adhoc_profile_{res['subject']}.json")
+        dl2.download_button(
+            "per_question.jsonl",
+            "\n".join(json.dumps(r, ensure_ascii=False) for r in res["rows"]),
+            file_name=f"adhoc_rows_{res['subject']}.jsonl")
+        if st.button("Clear result", key="adhoc_clear"):
+            del st.session_state["adhoc_result"]
+            st.rerun()
 
 
 # ---------------------------------------------------------------------------

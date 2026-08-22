@@ -10,3 +10,4 @@ altair>=5.0.0
 matplotlib>=3.8.0
 pytest>=8.0.0        # tests only (offline; no API key needed)
 
+pypdf>=5.0            # ad-hoc PDF upload in the app (pure Python, ~1MB)
