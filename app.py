@@ -1109,6 +1109,10 @@ with tab_run:
 # Results tab
 # ---------------------------------------------------------------------------
 with tab_results:
+    # Imported here explicitly: the analysis expanders below chart with
+    # altair before the profile charts further down would have imported it.
+    import altair as alt
+
     res_run = run_selectbox("Run to view", key="results_run",
                             default_run_id=runs.get_current())
     res_meta = runs.read_meta(res_run) if res_run else {}
@@ -1569,6 +1573,530 @@ with tab_results:
                             "the dominant logic?")
                 st.dataframe(pd.DataFrame(dom), hide_index=True, width="stretch")
 
+        # --- Embedding agreement: the non-LLM second judge (post-hoc) ---
+        emb = load_embedding_summary(res_run)
+        with st.expander("Embedding agreement (non-LLM second judge)",
+                         expanded=False):
+            st.caption(
+                "Embeds every committed answer and the run's own seven reference "
+                "answers per category, ranks the references by cosine similarity, "
+                "and checks whether the nearest reference's logic agrees with the "
+                "LLM matcher's top logic. Deterministic and LLM-free. Absolute "
+                "cosine values are NOT interpretable (e5 compresses them into a "
+                "narrow band) — only the ranking and the top1–top2 margin are."
+            )
+            with st.expander("ℹ️ How embedding agreement is computed",
+                             expanded=False):
+                st.markdown(
+                    "Implemented in `il_rag/embedding_agreement.py`. Every "
+                    "**committed** answer is compared against the seven reference "
+                    "answers *for its own question* (base text plus any "
+                    "per-question override — the identical references the LLM "
+                    "matcher saw). Abstained rows are skipped. No LLM is involved "
+                    "here: embeddings and arithmetic only, so the result is "
+                    "exactly reproducible."
+                )
+                st.markdown(
+                    "**Step 1 — embed and measure cosine similarity.** Answers and "
+                    "references are embedded with the same e5 model used for "
+                    "retrieval (each truncated to 1400 characters to respect its "
+                    "512-token limit; answers state their conclusion first, so the "
+                    "head carries the signal). For each logic $k$:"
+                )
+                st.latex(r"s_k=\cos\bigl(v_{\text{answer}},\,v_{\text{ref}_k}\bigr)"
+                         r"=\frac{v_{\text{answer}}\cdot v_{\text{ref}_k}}"
+                         r"{\lVert v_{\text{answer}}\rVert\,\lVert v_{\text{ref}_k}\rVert}")
+                st.markdown(
+                    "**Step 2 — the binary verdict.** Take the nearest reference "
+                    "and compare it with the matcher's top-weighted logic. The "
+                    "**margin** records how decisive that pick was:"
+                )
+                st.latex(
+                    r"\hat{k}=\arg\max_k s_k, \qquad "
+                    r"\mathrm{agree}=\bigl[\hat{k}=\arg\max_k w_k\bigr], \qquad "
+                    r"\mathrm{margin}=s_{(1)}-s_{(2)}"
+                )
+                st.markdown(
+                    "**Step 3 — graded closeness shares.** Convert the seven "
+                    "similarities into proportions by subtracting the *farthest* "
+                    "reference's similarity, then normalizing (min-shifted "
+                    "normalization). The farthest logic receives exactly 0; a row "
+                    "with no spread at all degrades to uniform $1/7$:"
+                )
+                st.latex(
+                    r"\sigma_k=\frac{s_k-\min_j s_j}{\sum_{m}\bigl(s_m-\min_j s_j\bigr)},"
+                    r"\qquad \sum_k \sigma_k = 1"
+                )
+                st.markdown(
+                    "**Step 4 — two continuous comparisons** against the matcher's "
+                    "weight vector $w$. The first reads the share landing on the "
+                    "matcher's single top pick; the second compares the *whole* "
+                    "shape via the overlapping coefficient (histogram "
+                    "intersection):"
+                )
+                st.latex(
+                    r"\mathrm{share\_on\_top}=\sigma_{\arg\max_k w_k}, \qquad "
+                    r"\mathrm{overlap}=\sum_{k=1}^{7}\min(\sigma_k, w_k)"
+                )
+                st.markdown(
+                    "**Step 5 — baselines.** Each metric is reported against what "
+                    "an uninformative judge would score, so the numbers can be "
+                    "read as *above chance* rather than in the abstract:"
+                )
+                st.latex(
+                    r"\text{chance share}=\tfrac{1}{7}\approx 0.143, \qquad "
+                    r"\text{uniform overlap}=\sum_{k}\min\bigl(\tfrac{1}{7},\,w_k\bigr)"
+                )
+                symbol_glossary([
+                    (r"$k$", "**a logic** — one of the seven"),
+                    (r"$j,\;m$", "*other* logics — used when a formula holds $k$ "
+                                 "fixed and ranges over all seven"),
+                    (r"$v_{\text{answer}}$", "the answer's **embedding**: 1024 "
+                                             "numbers encoding its meaning"),
+                    (r"$v_{\mathrm{ref}_k}$", "the **embedding of logic $k$'s "
+                                              "reference answer** for this question"),
+                    (r"$s_k$", "**cosine similarity** between the answer and "
+                               "reference $k$, in $[-1,1]$ (in practice ≈0.78–0.87)"),
+                    (r"$s_{(1)},\,s_{(2)}$", "the **highest and second-highest** "
+                                             "similarities, once sorted"),
+                    (r"$\mathrm{margin}$", "$s_{(1)}-s_{(2)}$ — how **decisive** "
+                                           "the winning pick was; near 0 = a tie"),
+                    (r"$\sigma_k$", "the **closeness share** after min-shifting, so "
+                                    "the seven sum to 1"),
+                    (r"$\hat{k}$", "the **nearest** logic (the hat means *chosen*)"),
+                    (r"$w_k$", "the **LLM matcher's weight** for logic $k$"),
+                    (r"$\lVert v \rVert$", "the **length (norm)** of vector $v$ — "
+                                           "dividing by it is what makes cosine "
+                                           "measure direction, not magnitude"),
+                    (r"$\cdot$", "the **dot product** of two vectors"),
+                    *_SET_NOTATION,
+                ])
+                st.markdown(
+                    "All five quantities are averaged for the overall summary and "
+                    "for each category and lab×source slice.\n\n"
+                    "**Design decisions**\n"
+                    "- *Why min-shifted shares instead of softmax?* Softmax needs "
+                    "a temperature constant that would have to be tuned and "
+                    "justified. Min-shifting is parameter-free and "
+                    "**scale-invariant**: adding a constant to every similarity "
+                    "leaves the shares unchanged. That matters because e5 "
+                    "compresses cosines into a narrow high band (empirically "
+                    "≈0.78–0.87 here), so only the *relative spread within a row* "
+                    "carries information.\n"
+                    "- *Why absolute cosines are not reported as a score.* For the "
+                    "same reason: a 0.84 similarity is not '84% similar'. Only "
+                    "rankings, margins and shares are interpretable.\n"
+                    "- *Why keep both the binary and graded views?* The binary "
+                    "argmax is the conventional, recognizable number but is harsh: "
+                    "a near-tie that falls the other way counts as a full "
+                    "disagreement. The graded metrics show whether the answer "
+                    "*leaned* toward the matcher's pick even when the argmax "
+                    "flipped.\n"
+                    "- *Why overlap needs a per-row baseline.* Overlap's floor "
+                    "depends on how concentrated $w$ is — a matcher putting 1.0 on "
+                    "one logic can score at most $1/7$ against a uniform judge, "
+                    "while a diffuse $w$ scores much higher. Share, by contrast, "
+                    "has the flat $1/7$ baseline.\n"
+                    "- *What this check is for.* It is **triangulation, not ground "
+                    "truth**: whole-answer embeddings track topic more than "
+                    "institutional stance, so treat low agreement as a limit of "
+                    "surface similarity rather than evidence the matcher is wrong."
+                )
+            if st.button("Compute embedding agreement",
+                         disabled=not api_key_present(),
+                         help="One embedding per committed row + 63 references, "
+                              "batched — fractions of a cent. Recomputing "
+                              "overwrites the previous result for this run."):
+                args = [PYTHON, "scripts/04_run_embedding_agreement.py",
+                        "--run", res_run]
+                with st.status("Computing embedding agreement…",
+                               expanded=True) as status:
+                    rc = stream_subprocess(args, st.empty())
+                    if rc == 0:
+                        status.update(label="Embedding agreement complete ✅",
+                                      state="complete")
+                    else:
+                        status.update(label=f"Check failed (exit {rc})",
+                                      state="error")
+                st.rerun()
+
+            if emb:
+                o = emb["overall"]
+                e1, e2, e3 = st.columns(3)
+                e1.metric("Agreement with matcher",
+                          f"{o['rate']:.0%}" if o.get("rate") is not None else "—",
+                          help="share of committed answers where the embedding-"
+                               "nearest reference logic equals the matcher's top "
+                               "logic")
+                e2.metric("Rows compared", o.get("n", 0))
+                e3.metric("Mean top1–top2 margin", f"{emb.get('mean_margin', 0):.3f}",
+                          help="how decisively the nearest reference wins; small "
+                               "margins mean the embedding judge itself was "
+                               "uncertain")
+
+                # Graded (ratio-of-closeness) metrics, present on newer summaries.
+                if "mean_share_on_matcher_top" in emb:
+                    g1, g2 = st.columns(2)
+                    g1.metric(
+                        "Closeness share on matcher's pick",
+                        f"{emb['mean_share_on_matcher_top']:.3f}",
+                        delta=f"chance {emb.get('share_chance_baseline', 1/7):.3f}",
+                        delta_color="off",
+                        help="mean share of embedding closeness the matcher's top "
+                             "logic receives (min-shifted shares); above 0.143 = "
+                             "above chance")
+                    g2.metric(
+                        "Distribution overlap",
+                        f"{emb['mean_overlap']:.3f}",
+                        delta=f"uniform judge {emb.get('mean_overlap_uniform_baseline', 0):.3f}",
+                        delta_color="off",
+                        help="overlap between embedding closeness shares and the "
+                             "matcher's weights (1 = identical); compare against "
+                             "what a totally uninformative judge would score")
+
+                cat_rows = [{"category": c, "rate": v["rate"], "n": v["n"],
+                             "share": v.get("mean_share_on_matcher_top"),
+                             "overlap": v.get("mean_overlap")}
+                            for c, v in emb.get("by_category", {}).items()
+                            if v.get("rate") is not None]
+                if cat_rows:
+                    edf = pd.DataFrame(cat_rows)
+                    # Older summaries lack the graded per-category means; only
+                    # offer the metrics the file actually carries.
+                    metric_opts = {"binary agreement rate": ("rate", None)}
+                    if edf["share"].notna().all():
+                        metric_opts["closeness share on matcher's pick"] = (
+                            "share", emb.get("share_chance_baseline", 1 / 7))
+                    if edf["overlap"].notna().all():
+                        metric_opts["distribution overlap"] = ("overlap", None)
+                    sel_metric = st.radio(
+                        "Per-category metric", list(metric_opts),
+                        horizontal=True, key="emb_cat_metric",
+                        help="Binary = strict argmax match. Closeness share and "
+                             "overlap are the graded (ratio) views; the dashed "
+                             "rule marks the chance baseline where applicable.")
+                    field, baseline = metric_opts[sel_metric]
+                    emb_chart = (
+                        alt.Chart(edf)
+                        .mark_bar()
+                        .encode(
+                            x=alt.X(f"{field}:Q", title=sel_metric,
+                                    scale=alt.Scale(domain=[0, 1])),
+                            y=alt.Y("category:N", title=None,
+                                    sort=[c for c in CATEGORIES]),
+                            color=alt.Color(f"{field}:Q", legend=None,
+                                            scale=alt.Scale(scheme="redyellowgreen",
+                                                            domain=[0, 1])),
+                            tooltip=["category",
+                                     alt.Tooltip("rate:Q", format=".2f",
+                                                 title="binary rate"),
+                                     alt.Tooltip("share:Q", format=".3f",
+                                                 title="closeness share"),
+                                     alt.Tooltip("overlap:Q", format=".3f"),
+                                     "n"],
+                        )
+                        .properties(height=220)
+                    )
+                    if baseline:
+                        rule = (alt.Chart(pd.DataFrame({"x": [baseline]}))
+                                .mark_rule(strokeDash=[4, 3], color="#666")
+                                .encode(x="x:Q"))
+                        emb_chart = emb_chart + rule
+                    st.altair_chart(emb_chart, width="stretch")
+
+                erows = load_embedding_rows(res_run)
+                if erows is not None and not erows.empty:
+                    dis = erows[~erows["agree"]]
+                    if dis.empty:
+                        st.success("✅ The embedding judge agrees with the matcher "
+                                   "on every committed answer.")
+                    else:
+                        st.markdown(f"**{len(dis)} disagreement(s)** — where the "
+                                    "two judges split (low margins mean the "
+                                    "embedding side was itself a coin toss):")
+                        st.dataframe(
+                            dis[["org", "source_type", "qid", "matcher_top",
+                                 "matcher_top_weight", "embedding_nearest",
+                                 "margin"]].rename(columns={
+                                     "matcher_top": "matcher says",
+                                     "matcher_top_weight": "weight",
+                                     "embedding_nearest": "embedding says",
+                                 }),
+                            hide_index=True, width="stretch")
+
+                if erows is not None and not erows.empty:
+                    with st.expander("Per-question similarities (the raw numbers)",
+                                     expanded=False):
+                        st.caption(
+                            "Every row's seven cosine similarities, and the "
+                            "min-shifted closeness shares derived from them. These "
+                            "are the inputs to every aggregate above — shown "
+                            "because the aggregates are otherwise unauditable. "
+                            "Remember the absolute cosines are not interpretable "
+                            "on their own (e5 compresses them into a narrow band); "
+                            "the ranking and the shares are."
+                        )
+                        which = st.radio(
+                            "Show", ["cosine similarities", "closeness shares"],
+                            horizontal=True, key="emb_raw_which")
+                        col = ("similarities" if which == "cosine similarities"
+                               else "embedding_shares")
+                        if col not in erows.columns:
+                            st.info(
+                                "Closeness shares are not in this run's file — it "
+                                "predates the graded metrics. Recompute the check "
+                                "above to add them.")
+                        else:
+                            wide = pd.DataFrame([
+                                {"lab": r["org"], "source": r["source_type"],
+                                 "qid": r["qid"],
+                                 "matcher": r["matcher_top"],
+                                 "embedding": r["embedding_nearest"],
+                                 "margin": r["margin"],
+                                 **{logic: (r[col] or {}).get(logic)
+                                    for logic in LOGICS}}
+                                for _, r in erows.iterrows()
+                            ])
+                            st.dataframe(wide, hide_index=True, width="stretch")
+
+                edir = runs.run_dir(res_run) / "embedding_agreement"
+                dle1, dle2 = st.columns(2)
+                if (edir / "summary.json").exists():
+                    dle1.download_button("summary.json",
+                                         (edir / "summary.json").read_bytes(),
+                                         file_name=f"embedding_summary_{res_run}.json")
+                if (edir / "similarities.jsonl").exists():
+                    dle2.download_button("similarities.jsonl",
+                                         (edir / "similarities.jsonl").read_bytes(),
+                                         file_name=f"embedding_rows_{res_run}.jsonl")
+
+        # --- Keyword agreement: the lexical third judge (post-hoc) ---
+        with st.expander("Keyword agreement (lexical third judge)",
+                         expanded=False):
+            st.caption(
+                "The bluntest and most transparent judge: each question's seven "
+                "reference answers are reduced to **distinctive keywords**, each "
+                "RAG answer to its content words, and the verdict is which logic's "
+                "keywords the answer actually contains. No LLM, no embeddings — "
+                "every verdict is a visible list of matched words."
+            )
+
+            with st.expander("ℹ️ How keyword agreement is computed", expanded=False):
+                st.markdown(
+                    "Implemented in `il_rag/keyword_agreement.py`. Deterministic "
+                    "and free: pure set arithmetic over words."
+                )
+                st.markdown(
+                    "**Step 1 — derive distinctive keywords.** Take the content "
+                    "tokens of each reference answer (lowercased, stopwords and "
+                    "≤2-character tokens removed — the same tokenizer the grounding "
+                    "check uses). Within one question the seven references share "
+                    "framing vocabulary (*lab, conduct, appropriate*) that says "
+                    "nothing about **which** logic, so a token is kept only if it "
+                    "appears in at most $\\tau$ of the seven sets:"
+                )
+                st.latex(
+                    r"K_\ell=\bigl\{\,t \in T(\mathrm{ref}_\ell)\;\big|\;"
+                    r"\mathrm{df}(t)\le\tau\,\bigr\},\qquad "
+                    r"\mathrm{df}(t)=\bigl|\{m : t \in T(\mathrm{ref}_m)\}\bigr|"
+                )
+                st.markdown(
+                    f"$\\tau$ = `--max-df` (default "
+                    f"**{ka_mod.KEYWORD_MAX_LOGIC_DF}**): 1 keeps strictly unique "
+                    "tokens; 2 tolerates natural pairwise sharing (the *capitalism* "
+                    "variants) without letting category-wide vocabulary through."
+                )
+                st.markdown(
+                    "**Step 2 — score each logic by keyword recall.** What fraction "
+                    "of a logic's keywords does the answer contain?"
+                )
+                st.latex(
+                    r"r_\ell=\frac{\bigl|\,T(\text{answer})\cap K_\ell\,\bigr|}"
+                    r"{\bigl|\,K_\ell\,\bigr|}"
+                )
+                st.markdown(
+                    "Recall, not raw count, so a logic with many keywords is not "
+                    "rewarded merely for having a longer list."
+                )
+                st.markdown(
+                    "**Step 3 — normalize to shares and pick a winner.** Same shape "
+                    "as the embedding judge, so the two are directly comparable:"
+                )
+                st.latex(
+                    r"\sigma_\ell=\frac{r_\ell}{\sum_m r_m},\qquad "
+                    r"\hat{\ell}=\arg\max_\ell r_\ell,\qquad "
+                    r"\mathrm{overlap}=\sum_\ell \min(\sigma_\ell, w_\ell)"
+                )
+                st.markdown(
+                    "**Rows with no overlap at all** — the answer shares not one "
+                    "keyword with any logic — are reported separately as "
+                    "`no_overlap` and **excluded from the rates** rather than "
+                    "forced to a uniform guess."
+                )
+                symbol_glossary([
+                    (r"$\ell$", "**a logic** — one of the seven (State, Profession, "
+                                "Market, Corporation, Family, Religion, Community)"),
+                    (r"$m$", "*another* logic — a second letter exists only so a "
+                             "formula can hold $\\ell$ fixed while counting across "
+                             "all the others"),
+                    (r"$t$", "**a token** — one content word, e.g. `investors`"),
+                    (r"$T(x)$", "the **content tokens** of text $x$: lowercased "
+                                "words, minus stopwords and ≤2-character tokens"),
+                    (r"$\mathrm{ref}_\ell$", "the **reference answer** written for "
+                                             "logic $\\ell$ for this question"),
+                    (r"$\mathrm{df}(t)$", "**document frequency** — how many of "
+                                          "this question's 7 references contain "
+                                          "token $t$"),
+                    (r"$\tau$", f"the **df cutoff** (`--max-df`, default "
+                                f"**{ka_mod.KEYWORD_MAX_LOGIC_DF}**): keep a token "
+                                "only if $\\mathrm{df}(t)\\le\\tau$"),
+                    (r"$K_\ell$", "logic $\\ell$'s resulting **keyword set**"),
+                    (r"$r_\ell$", "**keyword recall** — the share of $K_\\ell$ the "
+                                  "answer contains, in $[0,1]$"),
+                    (r"$\sigma_\ell$", "the **normalized share** — $r_\\ell$ as a "
+                                       "fraction of all seven, so they sum to 1"),
+                    (r"$\hat{\ell}$", "the **predicted logic** (the hat means "
+                                      "*estimated*, vs plain $\\ell$ = any logic)"),
+                    (r"$w_\ell$", "the **LLM matcher's weight** for logic $\\ell$ "
+                                  "— what this judge is compared against"),
+                    *_SET_NOTATION,
+                ], note="In the set-builder braces, the vertical bar reads “such "
+                        "that”, not division.")
+                st.markdown(
+                    "**Design decisions**\n"
+                    "- *Keywords are derived, not hand-written (v1).* They come "
+                    "from the run's own questionnaire snapshot, honoring "
+                    "per-question overrides, so they always describe the references "
+                    "that actually graded that run. Hand-authored keyword sets can "
+                    "replace them later without touching the scoring.\n"
+                    "- *Why the distinctiveness filter is load-bearing.* Without "
+                    "it, shared framing words would dominate every set and every "
+                    "logic would score alike — the filter is what turns reference "
+                    "text into a discriminating signal.\n"
+                    "- *Its weakness is synonymy, and it is structural.* An answer "
+                    "saying \"government\" earns nothing from a reference saying "
+                    "\"state\". Misses are therefore common **by construction**; "
+                    "this judge is here for transparency and triangulation, not "
+                    "accuracy.\n"
+                    "- *Why add a third judge at all.* The three fail in different "
+                    "ways — the matcher can be swayed by rhetoric, embeddings by "
+                    "topical similarity, keywords by wording. Where all three "
+                    "agree, the classification is hard to dismiss; where they "
+                    "split, the matched-word lists show exactly why."
+                )
+
+            if st.button("Compute keyword agreement",
+                         help="Pure computation over the saved run — no API calls. "
+                              "Recomputing overwrites the previous result.",
+                         key="kw_run_btn"):
+                args = [PYTHON, "scripts/12_run_keyword_agreement.py",
+                        "--run", res_run]
+                with st.status("Computing keyword agreement…",
+                               expanded=True) as status:
+                    rc = stream_subprocess(args, st.empty())
+                    status.update(
+                        label=("Keyword agreement complete ✅" if rc == 0
+                               else f"Failed (exit {rc})"),
+                        state="complete" if rc == 0 else "error")
+                st.rerun()
+
+            kw = load_keyword_summary(res_run)
+            if kw:
+                o = kw["overall"]
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("Agreement with matcher",
+                          f"{o['rate']:.0%}" if o.get("rate") is not None else "—",
+                          delta=f"chance {1 / len(LOGICS):.0%}", delta_color="off")
+                m2.metric("Keyword share on matcher's pick",
+                          f"{o.get('mean_share_on_matcher_top', 0):.3f}",
+                          delta=f"chance {kw.get('share_chance_baseline', 1/7):.3f}",
+                          delta_color="off")
+                m3.metric("Distribution overlap",
+                          f"{o.get('mean_overlap', 0):.3f}")
+                m4.metric("No keyword overlap", o.get("n_no_overlap", 0),
+                          help="answers sharing no keyword with ANY logic — "
+                               "excluded from the rates rather than guessed")
+
+                # Head-to-head with the embedding judge when both have been run.
+                if emb and emb["overall"].get("rate") is not None:
+                    cmp_rows = []
+                    for cat, ks in kw.get("by_category", {}).items():
+                        es = emb.get("by_category", {}).get(cat, {})
+                        if ks.get("rate") is not None and es.get("rate") is not None:
+                            cmp_rows.append({"category": cat,
+                                             "embedding": es["rate"],
+                                             "keyword": ks["rate"]})
+                    if cmp_rows:
+                        st.markdown("**The two non-LLM judges, side by side.** They "
+                                    "fail differently — where one collapses the "
+                                    "other often holds, which is the reason to run "
+                                    "both:")
+                        cdf = pd.DataFrame(cmp_rows).melt(
+                            "category", var_name="judge", value_name="rate")
+                        ccht = (
+                            alt.Chart(cdf).mark_bar().encode(
+                                x=alt.X("rate:Q", title="agreement with matcher",
+                                        scale=alt.Scale(domain=[0, 1])),
+                                y=alt.Y("category:N", title=None,
+                                        sort=[c for c in CATEGORIES]),
+                                yOffset=alt.YOffset("judge:N"),
+                                color=alt.Color("judge:N", title="judge"),
+                                tooltip=["category", "judge",
+                                         alt.Tooltip("rate:Q", format=".0%")],
+                            ).properties(height=max(220, 30 * len(cmp_rows)))
+                        )
+                        st.altair_chart(ccht, width="stretch")
+
+                krows = load_keyword_rows(res_run)
+                if krows is not None and not krows.empty:
+                    with st.expander("Matched words behind every verdict",
+                                     expanded=False):
+                        st.caption(
+                            "The whole point of a lexical judge: each verdict is "
+                            "auditable by eye. Pick a row to see which of each "
+                            "logic's keywords the answer actually contained."
+                        )
+                        only_dis = st.checkbox("Only where it disagrees with the "
+                                               "matcher", value=False, key="kw_dis")
+                        kv = krows[krows["agree"] == False] if only_dis else krows  # noqa: E712
+                        st.dataframe(
+                            kv[["org", "source_type", "qid", "matcher_top",
+                                "keyword_top", "agree", "share_on_matcher_top",
+                                "overlap"]].rename(columns={
+                                    "matcher_top": "matcher says",
+                                    "keyword_top": "keywords say"}),
+                            hide_index=True, width="stretch")
+                        opts = [f"{r['org']} · {r['source_type']} · {r['qid']}"
+                                for _, r in kv.iterrows()]
+                        if opts:
+                            sel = st.selectbox("Inspect a row", opts, key="kw_pick")
+                            r = kv.iloc[opts.index(sel)]
+                            mw = r["matched_words"] or {}
+                            st.markdown(
+                                f"**Matcher:** {r['matcher_top']} "
+                                f"({100 * r['matcher_top_weight']:.0f}%) · "
+                                f"**Keywords:** {r['keyword_top'] or '—'}")
+                            if mw:
+                                st.dataframe(pd.DataFrame(
+                                    [{"logic": k,
+                                      "keyword recall": r["keyword_scores"].get(k),
+                                      "matched words": ", ".join(v)}
+                                     for k, v in mw.items()]),
+                                    hide_index=True, width="stretch")
+                            else:
+                                st.info("This answer matched no keyword of any "
+                                        "logic (`no_overlap`).")
+
+                kdir = runs.run_dir(res_run) / "keyword_agreement"
+                d1, d2, d3 = st.columns(3)
+                for col, name, fname in (
+                        (d1, "summary.json", f"keyword_summary_{res_run}.json"),
+                        (d2, "rows.jsonl", f"keyword_rows_{res_run}.jsonl"),
+                        (d3, "keywords.json", f"keywords_{res_run}.json")):
+                    if (kdir / name).exists():
+                        col.download_button(name, (kdir / name).read_bytes(),
+                                            file_name=fname, key=f"kw_dl_{name}")
+
         # ci_long: lo/hi per (lab, source, logic) for error-bar overlays.
         ci_recs = []
         if ci_data:
@@ -1608,7 +2136,6 @@ with tab_results:
                          f"{worst:.1f}% — the method may be misfiring.")
 
             # --- One chart per lab: published vs thirdparty side by side ---
-            import altair as alt
             for org in [o for o in ORGS if o in long["lab"].unique()]:
                 st.subheader(org)
                 sub = long[long["lab"] == org]
@@ -1906,19 +2433,23 @@ with tab_audit:
 with tab_halluc:
     st.header("Hallucination & grounding checks")
     st.caption(
-        "Five black-box checks: **retrieval grounding** (was there relevant "
+        "Four black-box checks: **retrieval grounding** (was there relevant "
         "text to answer from?), **quote verification** (does the cited support "
         "actually appear in the sources?), **quote provenance** (if it doesn't, "
         "is it a paraphrase, a figure of speech, or a fabrication — and is its "
-        "content true anyway?), **metamorphic stability & evidence "
+        "content true anyway?), and **metamorphic stability & evidence "
         "sensitivity** (does the label survive a reword — and does it stop when "
-        "the supporting evidence is taken away?), and **embedding agreement** "
-        "(does a non-LLM judge rank the same reference nearest?)."
+        "the supporting evidence is taken away?). The two non-LLM judges — "
+        "**embedding agreement** and **keyword agreement** — grade the same "
+        "run and now sit on the **Results** tab, beside the profiles they "
+        "judge."
     )
     hal_run = run_selectbox("Run to inspect", key="halluc_run",
                             default_run_id=runs.get_current())
     dfh = load_per_question(hal_run)
     stab = load_stability(hal_run)
+    # Still loaded here although the check itself moved to the Results tab:
+    # the alert banner and the download bundle below both read it.
     emb = load_embedding_summary(hal_run)
     prov = load_quote_provenance(hal_run)
     prov_spans = load_quote_spans(hal_run)
@@ -2007,12 +2538,13 @@ with tab_halluc:
                            f"🧭 **Low embedding agreement** "
                            f"({emb['overall']['rate']:.0%}): the non-LLM judge "
                            f"often ranks a different logic's reference nearest "
-                           f"than the matcher's top pick. See section 4."))
+                           f"than the matcher's top pick. See the "
+                           f"**Results** tab."))
         if not (has_grounding or has_quotes or stab or emb or prov):
             st.info("None of the checks have run for this snapshot yet. Enable "
                     "**--grounding** / **--quotes** on the Run tab for the next "
-                    "run, or launch the metamorphic eval / embedding agreement / "
-                    "quote provenance below (all three work on any existing run).")
+                    "run, or launch the metamorphic eval / quote provenance "
+                    "below (both work on any existing run).")
         elif alerts:
             for kind, msg in alerts:
                 getattr(st, kind)(msg)
@@ -2029,9 +2561,9 @@ with tab_halluc:
             if not csv_members:
                 st.caption(
                     "No checks have produced results for this snapshot yet. "
-                    "Enable **--grounding** / **--quotes** on the Run tab, or "
-                    "launch the metamorphic eval / embedding agreement below, "
-                    "then come back here.")
+                    "Enable **--grounding** / **--quotes** on the Run tab, "
+                    "launch the metamorphic eval below, or compute embedding "
+                    "agreement on the Results tab, then come back here.")
             else:
                 st.caption(
                     "One row per decision across the "
@@ -3204,527 +3736,6 @@ with tab_halluc:
                 dl2.download_button("variants.jsonl",
                                     (mdir / "variants.jsonl").read_bytes(),
                                     file_name=f"variants_{hal_run}.jsonl")
-
-        # ---------------- 4 · Embedding agreement ----------------
-        st.subheader("4 · Embedding agreement (second judge)")
-        st.caption(
-            "Embeds every committed answer and the run's own seven reference "
-            "answers per category, ranks the references by cosine similarity, "
-            "and checks whether the nearest reference's logic agrees with the "
-            "LLM matcher's top logic. Deterministic and LLM-free. Absolute "
-            "cosine values are NOT interpretable (e5 compresses them into a "
-            "narrow band) — only the ranking and the top1–top2 margin are."
-        )
-        with st.expander("ℹ️ How embedding agreement is computed",
-                         expanded=False):
-            st.markdown(
-                "Implemented in `il_rag/embedding_agreement.py`. Every "
-                "**committed** answer is compared against the seven reference "
-                "answers *for its own question* (base text plus any "
-                "per-question override — the identical references the LLM "
-                "matcher saw). Abstained rows are skipped. No LLM is involved "
-                "here: embeddings and arithmetic only, so the result is "
-                "exactly reproducible."
-            )
-            st.markdown(
-                "**Step 1 — embed and measure cosine similarity.** Answers and "
-                "references are embedded with the same e5 model used for "
-                "retrieval (each truncated to 1400 characters to respect its "
-                "512-token limit; answers state their conclusion first, so the "
-                "head carries the signal). For each logic $k$:"
-            )
-            st.latex(r"s_k=\cos\bigl(v_{\text{answer}},\,v_{\text{ref}_k}\bigr)"
-                     r"=\frac{v_{\text{answer}}\cdot v_{\text{ref}_k}}"
-                     r"{\lVert v_{\text{answer}}\rVert\,\lVert v_{\text{ref}_k}\rVert}")
-            st.markdown(
-                "**Step 2 — the binary verdict.** Take the nearest reference "
-                "and compare it with the matcher's top-weighted logic. The "
-                "**margin** records how decisive that pick was:"
-            )
-            st.latex(
-                r"\hat{k}=\arg\max_k s_k, \qquad "
-                r"\mathrm{agree}=\bigl[\hat{k}=\arg\max_k w_k\bigr], \qquad "
-                r"\mathrm{margin}=s_{(1)}-s_{(2)}"
-            )
-            st.markdown(
-                "**Step 3 — graded closeness shares.** Convert the seven "
-                "similarities into proportions by subtracting the *farthest* "
-                "reference's similarity, then normalizing (min-shifted "
-                "normalization). The farthest logic receives exactly 0; a row "
-                "with no spread at all degrades to uniform $1/7$:"
-            )
-            st.latex(
-                r"\sigma_k=\frac{s_k-\min_j s_j}{\sum_{m}\bigl(s_m-\min_j s_j\bigr)},"
-                r"\qquad \sum_k \sigma_k = 1"
-            )
-            st.markdown(
-                "**Step 4 — two continuous comparisons** against the matcher's "
-                "weight vector $w$. The first reads the share landing on the "
-                "matcher's single top pick; the second compares the *whole* "
-                "shape via the overlapping coefficient (histogram "
-                "intersection):"
-            )
-            st.latex(
-                r"\mathrm{share\_on\_top}=\sigma_{\arg\max_k w_k}, \qquad "
-                r"\mathrm{overlap}=\sum_{k=1}^{7}\min(\sigma_k, w_k)"
-            )
-            st.markdown(
-                "**Step 5 — baselines.** Each metric is reported against what "
-                "an uninformative judge would score, so the numbers can be "
-                "read as *above chance* rather than in the abstract:"
-            )
-            st.latex(
-                r"\text{chance share}=\tfrac{1}{7}\approx 0.143, \qquad "
-                r"\text{uniform overlap}=\sum_{k}\min\bigl(\tfrac{1}{7},\,w_k\bigr)"
-            )
-            symbol_glossary([
-                (r"$k$", "**a logic** — one of the seven"),
-                (r"$j,\;m$", "*other* logics — used when a formula holds $k$ "
-                             "fixed and ranges over all seven"),
-                (r"$v_{\text{answer}}$", "the answer's **embedding**: 1024 "
-                                         "numbers encoding its meaning"),
-                (r"$v_{\mathrm{ref}_k}$", "the **embedding of logic $k$'s "
-                                          "reference answer** for this question"),
-                (r"$s_k$", "**cosine similarity** between the answer and "
-                           "reference $k$, in $[-1,1]$ (in practice ≈0.78–0.87)"),
-                (r"$s_{(1)},\,s_{(2)}$", "the **highest and second-highest** "
-                                         "similarities, once sorted"),
-                (r"$\mathrm{margin}$", "$s_{(1)}-s_{(2)}$ — how **decisive** "
-                                       "the winning pick was; near 0 = a tie"),
-                (r"$\sigma_k$", "the **closeness share** after min-shifting, so "
-                                "the seven sum to 1"),
-                (r"$\hat{k}$", "the **nearest** logic (the hat means *chosen*)"),
-                (r"$w_k$", "the **LLM matcher's weight** for logic $k$"),
-                (r"$\lVert v \rVert$", "the **length (norm)** of vector $v$ — "
-                                       "dividing by it is what makes cosine "
-                                       "measure direction, not magnitude"),
-                (r"$\cdot$", "the **dot product** of two vectors"),
-                *_SET_NOTATION,
-            ])
-            st.markdown(
-                "All five quantities are averaged for the overall summary and "
-                "for each category and lab×source slice.\n\n"
-                "**Design decisions**\n"
-                "- *Why min-shifted shares instead of softmax?* Softmax needs "
-                "a temperature constant that would have to be tuned and "
-                "justified. Min-shifting is parameter-free and "
-                "**scale-invariant**: adding a constant to every similarity "
-                "leaves the shares unchanged. That matters because e5 "
-                "compresses cosines into a narrow high band (empirically "
-                "≈0.78–0.87 here), so only the *relative spread within a row* "
-                "carries information.\n"
-                "- *Why absolute cosines are not reported as a score.* For the "
-                "same reason: a 0.84 similarity is not '84% similar'. Only "
-                "rankings, margins and shares are interpretable.\n"
-                "- *Why keep both the binary and graded views?* The binary "
-                "argmax is the conventional, recognizable number but is harsh: "
-                "a near-tie that falls the other way counts as a full "
-                "disagreement. The graded metrics show whether the answer "
-                "*leaned* toward the matcher's pick even when the argmax "
-                "flipped.\n"
-                "- *Why overlap needs a per-row baseline.* Overlap's floor "
-                "depends on how concentrated $w$ is — a matcher putting 1.0 on "
-                "one logic can score at most $1/7$ against a uniform judge, "
-                "while a diffuse $w$ scores much higher. Share, by contrast, "
-                "has the flat $1/7$ baseline.\n"
-                "- *What this check is for.* It is **triangulation, not ground "
-                "truth**: whole-answer embeddings track topic more than "
-                "institutional stance, so treat low agreement as a limit of "
-                "surface similarity rather than evidence the matcher is wrong."
-            )
-        if st.button("Compute embedding agreement",
-                     disabled=not api_key_present(),
-                     help="One embedding per committed row + 63 references, "
-                          "batched — fractions of a cent. Recomputing "
-                          "overwrites the previous result for this run."):
-            args = [PYTHON, "scripts/04_run_embedding_agreement.py",
-                    "--run", hal_run]
-            with st.status("Computing embedding agreement…",
-                           expanded=True) as status:
-                rc = stream_subprocess(args, st.empty())
-                if rc == 0:
-                    status.update(label="Embedding agreement complete ✅",
-                                  state="complete")
-                else:
-                    status.update(label=f"Check failed (exit {rc})",
-                                  state="error")
-            st.rerun()
-
-        if emb:
-            o = emb["overall"]
-            e1, e2, e3 = st.columns(3)
-            e1.metric("Agreement with matcher",
-                      f"{o['rate']:.0%}" if o.get("rate") is not None else "—",
-                      help="share of committed answers where the embedding-"
-                           "nearest reference logic equals the matcher's top "
-                           "logic")
-            e2.metric("Rows compared", o.get("n", 0))
-            e3.metric("Mean top1–top2 margin", f"{emb.get('mean_margin', 0):.3f}",
-                      help="how decisively the nearest reference wins; small "
-                           "margins mean the embedding judge itself was "
-                           "uncertain")
-
-            # Graded (ratio-of-closeness) metrics, present on newer summaries.
-            if "mean_share_on_matcher_top" in emb:
-                g1, g2 = st.columns(2)
-                g1.metric(
-                    "Closeness share on matcher's pick",
-                    f"{emb['mean_share_on_matcher_top']:.3f}",
-                    delta=f"chance {emb.get('share_chance_baseline', 1/7):.3f}",
-                    delta_color="off",
-                    help="mean share of embedding closeness the matcher's top "
-                         "logic receives (min-shifted shares); above 0.143 = "
-                         "above chance")
-                g2.metric(
-                    "Distribution overlap",
-                    f"{emb['mean_overlap']:.3f}",
-                    delta=f"uniform judge {emb.get('mean_overlap_uniform_baseline', 0):.3f}",
-                    delta_color="off",
-                    help="overlap between embedding closeness shares and the "
-                         "matcher's weights (1 = identical); compare against "
-                         "what a totally uninformative judge would score")
-
-            cat_rows = [{"category": c, "rate": v["rate"], "n": v["n"],
-                         "share": v.get("mean_share_on_matcher_top"),
-                         "overlap": v.get("mean_overlap")}
-                        for c, v in emb.get("by_category", {}).items()
-                        if v.get("rate") is not None]
-            if cat_rows:
-                edf = pd.DataFrame(cat_rows)
-                # Older summaries lack the graded per-category means; only
-                # offer the metrics the file actually carries.
-                metric_opts = {"binary agreement rate": ("rate", None)}
-                if edf["share"].notna().all():
-                    metric_opts["closeness share on matcher's pick"] = (
-                        "share", emb.get("share_chance_baseline", 1 / 7))
-                if edf["overlap"].notna().all():
-                    metric_opts["distribution overlap"] = ("overlap", None)
-                sel_metric = st.radio(
-                    "Per-category metric", list(metric_opts),
-                    horizontal=True, key="emb_cat_metric",
-                    help="Binary = strict argmax match. Closeness share and "
-                         "overlap are the graded (ratio) views; the dashed "
-                         "rule marks the chance baseline where applicable.")
-                field, baseline = metric_opts[sel_metric]
-                emb_chart = (
-                    alt.Chart(edf)
-                    .mark_bar()
-                    .encode(
-                        x=alt.X(f"{field}:Q", title=sel_metric,
-                                scale=alt.Scale(domain=[0, 1])),
-                        y=alt.Y("category:N", title=None,
-                                sort=[c for c in CATEGORIES]),
-                        color=alt.Color(f"{field}:Q", legend=None,
-                                        scale=alt.Scale(scheme="redyellowgreen",
-                                                        domain=[0, 1])),
-                        tooltip=["category",
-                                 alt.Tooltip("rate:Q", format=".2f",
-                                             title="binary rate"),
-                                 alt.Tooltip("share:Q", format=".3f",
-                                             title="closeness share"),
-                                 alt.Tooltip("overlap:Q", format=".3f"),
-                                 "n"],
-                    )
-                    .properties(height=220)
-                )
-                if baseline:
-                    rule = (alt.Chart(pd.DataFrame({"x": [baseline]}))
-                            .mark_rule(strokeDash=[4, 3], color="#666")
-                            .encode(x="x:Q"))
-                    emb_chart = emb_chart + rule
-                st.altair_chart(emb_chart, width="stretch")
-
-            erows = load_embedding_rows(hal_run)
-            if erows is not None and not erows.empty:
-                dis = erows[~erows["agree"]]
-                if dis.empty:
-                    st.success("✅ The embedding judge agrees with the matcher "
-                               "on every committed answer.")
-                else:
-                    st.markdown(f"**{len(dis)} disagreement(s)** — where the "
-                                "two judges split (low margins mean the "
-                                "embedding side was itself a coin toss):")
-                    st.dataframe(
-                        dis[["org", "source_type", "qid", "matcher_top",
-                             "matcher_top_weight", "embedding_nearest",
-                             "margin"]].rename(columns={
-                                 "matcher_top": "matcher says",
-                                 "matcher_top_weight": "weight",
-                                 "embedding_nearest": "embedding says",
-                             }),
-                        hide_index=True, width="stretch")
-
-            if erows is not None and not erows.empty:
-                with st.expander("Per-question similarities (the raw numbers)",
-                                 expanded=False):
-                    st.caption(
-                        "Every row's seven cosine similarities, and the "
-                        "min-shifted closeness shares derived from them. These "
-                        "are the inputs to every aggregate above — shown "
-                        "because the aggregates are otherwise unauditable. "
-                        "Remember the absolute cosines are not interpretable "
-                        "on their own (e5 compresses them into a narrow band); "
-                        "the ranking and the shares are."
-                    )
-                    which = st.radio(
-                        "Show", ["cosine similarities", "closeness shares"],
-                        horizontal=True, key="emb_raw_which")
-                    col = ("similarities" if which == "cosine similarities"
-                           else "embedding_shares")
-                    if col not in erows.columns:
-                        st.info(
-                            "Closeness shares are not in this run's file — it "
-                            "predates the graded metrics. Recompute the check "
-                            "above to add them.")
-                    else:
-                        wide = pd.DataFrame([
-                            {"lab": r["org"], "source": r["source_type"],
-                             "qid": r["qid"],
-                             "matcher": r["matcher_top"],
-                             "embedding": r["embedding_nearest"],
-                             "margin": r["margin"],
-                             **{logic: (r[col] or {}).get(logic)
-                                for logic in LOGICS}}
-                            for _, r in erows.iterrows()
-                        ])
-                        st.dataframe(wide, hide_index=True, width="stretch")
-
-            edir = runs.run_dir(hal_run) / "embedding_agreement"
-            dle1, dle2 = st.columns(2)
-            if (edir / "summary.json").exists():
-                dle1.download_button("summary.json",
-                                     (edir / "summary.json").read_bytes(),
-                                     file_name=f"embedding_summary_{hal_run}.json")
-            if (edir / "similarities.jsonl").exists():
-                dle2.download_button("similarities.jsonl",
-                                     (edir / "similarities.jsonl").read_bytes(),
-                                     file_name=f"embedding_rows_{hal_run}.jsonl")
-
-        # ---------------- 5 · Keyword agreement ----------------
-        st.subheader("5 · Keyword agreement (lexical third judge)")
-        st.caption(
-            "The bluntest and most transparent judge: each question's seven "
-            "reference answers are reduced to **distinctive keywords**, each "
-            "RAG answer to its content words, and the verdict is which logic's "
-            "keywords the answer actually contains. No LLM, no embeddings — "
-            "every verdict is a visible list of matched words."
-        )
-
-        with st.expander("ℹ️ How keyword agreement is computed", expanded=False):
-            st.markdown(
-                "Implemented in `il_rag/keyword_agreement.py`. Deterministic "
-                "and free: pure set arithmetic over words."
-            )
-            st.markdown(
-                "**Step 1 — derive distinctive keywords.** Take the content "
-                "tokens of each reference answer (lowercased, stopwords and "
-                "≤2-character tokens removed — the same tokenizer the grounding "
-                "check uses). Within one question the seven references share "
-                "framing vocabulary (*lab, conduct, appropriate*) that says "
-                "nothing about **which** logic, so a token is kept only if it "
-                "appears in at most $\\tau$ of the seven sets:"
-            )
-            st.latex(
-                r"K_\ell=\bigl\{\,t \in T(\mathrm{ref}_\ell)\;\big|\;"
-                r"\mathrm{df}(t)\le\tau\,\bigr\},\qquad "
-                r"\mathrm{df}(t)=\bigl|\{m : t \in T(\mathrm{ref}_m)\}\bigr|"
-            )
-            st.markdown(
-                f"$\\tau$ = `--max-df` (default "
-                f"**{ka_mod.KEYWORD_MAX_LOGIC_DF}**): 1 keeps strictly unique "
-                "tokens; 2 tolerates natural pairwise sharing (the *capitalism* "
-                "variants) without letting category-wide vocabulary through."
-            )
-            st.markdown(
-                "**Step 2 — score each logic by keyword recall.** What fraction "
-                "of a logic's keywords does the answer contain?"
-            )
-            st.latex(
-                r"r_\ell=\frac{\bigl|\,T(\text{answer})\cap K_\ell\,\bigr|}"
-                r"{\bigl|\,K_\ell\,\bigr|}"
-            )
-            st.markdown(
-                "Recall, not raw count, so a logic with many keywords is not "
-                "rewarded merely for having a longer list."
-            )
-            st.markdown(
-                "**Step 3 — normalize to shares and pick a winner.** Same shape "
-                "as the embedding judge, so the two are directly comparable:"
-            )
-            st.latex(
-                r"\sigma_\ell=\frac{r_\ell}{\sum_m r_m},\qquad "
-                r"\hat{\ell}=\arg\max_\ell r_\ell,\qquad "
-                r"\mathrm{overlap}=\sum_\ell \min(\sigma_\ell, w_\ell)"
-            )
-            st.markdown(
-                "**Rows with no overlap at all** — the answer shares not one "
-                "keyword with any logic — are reported separately as "
-                "`no_overlap` and **excluded from the rates** rather than "
-                "forced to a uniform guess."
-            )
-            symbol_glossary([
-                (r"$\ell$", "**a logic** — one of the seven (State, Profession, "
-                            "Market, Corporation, Family, Religion, Community)"),
-                (r"$m$", "*another* logic — a second letter exists only so a "
-                         "formula can hold $\\ell$ fixed while counting across "
-                         "all the others"),
-                (r"$t$", "**a token** — one content word, e.g. `investors`"),
-                (r"$T(x)$", "the **content tokens** of text $x$: lowercased "
-                            "words, minus stopwords and ≤2-character tokens"),
-                (r"$\mathrm{ref}_\ell$", "the **reference answer** written for "
-                                         "logic $\\ell$ for this question"),
-                (r"$\mathrm{df}(t)$", "**document frequency** — how many of "
-                                      "this question's 7 references contain "
-                                      "token $t$"),
-                (r"$\tau$", f"the **df cutoff** (`--max-df`, default "
-                            f"**{ka_mod.KEYWORD_MAX_LOGIC_DF}**): keep a token "
-                            "only if $\\mathrm{df}(t)\\le\\tau$"),
-                (r"$K_\ell$", "logic $\\ell$'s resulting **keyword set**"),
-                (r"$r_\ell$", "**keyword recall** — the share of $K_\\ell$ the "
-                              "answer contains, in $[0,1]$"),
-                (r"$\sigma_\ell$", "the **normalized share** — $r_\\ell$ as a "
-                                   "fraction of all seven, so they sum to 1"),
-                (r"$\hat{\ell}$", "the **predicted logic** (the hat means "
-                                  "*estimated*, vs plain $\\ell$ = any logic)"),
-                (r"$w_\ell$", "the **LLM matcher's weight** for logic $\\ell$ "
-                              "— what this judge is compared against"),
-                *_SET_NOTATION,
-            ], note="In the set-builder braces, the vertical bar reads “such "
-                    "that”, not division.")
-            st.markdown(
-                "**Design decisions**\n"
-                "- *Keywords are derived, not hand-written (v1).* They come "
-                "from the run's own questionnaire snapshot, honoring "
-                "per-question overrides, so they always describe the references "
-                "that actually graded that run. Hand-authored keyword sets can "
-                "replace them later without touching the scoring.\n"
-                "- *Why the distinctiveness filter is load-bearing.* Without "
-                "it, shared framing words would dominate every set and every "
-                "logic would score alike — the filter is what turns reference "
-                "text into a discriminating signal.\n"
-                "- *Its weakness is synonymy, and it is structural.* An answer "
-                "saying \"government\" earns nothing from a reference saying "
-                "\"state\". Misses are therefore common **by construction**; "
-                "this judge is here for transparency and triangulation, not "
-                "accuracy.\n"
-                "- *Why add a third judge at all.* The three fail in different "
-                "ways — the matcher can be swayed by rhetoric, embeddings by "
-                "topical similarity, keywords by wording. Where all three "
-                "agree, the classification is hard to dismiss; where they "
-                "split, the matched-word lists show exactly why."
-            )
-
-        if st.button("Compute keyword agreement",
-                     help="Pure computation over the saved run — no API calls. "
-                          "Recomputing overwrites the previous result.",
-                     key="kw_run_btn"):
-            args = [PYTHON, "scripts/12_run_keyword_agreement.py",
-                    "--run", hal_run]
-            with st.status("Computing keyword agreement…",
-                           expanded=True) as status:
-                rc = stream_subprocess(args, st.empty())
-                status.update(
-                    label=("Keyword agreement complete ✅" if rc == 0
-                           else f"Failed (exit {rc})"),
-                    state="complete" if rc == 0 else "error")
-            st.rerun()
-
-        kw = load_keyword_summary(hal_run)
-        if kw:
-            o = kw["overall"]
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Agreement with matcher",
-                      f"{o['rate']:.0%}" if o.get("rate") is not None else "—",
-                      delta=f"chance {1 / len(LOGICS):.0%}", delta_color="off")
-            m2.metric("Keyword share on matcher's pick",
-                      f"{o.get('mean_share_on_matcher_top', 0):.3f}",
-                      delta=f"chance {kw.get('share_chance_baseline', 1/7):.3f}",
-                      delta_color="off")
-            m3.metric("Distribution overlap",
-                      f"{o.get('mean_overlap', 0):.3f}")
-            m4.metric("No keyword overlap", o.get("n_no_overlap", 0),
-                      help="answers sharing no keyword with ANY logic — "
-                           "excluded from the rates rather than guessed")
-
-            # Head-to-head with the embedding judge when both have been run.
-            if emb and emb["overall"].get("rate") is not None:
-                cmp_rows = []
-                for cat, ks in kw.get("by_category", {}).items():
-                    es = emb.get("by_category", {}).get(cat, {})
-                    if ks.get("rate") is not None and es.get("rate") is not None:
-                        cmp_rows.append({"category": cat,
-                                         "embedding": es["rate"],
-                                         "keyword": ks["rate"]})
-                if cmp_rows:
-                    st.markdown("**The two non-LLM judges, side by side.** They "
-                                "fail differently — where one collapses the "
-                                "other often holds, which is the reason to run "
-                                "both:")
-                    cdf = pd.DataFrame(cmp_rows).melt(
-                        "category", var_name="judge", value_name="rate")
-                    ccht = (
-                        alt.Chart(cdf).mark_bar().encode(
-                            x=alt.X("rate:Q", title="agreement with matcher",
-                                    scale=alt.Scale(domain=[0, 1])),
-                            y=alt.Y("category:N", title=None,
-                                    sort=[c for c in CATEGORIES]),
-                            yOffset=alt.YOffset("judge:N"),
-                            color=alt.Color("judge:N", title="judge"),
-                            tooltip=["category", "judge",
-                                     alt.Tooltip("rate:Q", format=".0%")],
-                        ).properties(height=max(220, 30 * len(cmp_rows)))
-                    )
-                    st.altair_chart(ccht, width="stretch")
-
-            krows = load_keyword_rows(hal_run)
-            if krows is not None and not krows.empty:
-                with st.expander("Matched words behind every verdict",
-                                 expanded=False):
-                    st.caption(
-                        "The whole point of a lexical judge: each verdict is "
-                        "auditable by eye. Pick a row to see which of each "
-                        "logic's keywords the answer actually contained."
-                    )
-                    only_dis = st.checkbox("Only where it disagrees with the "
-                                           "matcher", value=False, key="kw_dis")
-                    kv = krows[krows["agree"] == False] if only_dis else krows  # noqa: E712
-                    st.dataframe(
-                        kv[["org", "source_type", "qid", "matcher_top",
-                            "keyword_top", "agree", "share_on_matcher_top",
-                            "overlap"]].rename(columns={
-                                "matcher_top": "matcher says",
-                                "keyword_top": "keywords say"}),
-                        hide_index=True, width="stretch")
-                    opts = [f"{r['org']} · {r['source_type']} · {r['qid']}"
-                            for _, r in kv.iterrows()]
-                    if opts:
-                        sel = st.selectbox("Inspect a row", opts, key="kw_pick")
-                        r = kv.iloc[opts.index(sel)]
-                        mw = r["matched_words"] or {}
-                        st.markdown(
-                            f"**Matcher:** {r['matcher_top']} "
-                            f"({100 * r['matcher_top_weight']:.0f}%) · "
-                            f"**Keywords:** {r['keyword_top'] or '—'}")
-                        if mw:
-                            st.dataframe(pd.DataFrame(
-                                [{"logic": k,
-                                  "keyword recall": r["keyword_scores"].get(k),
-                                  "matched words": ", ".join(v)}
-                                 for k, v in mw.items()]),
-                                hide_index=True, width="stretch")
-                        else:
-                            st.info("This answer matched no keyword of any "
-                                    "logic (`no_overlap`).")
-
-            kdir = runs.run_dir(hal_run) / "keyword_agreement"
-            d1, d2, d3 = st.columns(3)
-            for col, name, fname in (
-                    (d1, "summary.json", f"keyword_summary_{hal_run}.json"),
-                    (d2, "rows.jsonl", f"keyword_rows_{hal_run}.jsonl"),
-                    (d3, "keywords.json", f"keywords_{hal_run}.json")):
-                if (kdir / name).exists():
-                    col.download_button(name, (kdir / name).read_bytes(),
-                                        file_name=fname, key=f"kw_dl_{name}")
 
 # ---------------------------------------------------------------------------
 # Topics tab — the inductive layer: what the corpus talks about, and how those
