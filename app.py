@@ -43,15 +43,23 @@ from il_rag import (
     keyword_agreement as ka_mod,
     pdf_sources,
     runs,
+    topic_keywords as tk_mod,
     topics as topics_mod,
 )
 from il_rag.config import (
     ARTICLE_PDF_DIR,
+    CALIBRATION_VOCAB_SIZE,
     CHROMA_DIR,
     CHUNK_OVERLAP,
     CHUNK_SIZE,
     COLLECTION_NAME,
     GROUNDING_LOW_THRESHOLD,
+    KEYWORD_MAX_CANDIDATES,
+    KEYWORD_MORPH_MIN_PREFIX,
+    KEYWORD_MORPH_MIN_RATIO,
+    KEYWORD_NULL_DRAWS,
+    KEYWORD_SEMANTIC_MAX_SCORE,
+    KEYWORD_SEMANTIC_MIN_PERCENTILE,
     METAMORPHIC_CONTROLS,
     METAMORPHIC_PARAPHRASES,
     METAMORPHIC_PARAPHRASE_TEMPERATURE,
@@ -463,6 +471,54 @@ def load_quote_spans(run_id: str | None) -> pd.DataFrame | None:
                 except json.JSONDecodeError:
                     continue
     return pd.DataFrame(rows) if rows else None
+
+
+def load_topic_keyword_summary(run_id: str | None) -> dict | None:
+    """The topic-keyword retention summary for a run, if the stage has run."""
+    return tk_mod.load_summary(run_id)
+
+
+def load_topic_keyword_rows(run_id: str | None) -> pd.DataFrame | None:
+    rows = tk_mod.load_rows(run_id)
+    return pd.DataFrame(rows) if rows else None
+
+
+def load_topic_keyword_terms(run_id: str | None) -> pd.DataFrame | None:
+    rows = tk_mod.load_terms(run_id)
+    return pd.DataFrame(rows) if rows else None
+
+
+def lexicon_stamp() -> tuple | None:
+    """(mtime, size) of the calibration file — the cache key for load_lexicon.
+
+    cache_resource survives page reloads for the life of the server process,
+    and `calibrate` is run from a terminal WHILE the app is open. Without a
+    stamp the page would go on insisting there is no calibration long after
+    one exists (and would keep serving the old grid after a recalibration).
+    """
+    path = tk_mod.LEXICON_DIR / tk_mod.CALIBRATION_NAME
+    if not path.exists():
+        return None
+    info = path.stat()
+    return (info.st_mtime_ns, info.st_size)
+
+
+@st.cache_resource(show_spinner=False)
+def load_lexicon(stamp: tuple | None):
+    """(WordVectors, Calibration) over data/lexicon/, or (None, None).
+
+    cache_resource rather than cache_data: this holds a live numpy matrix of a
+    few thousand word vectors, not a small serializable payload. readonly=True
+    so the app can never spend an embedding call or rewrite the cache — only
+    the CLI stage is allowed to do either. `stamp` is not read; it exists to
+    key the cache (see lexicon_stamp).
+    """
+    if stamp is None:
+        return None, None
+    cal = tk_mod.Calibration.load()
+    if cal is None:
+        return None, None
+    return tk_mod.WordVectors(readonly=True), cal
 
 
 # ---------------------------------------------------------------------------
@@ -4059,6 +4115,594 @@ with tab_topics:
                 st.success("Every topic was reached by at least one question.")
 
             st.caption(xtab.get("note", ""))
+
+        # --- Keyword retention: the semantic keyword matcher ---------------
+        # Sits outside the cross-tab branch on purpose: it needs `tinfo` and a
+        # run, not `topic_logic.json`, and must not vanish when that is absent.
+        st.subheader("Keyword retention — does a topic's vocabulary reach the answers?")
+        st.caption(
+            "The keywords above are BERTopic's description of each topic. This "
+            "section scores them: when the pipeline answered a question from "
+            "evidence belonging to a topic, how much of that topic's vocabulary "
+            "actually made it into the answer — **verbatim**, as an "
+            "**inflection**, as a **semantic neighbour**, or not at all. It is "
+            "the graded counterpart of the exact-match keyword judge on the "
+            "Results tab, which by construction cannot see synonymy."
+        )
+
+        with st.expander("ℹ️ How keyword retention is scored", expanded=False):
+            st.markdown(
+                "Implemented in `il_rag/topic_keywords.py`. Same shape as the "
+                "quote-provenance ladder: four rungs, cheapest first, and the "
+                "**first rung to clear its bar wins**."
+            )
+            st.markdown(
+                "**Rung 1 — exact.** The keyword occurs as a whole token. A "
+                "bigram (*export controls*) must occur **adjacently**, because "
+                "adjacency is what makes it the phrase; if only its words "
+                "appear, the phrase takes the **weaker** of the two and is "
+                "capped one rung down.\n\n"
+                "**Rung 2 — morphological.** Some answer word shares its stem "
+                "(*managers*, *managerial*, *management* for *manager*). Two "
+                "conditions, both required: a shared leading stem of at least "
+                f"**{KEYWORD_MORPH_MIN_PREFIX}** characters *and* a character "
+                f"similarity of at least **{KEYWORD_MORPH_MIN_RATIO}**. Neither "
+                "alone is safe — the prefix rule on its own accepts "
+                "*manage*/*mandate*.\n\n"
+                "**Rung 3 — semantic.** Some answer word is closer to the "
+                "keyword than $\\tau_{\\text{sem}}$ of random corpus word "
+                "pairs. This is the rung the feature exists for.\n\n"
+                "**Rung 4 — absent.** Nothing cleared a bar. The best near-miss "
+                "percentile is still recorded, so *nowhere close* is "
+                "distinguishable from *just under the bar*."
+            )
+            st.latex(
+                r"S(\kappa, a)=\begin{cases}"
+                r"1.0 & \kappa \sqsubseteq_{\text{tok}} a \\[4pt]"
+                r"\mathrm{ratio}(\kappa, w) & \exists\, w \in W(a):\ "
+                r"\mathrm{pre}(\kappa,w)\ge p^{*}\ \wedge\ "
+                r"\mathrm{ratio}(\kappa,w)\ge \tau_{\text{morph}} \\[4pt]"
+                r"\min\bigl(\pi(\cos(\kappa,w^{*})),\, \sigma_{\max}\bigr) & "
+                r"\pi(\cos(\kappa,w^{*})) \ge \tau_{\text{sem}},\ \ "
+                r"w^{*}=\arg\max_{w \in C(a)} \cos(\kappa, w) \\[4pt]"
+                r"0 & \text{otherwise}"
+                r"\end{cases}"
+            )
+            st.markdown(
+                "**Why a raw cosine is not a percentage here.** `config.py` "
+                "records the measurement that forces this design: on this "
+                "stack a faithful reword scored **0.849** while a wholly "
+                "unrelated claim scored **0.807** — 0.04 apart. Single *words* "
+                "are worse; this corpus's whole vocabulary sits in a band "
+                "roughly 0.74–0.82 wide. So the semantic rung reports a "
+                "**percentile** against the cosines of every pair of the "
+                "corpus's most frequent words:"
+            )
+            st.latex(
+                r"\pi(x)\;=\;\frac{\bigl|\{\,g \in G\ :\ g \le x\,\}\bigr|}{|G|}"
+                r"\qquad "
+                r"G=\Bigl\{\cos(u,v)\ :\ \{u,v\}\subset V,\ u\neq v\Bigr\}"
+            )
+            st.markdown(
+                "That also disposes of the obvious objection. The corpus is "
+                "entirely about AI labs, so *manager*/*sales* genuinely **is** "
+                "fairly close in absolute cosine — but it is a *typical* pair "
+                "here and lands near the background median, while "
+                "*manager*/*hierarchy* lands in the tail. Calibrating against "
+                "**this** corpus is what turns "
+                f"$\\tau_{{\\text{{sem}}}}={KEYWORD_SEMANTIC_MIN_PERCENTILE}$ "
+                "into a selective test instead of a rubber stamp. The "
+                "explorer at the bottom of this page shows the effect directly."
+            )
+            st.markdown(
+                "**Rolling up.** A row's keywords are the union over the topics "
+                "of the chunks it was answered from. Retention is the mean "
+                "score; the per-topic figure weights each answered row equally, "
+                "so a heavily-retrieved topic cannot dominate its own average:"
+            )
+            st.latex(
+                r"V_i=\frac{1}{|K(i)|}\sum_{\kappa \in K(i)} S(\kappa, a_i)"
+                r"\qquad "
+                r"V_k=\frac{1}{|A_k|}\sum_{i \in A_k}\frac{1}{|K_k|}"
+                r"\sum_{\kappa \in K_k} S(\kappa, a_i)"
+            )
+            st.markdown(
+                "**Semantic lift** is the headline — the part of retention an "
+                "exact-match judge is blind to — and the two reference arms are "
+                "what give a retention figure a referent at all:"
+            )
+            st.latex(
+                r"L_i = V_i - \sigma^{\text{exact}}_i"
+                r"\qquad\qquad "
+                r"N_i \;\le\; V_i \;\le\; C_i"
+            )
+            st.markdown(
+                "$C_i$ is the same keywords, **exact rung only, against the "
+                "retrieved chunks**. Keywords are derived *from* those chunks "
+                "by c-TF-IDF, so it runs high by construction — it is the "
+                "circularity concern stated as a number rather than caveated "
+                f"away. $N_i$ is the full ladder against **{KEYWORD_NULL_DRAWS} "
+                "topics the row never retrieved**. If $V_i$ sits at $N_i$, the "
+                "answers carry no more of the topic's vocabulary than a random "
+                "topic's — and that is the finding."
+            )
+            symbol_glossary([
+                (r"$\kappa$", "**a topic keyword** — one c-TF-IDF term, "
+                              "unigram or bigram"),
+                (r"$a_i$", "the **RAG answer** of row $i$"),
+                (r"$W(a)$", "every **word** in the answer, unfiltered — a "
+                            "literal hit is a literal hit, so two-character "
+                            "keywords and stopwords are matchable here"),
+                (r"$C(a)$", "the answer's **candidate words** for the semantic "
+                            "rung: content words only, ranked by frequency, "
+                            f"capped at **{KEYWORD_MAX_CANDIDATES}**"),
+                (r"$\sqsubseteq_{\text{tok}}$", "**occurs as a whole token** "
+                                                "(for a bigram: as two "
+                                                "adjacent tokens)"),
+                (r"$\mathrm{pre}(\kappa,w)$", "the length of their **shared "
+                                              "leading stem**, in characters"),
+                (r"$p^{*}$", f"the **stem bar** — {KEYWORD_MORPH_MIN_PREFIX} "
+                             "characters, or the length of the shorter word "
+                             "if that is less"),
+                (r"$\mathrm{ratio}$", "**character similarity** in $[0,1]$ "
+                                      "(difflib)"),
+                (r"$\tau_{\text{morph}}$", f"the **morphological bar**: "
+                                           f"**{KEYWORD_MORPH_MIN_RATIO}**"),
+                (r"$\cos(u,v)$", "**cosine similarity** of two word vectors"),
+                (r"$\pi(x)$", "the **percentile** of cosine $x$ in the corpus "
+                              "background distribution — *not* a similarity"),
+                (r"$G$", "the **background**: the cosine of every pair of "
+                         "corpus vocabulary words"),
+                (r"$V$", f"the **vocabulary** the background is built from — "
+                         f"the corpus's {CALIBRATION_VOCAB_SIZE} most frequent "
+                         "content words"),
+                (r"$\tau_{\text{sem}}$", "the **semantic bar**: "
+                                         f"**{KEYWORD_SEMANTIC_MIN_PERCENTILE}"
+                                         "**, i.e. *closer than 90% of random "
+                                         "corpus word pairs*"),
+                (r"$\sigma_{\max}$", "the **synonym cap**: "
+                                     f"**{KEYWORD_SEMANTIC_MAX_SCORE}**. A "
+                                     "neighbour never scores a full 100% — "
+                                     "that is reserved for a literal "
+                                     "occurrence"),
+                (r"$K_k$", "topic $k$'s **keyword set** (its c-TF-IDF terms)"),
+                (r"$K(i)$", "the **union** of the keyword sets of the topics "
+                            "row $i$'s evidence belonged to"),
+                (r"$A_k$", "the **answered rows** that retrieved evidence from "
+                           "topic $k$"),
+                (r"$V_i,\;V_k$", "**retention** — per row, and per topic"),
+                (r"$\sigma^{\text{exact}}_i$", "the share of row $i$'s "
+                                               "keywords matched **verbatim**"),
+                (r"$L_i$", "**semantic lift** — the part of retention an "
+                           "exact-match judge cannot see"),
+                (r"$C_i$", "the **verbatim ceiling**: the same keywords "
+                           "against the chunks they were derived from"),
+                (r"$N_i$", "the **null floor**: the same ladder against topics "
+                           "the row never retrieved"),
+                *_SET_NOTATION,
+            ], note="$w^{*}$ is the answer word that produced the match — the "
+                    "star means *the one that won*, not a footnote. It is "
+                    "stored with every verdict, which is why the drill-down "
+                    "can show you which word did it.")
+            st.markdown(
+                "**Design decisions**\n"
+                "- *Why percentile, not raw cosine.* See the 0.849/0.807 "
+                "measurement above. The band e5 puts single words in is too "
+                "tight to gate on, and far too tight to render as a "
+                "percentage.\n"
+                "- *Why the rungs short-circuit.* A keyword is never graded by "
+                "a more expensive test than it needs, and a machine with no "
+                "calibration on disk still gets the two lexical rungs rather "
+                "than nothing.\n"
+                "- *Why the weaker part carries a split bigram.* “export "
+                "controls” is present only to the extent that **both** "
+                "concepts are; a mean would let *controls* alone carry it.\n"
+                "- *Why the maximum over candidate words.* The grounding "
+                "check's argument: one genuinely relevant hit is enough, and a "
+                "strong hit must not be diluted by unrelated siblings.\n"
+                "- *Why the ceiling and floor arms exist.* A retention figure "
+                "with no referent is not a finding. The ceiling states the "
+                "circularity out loud; the floor is the noise level, the same "
+                "role the metamorphic control arm plays for flip rates.\n"
+                "- *Why this does not replace the keyword judge on the Results "
+                "tab.* Different keywords (topic c-TF-IDF vs per-logic "
+                "reference), different target (answers vs logic "
+                "classification), different question. That judge stays exactly "
+                "as it is — the value of a blunt, fully visible baseline is "
+                "that it is blunt."
+            )
+            st.markdown(
+                "**Limitations, stated plainly**\n"
+                "1. **Circularity.** Topic keywords are derived *from* the "
+                "corpus chunks, so scoring them against those same chunks is "
+                "near-tautological — which is what the ceiling arm measures "
+                "and why it is shown rather than hidden. The non-trivial "
+                "comparison is against the **answers**.\n"
+                "2. **These vectors capture topical relatedness, not "
+                "synonymy.** *manager* and *hierarchy* are related, not "
+                "synonyms. Antonyms embed close together (*permit* / "
+                "*prohibit*), so a high semantic score can mean the answer "
+                "discusses the concept **and takes the opposite position**. "
+                "Read the matched word, never the score alone.\n"
+                "3. **Percentiles are readable, not absolute** — a rank within "
+                "*this* corpus under *this* embedding model. Both are recorded "
+                "in `calibration.json`.\n"
+                "4. **The keyword sets are vectorizer artifacts**: ten "
+                "c-TF-IDF terms under one particular set of settings. "
+                "Changing how many keywords are stored changes every figure "
+                "here.\n"
+                "5. **The morphological rung is a prefix heuristic, not a "
+                "stemmer.** It over-fires on *policy*/*police* and under-fires "
+                "on *good*/*better*. It never fabricates — the matched surface "
+                "form is always shown.\n"
+                "6. **Per-row retention is noisy** (ten keywords against one "
+                "answer). Read the per-topic rollup.\n"
+                "7. **Attribution inherits the cross-tab's imprecision**: a "
+                "row's topics are the topics of *all* its retrieved chunks, "
+                "including ones the answer legitimately ignored.\n"
+                "8. **Every keyword counts equally.** c-TF-IDF already "
+                "filtered for distinctiveness once; weighting again would "
+                "double-count it."
+            )
+
+        lex_vectors, lex_cal = load_lexicon(lexicon_stamp())
+        if lex_cal is None:
+            st.warning(
+                "No percentile calibration on disk, so the **semantic rung is "
+                "disabled** — only verbatim and morphological matches can be "
+                "scored. A raw cosine is deliberately not used as a fallback: "
+                "shown as a percentage it would misrepresent the whole "
+                "measure. Build the calibration locally (one time, a few "
+                "hundred embedded words, then free forever):\n\n"
+                "```bash\n"
+                ".venv/bin/python scripts/13_run_topic_keywords.py calibrate\n"
+                "```\n"
+                "Then ship `data/lexicon/` alongside `data/topics/`.",
+                icon="📐")
+        else:
+            cm = lex_cal.meta
+            st.caption(
+                f"Calibrated {cm.get('built_at', '?')} on "
+                f"{cm.get('vocab_size', '?'):,} corpus words "
+                f"({cm.get('n_pairs', 0):,} word pairs) with "
+                f"`{cm.get('embedding_model', '?')}`. Median pair cosine "
+                f"**{cm.get('cos_p50', '?')}**, 99th percentile "
+                f"**{cm.get('cos_p99', '?')}** — that narrow band is what the "
+                "percentile scale is stretching out."
+            )
+
+        if topic_run:
+            if st.button(
+                    "Compute topic vocabulary retention",
+                    key="tk_run_btn",
+                    help="Unlike the other buttons on this page, this one "
+                         "COSTS: it embeds any answer word not already in "
+                         "data/lexicon/ — a few hundred words the first time, "
+                         "and ~0 on a rerun, because the cache is append-only. "
+                         "Recomputing overwrites the previous result."):
+                args = [PYTHON, "scripts/13_run_topic_keywords.py", "score",
+                        "--run", topic_run]
+                with st.status("Scoring topic vocabulary…", expanded=True) as status:
+                    rc = stream_subprocess(args, st.empty())
+                    status.update(
+                        label=("Keyword retention complete ✅" if rc == 0
+                               else f"Failed (exit {rc})"),
+                        state="complete" if rc == 0 else "error")
+                st.rerun()
+
+        tks = load_topic_keyword_summary(topic_run)
+        if tks is None:
+            st.caption("Not computed for this run yet — use the button above.")
+        elif not tks["overall"].get("n_scored"):
+            st.warning(
+                "No answered row retrieved evidence from a **clustered** "
+                "topic. Every retrieval landed either in the outlier topic "
+                "($-1$) or on chunk ids missing from the topic map — which is "
+                "what a reingest after fitting does, since chunk ids are "
+                "re-minted. Refit topics against the current index:\n\n"
+                "```bash\n"
+                ".venv/bin/python scripts/07_run_topics.py fit\n"
+                "```", icon="🧭")
+        else:
+            o = tks["overall"]
+            if not tks.get("calibrated"):
+                st.info(
+                    "This run was scored **without** the semantic rung, so "
+                    "retention below is verbatim + morphological only. "
+                    "Calibrate and recompute to see the semantic lift.",
+                    icon="⚠️")
+
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("Vocabulary retention",
+                      f"{o['mean_retention']:.0%}",
+                      delta=(f"null floor {o['mean_retention_null']:.0%}"
+                             if o.get("mean_retention_null") is not None
+                             else None),
+                      delta_color="off",
+                      help="mean score of a topic's keywords against the "
+                           "answers grounded in that topic")
+            k2.metric("Verbatim only", f"{o['mean_verbatim_share']:.0%}",
+                      help="what an exact-match judge would see on its own")
+            k3.metric("Semantic lift", f"{o['mean_semantic_lift']:.0%}",
+                      help="the part this matcher adds — inflections and "
+                           "neighbours the exact judge is blind to. The "
+                           "headline number for this section.")
+            k4.metric("Verbatim ceiling",
+                      (f"{o['mean_verbatim_ceiling']:.0%}"
+                       if o.get("mean_verbatim_ceiling") is not None else "—"),
+                      help="the same keywords against the chunks they were "
+                           "DERIVED from — the circularity baseline, not an "
+                           "achievement")
+
+            # Floor / measurement / ceiling, so "is this better than chance?"
+            # is answerable at a glance.
+            arms = [{"arm": "null floor", "value": o.get("mean_retention_null")},
+                    {"arm": "retention", "value": o.get("mean_retention")},
+                    {"arm": "verbatim ceiling", "value": o.get("mean_verbatim_ceiling")}]
+            arms = [a for a in arms if a["value"] is not None]
+            if len(arms) > 1:
+                st.altair_chart(
+                    alt.Chart(pd.DataFrame(arms)).mark_bar().encode(
+                        x=alt.X("value:Q", title=None,
+                                scale=alt.Scale(domain=[0, 1]),
+                                axis=alt.Axis(format="%")),
+                        y=alt.Y("arm:N", title=None,
+                                sort=["null floor", "retention",
+                                      "verbatim ceiling"]),
+                        color=alt.Color(
+                            "arm:N", legend=None,
+                            scale=alt.Scale(
+                                domain=["null floor", "retention",
+                                        "verbatim ceiling"],
+                                range=[BUCKET_COLORS[2], BUCKET_COLORS[1],
+                                       "#9E9E9E"])),
+                        tooltip=["arm", alt.Tooltip("value:Q", format=".1%")],
+                    ).properties(height=120),
+                    width="stretch")
+                st.caption(
+                    "Read left to right. Retention sitting on the floor means "
+                    "the answers carry no more of the topic's vocabulary than "
+                    "a random topic's; sitting near the ceiling means they "
+                    "carry nearly everything the evidence itself contained."
+                )
+
+            tk_rows = load_topic_keyword_rows(topic_run)
+            tk_terms = load_topic_keyword_terms(topic_run)
+
+            # Tier histogram over every scored keyword instance.
+            if tk_terms is not None and not tk_terms.empty:
+                tier_counts = {t: 0 for t in tk_mod.TIERS}
+                for d in tk_terms["tiers"]:
+                    for t, n in (d or {}).items():
+                        tier_counts[t] = tier_counts.get(t, 0) + int(n)
+                st.altair_chart(
+                    alt.Chart(pd.DataFrame(
+                        [{"tier": t, "n": n} for t, n in tier_counts.items()]
+                    )).mark_bar().encode(
+                        x=alt.X("n:Q", title="keyword × answer pairs"),
+                        y=alt.Y("tier:N", title=None, sort=list(tk_mod.TIERS)),
+                        tooltip=["tier", "n"],
+                    ).properties(height=140),
+                    width="stretch")
+
+            # Per-topic composition.
+            by_topic = [t for t in tks.get("by_topic", []) if t.get("n_rows")]
+            if by_topic:
+                st.markdown("**Where the vocabulary survives, and where it drops**")
+                min_rows = st.slider(
+                    "Minimum answered rows", 1,
+                    max(2, max(t["n_rows"] for t in by_topic)), 1,
+                    key="tk_min_rows",
+                    help="topics reached by fewer answers than this are hidden "
+                         "— a one-row topic average is not a measurement")
+                shown = [t for t in by_topic if t["n_rows"] >= min_rows]
+                if not shown:
+                    st.warning("No topic meets that threshold.")
+                else:
+                    labels = [f"{t['topic']}: {str(t['label'])[:34]}" for t in shown]
+                    heat = pd.DataFrame([
+                        {"topic": f"{t['topic']}: {str(t['label'])[:34]}",
+                         "tier": tier,
+                         "share": t.get(col) or 0.0,
+                         "rows": t["n_rows"]}
+                        for t in shown
+                        for tier, col in (("exact", "verbatim_share"),
+                                          ("morphological", "morph_share"),
+                                          ("semantic", "semantic_share"),
+                                          ("absent", "dropped_share"))
+                    ])
+                    st.altair_chart(
+                        alt.Chart(heat).mark_rect().encode(
+                            x=alt.X("tier:N", sort=list(tk_mod.TIERS), title=None),
+                            y=alt.Y("topic:N", title=None, sort=labels),
+                            color=alt.Color("share:Q", title="share of keywords",
+                                            scale=alt.Scale(scheme="blues")),
+                            tooltip=["topic", "tier",
+                                     alt.Tooltip("share:Q", format=".0%"),
+                                     "rows"],
+                        ).properties(height=min(26 * len(shown) + 40, 900)),
+                        width="stretch")
+                    st.caption(
+                        "Read a row, not a column: each row sums to 100% of "
+                        "that topic's keywords. A row weighted toward "
+                        "`absent` is a topic whose distinctive vocabulary the "
+                        "answers do not carry, in any form."
+                    )
+
+                dropped = sorted(shown, key=lambda t: -(t.get("dropped_share") or 0))
+                worst = dropped[0] if dropped else None
+                if worst and (worst.get("dropped_share") or 0) > 0.75:
+                    st.warning(
+                        f"Topic **{worst['topic']}** "
+                        f"({str(worst['label'])[:60]}) loses "
+                        f"{worst['dropped_share']:.0%} of its vocabulary: the "
+                        "answers grounded in it do not carry those words "
+                        "verbatim, as inflections, or as neighbours. Worth "
+                        "reading a few of those answers directly.", icon="🕳️")
+                elif worst:
+                    st.success(
+                        "No topic loses more than three quarters of its "
+                        "vocabulary — every topic's distinctive words reach "
+                        "the answers in some form.")
+
+            # Per-keyword drill-down: the audit trail.
+            if tk_terms is not None and not tk_terms.empty:
+                with st.expander("Every keyword's verdict, and the word that "
+                                 "produced it", expanded=False):
+                    st.caption(
+                        "The point of a graded matcher is that each score is "
+                        "checkable. Pick a topic to see how each of its "
+                        "keywords fared, then a keyword to see the exact "
+                        "answer word that matched it."
+                    )
+                    topic_opts = sorted({int(t) for t in tk_terms["topic"]})
+                    label_by_topic = {int(r["topic"]): str(r["label"])
+                                      for _, r in tk_terms.iterrows()}
+                    sel_topic = st.selectbox(
+                        "Topic", topic_opts, key="tk_topic_pick",
+                        format_func=lambda t: f"{t}: {label_by_topic.get(t, '')[:50]}")
+                    tv = tk_terms[tk_terms["topic"] == sel_topic].copy()
+                    tv["exact"] = [d.get("exact", 0) for d in tv["tiers"]]
+                    tv["morph"] = [d.get("morphological", 0) for d in tv["tiers"]]
+                    tv["semantic"] = [d.get("semantic", 0) for d in tv["tiers"]]
+                    tv["absent"] = [d.get("absent", 0) for d in tv["tiers"]]
+                    tv["top matches"] = [
+                        ", ".join(f"{w} ({n})" for w, n in (m or []))
+                        for m in tv["top_matches"]]
+                    st.dataframe(
+                        tv[["keyword", "retention", "exact", "morph",
+                            "semantic", "absent", "top matches", "n_rows"]],
+                        hide_index=True, width="stretch")
+
+                    if tk_rows is not None and not tk_rows.empty:
+                        kw_opts = list(tv["keyword"])
+                        sel_kw = st.selectbox("Keyword", kw_opts, key="tk_kw_pick")
+                        detail = []
+                        for _, r in tk_rows.iterrows():
+                            for k in (r.get("keywords") or []):
+                                if k["topic"] == sel_topic and k["keyword"] == sel_kw:
+                                    detail.append({
+                                        "org": r["org"],
+                                        "source_type": r["source_type"],
+                                        "qid": r["qid"],
+                                        "tier": k["tier"],
+                                        "score": k["score"],
+                                        "matched": _present(k["matched"]) or "—",
+                                        "rule": _present(k["rule"]) or "—",
+                                        # null for exact/morph matches; without
+                                        # _present pandas renders literal "nan"
+                                        "cosine": _present(k["cosine"]) or "—",
+                                        "near miss": _present(
+                                            k.get("near_miss")) or "—",
+                                    })
+                        if detail:
+                            st.dataframe(pd.DataFrame(detail), hide_index=True,
+                                         width="stretch")
+                            st.caption(
+                                f"Every row is one answer graded against "
+                                f"`{sel_kw}`. Where `tier` is *semantic*, "
+                                "`matched` is the answer word that earned the "
+                                "score — read it before trusting the number: "
+                                "these vectors capture relatedness, and an "
+                                "antonym is closely related. Where `tier` is "
+                                "*absent* the score is **0** — a keyword that "
+                                "cleared no bar earns nothing — and `near "
+                                "miss` says how close it came, which is what "
+                                "you would retune the bar against."
+                            )
+
+            kdir = runs.run_dir(topic_run) / tk_mod.OUT_DIR_NAME
+            d1, d2, d3 = st.columns(3)
+            for col, name in ((d1, "summary.json"), (d2, "rows.jsonl"),
+                              (d3, "terms.jsonl")):
+                if (kdir / name).exists():
+                    col.download_button(
+                        name, (kdir / name).read_bytes(),
+                        file_name=f"topic_keywords_{name.split('.')[0]}_"
+                                  f"{topic_run}.{name.split('.')[-1]}",
+                        key=f"tk_dl_{name}")
+
+            st.caption(tks.get("note", ""))
+
+        # --- Keyword neighborhood explorer --------------------------------
+        # Depends only on the lexicon: no run, no cross-tab, no API key. This
+        # is the interpretability proof — it is where the percentile scale
+        # visibly earns its place against the raw cosine it is derived from.
+        st.subheader("Keyword neighborhood explorer")
+        if lex_cal is None or lex_vectors is None:
+            st.info(
+                "The explorer reads `data/lexicon/`, which is built by the "
+                "`calibrate` command above. Once it exists, pick any topic "
+                "keyword here and see its nearest corpus words with calibrated "
+                "scores — no API calls, because every vector is already "
+                "cached.", icon="🔎")
+        else:
+            st.caption(
+                "Pick a keyword and see what the corpus considers close to it. "
+                "This is the check on everything above: the **percentile** "
+                "column should separate words that a **raw cosine** barely "
+                "distinguishes."
+            )
+            all_kw = sorted({k for r in tinfo["topics"] if not r["is_outlier"]
+                             for k in r.get("keywords", [])})
+            c_pick, c_free = st.columns([2, 2])
+            picked = c_pick.selectbox(
+                "A topic keyword", all_kw,
+                index=(all_kw.index("manager") if "manager" in all_kw else 0),
+                key="tk_nb_pick") if all_kw else None
+            typed = c_free.text_input("…or any corpus word", value="",
+                                      key="tk_nb_free").strip().lower()
+            query = typed or picked
+            top_n = st.slider("Neighbours to show", 5, 50, 25, key="tk_nb_n")
+
+            # Bigram keywords are not single vectors; score their head word.
+            probe = (query or "").split()[-1] if query else ""
+            nbrs = tk_mod.neighbors(probe, vectors=lex_vectors,
+                                    calibration=lex_cal, top_n=top_n) if probe else []
+            if not nbrs:
+                st.info(
+                    f"`{probe or '—'}` is not in the cached lexicon (the "
+                    f"{lex_cal.meta.get('vocab_size', '?')} most frequent "
+                    "corpus content words). The explorer never embeds on "
+                    "demand — it is read-only over the cache.", icon="🔎")
+            else:
+                ndf = pd.DataFrame(nbrs)
+                st.altair_chart(
+                    alt.Chart(ndf).mark_bar().encode(
+                        x=alt.X("percentile:Q", title="calibrated closeness",
+                                scale=alt.Scale(domain=[0, 1]),
+                                axis=alt.Axis(format="%")),
+                        y=alt.Y("word:N", title=None,
+                                sort=list(ndf["word"])),
+                        color=alt.Color("tier:N", title="how the ladder would "
+                                                        "treat it",
+                                        scale=alt.Scale(
+                                            domain=list(tk_mod.TIERS))),
+                        tooltip=["word", alt.Tooltip("cosine:Q", format=".4f"),
+                                 alt.Tooltip("percentile:Q", format=".1%"),
+                                 "tier", "df"],
+                    ).properties(height=min(22 * len(ndf) + 40, 900)),
+                    width="stretch")
+                band = float(ndf["cosine"].max() - ndf["cosine"].min())
+                st.caption(
+                    f"These {len(ndf)} neighbours span a raw cosine range of "
+                    f"just **{band:.4f}** (from {ndf['cosine'].min():.4f} to "
+                    f"{ndf['cosine'].max():.4f}), while the percentile axis "
+                    f"spreads them across "
+                    f"{(ndf['percentile'].max() - ndf['percentile'].min()):.0%}. "
+                    "That gap is the entire argument for calibrating: the raw "
+                    "numbers are not a scale anyone could read."
+                )
+                st.dataframe(
+                    ndf[["word", "cosine", "percentile", "tier", "df"]],
+                    hide_index=True, width="stretch")
+                st.caption(
+                    "`exact` is the word itself, `morphological` an "
+                    "inflection, `semantic` a different word the corpus places "
+                    "nearby. A neighbour being close does **not** mean it "
+                    "means the same thing — antonyms are close too."
+                )
+
 
 
 # ---------------------------------------------------------------------------

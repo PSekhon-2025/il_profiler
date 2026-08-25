@@ -98,23 +98,37 @@ pulls UMAP/HDBSCAN/scikit-learn, and UMAP on 15.5k × 1024 vectors peaks well
 above this machine's 1 GB. Only the small JSON results are shipped; the app
 reads them and never imports BERTopic.
 
+The Topics tab's **keyword retention** section (§9.6) adds a second local-only
+artifact, `data/lexicon/`: the cached word vectors and the word-pair
+calibration that turns a raw cosine into a readable percentile. It is built from
+the Chroma index and costs a few hundred embedding calls once. It is *read-only*
+in the container — the app never embeds on demand — so the neighborhood explorer
+works there with no API key at all.
+
 ```bash
 # local, one-off (needs: pip install -r requirements-topics.txt)
 python scripts/07_run_topics.py fit
 python scripts/07_run_topics.py crosstab --run <run_id>
 
-# ship the results (~75 KB) to the volume
+# local, one-off: the word-pair calibration behind the keyword-retention scores
+python scripts/13_run_topic_keywords.py calibrate
+python scripts/13_run_topic_keywords.py score --run <run_id>
+
+# ship the results (~8 MB, nearly all of it word_vectors.npz) to the volume
 RUN=<run_id>
-tar czf /tmp/topics_payload.tgz data/topics "data/profiles/runs/$RUN/topics"
+tar czf /tmp/topics_payload.tgz data/topics data/lexicon     "data/profiles/runs/$RUN/topics" "data/profiles/runs/$RUN/topic_keywords"
 fly sftp put /tmp/topics_payload.tgz /app/topics_payload.tgz
 fly ssh console -C "sh -c 'cd /app && tar xzf topics_payload.tgz && rm topics_payload.tgz'"
 fly apps restart il-profiler
 ```
 
-The payload contains chunk **ids**, topic keywords and aggregate percentages —
-no article text — so it carries none of the corpus's copyright exposure.
-Re-fit and re-ship whenever the index is rebuilt, since topics are keyed to
-chunk ids.
+The payload contains chunk **ids**, topic keywords, single-word vectors and
+aggregate percentages — no article text — so it carries none of the corpus's
+copyright exposure. Re-fit and re-ship whenever the index is rebuilt, since
+topics are keyed to chunk ids; re-run `calibrate` too, since the background
+distribution is a property of the corpus vocabulary. If `data/lexicon/` is
+absent the app degrades cleanly: the semantic rung is disabled and the page says
+so, rather than falling back to an uncalibrated cosine.
 
 ## Shipping the source documents (so `[excerpt N]` links work)
 

@@ -351,6 +351,43 @@ against retrieved evidence rather than its surface string follows FActScore
 ([Min et al., 2023](https://aclanthology.org/2023.emnlp-main.741/)). Full
 derivation and reference list in ARCHITECTURE.md §9.5.
 
+### 2c. Topic-keyword retention — `scripts/13_run_topic_keywords.py`
+
+*On the **Topics** tab, not the Hallucination tab.* Takes BERTopic's per-topic
+keywords and asks how much of each topic's vocabulary reaches the answers
+grounded in that topic. Same idea as 2b, applied to keywords instead of quotes:
+where `12_run_keyword_agreement.py` asks "does the answer contain this keyword,
+yes/no", this grades the "no" on a distance ladder — **exact** (1.00) →
+**morphological** (an inflection) → **semantic** (a neighbour, scored by how
+close) → **absent** (0).
+
+A raw cosine cannot be shown as a "% match" here: e5 compresses single-word
+similarity into a band roughly 0.74–0.82 wide (the same effect measured in
+`config.py` for sentences). So the semantic rung reports a **percentile against
+the cosines of every pair of the corpus's own frequent words** — which is also
+what makes the bar selective, since in an AI-lab corpus *manager*/*sales* is a
+typical pair while *manager*/*hierarchy* is a tail one.
+
+```bash
+# once per corpus: the background distribution (needs the Chroma index)
+python scripts/13_run_topic_keywords.py calibrate
+
+# per run (needs a fitted topic model — see scripts/07_run_topics.py fit)
+python scripts/13_run_topic_keywords.py score --run <run_id>
+python scripts/13_run_topic_keywords.py score --no-embeddings   # lexical only, free
+
+# the quickest sanity check that calibration is working
+python scripts/13_run_topic_keywords.py neighbors manager --top 25
+```
+
+Word vectors are cached in `data/lexicon/` and the cache is append-only, so a
+first run embeds a few hundred words and every rerun embeds none. Without the
+calibration the semantic rung is disabled rather than falling back to a raw
+cosine. Reported alongside a **verbatim ceiling** (the same keywords against the
+chunks they were derived from — the circularity baseline) and a **null floor**
+(the ladder against topics the row never retrieved). Full write-up:
+ARCHITECTURE.md §9.6.
+
 ### 3. Metamorphic stability & evidence sensitivity — `scripts/03_run_metamorphic_eval.py`
 
 ```bash
@@ -553,6 +590,10 @@ il_rag/
   metamorphic.py      opt-in: control / paraphrase / ablation / distractor eval
   embedding_agreement.py  opt-in: non-LLM second judge (binary + graded)
   quote_provenance.py opt-in: graded quote provenance x veracity (2x2 verdict)
+  topics.py           LOCAL: inductive BERTopic layer + topic x logic cross-tab
+  keyword_agreement.py    opt-in: exact-match lexical third judge
+  topic_keywords.py   opt-in: graded topic-keyword distance ladder (exact ->
+                      inflection -> semantic neighbour), on the Topics tab
   pdf_sources.py      opt-in: resolve a chunk back to its source PDF, so the
                       audit trail's [excerpt N] citations become links
   article_pdfs.py     LOCAL: split the RTF press dumps into one PDF per record
@@ -567,11 +608,18 @@ scripts/
   04_run_embedding_agreement.py  stage 4 (optional): embedding second judge
   05_run_bootstrap_ci.py      stage 5 (optional): bootstrap error bars
   06_run_quote_provenance.py  stage 6 (optional): graded quote provenance
+  07_run_topics.py            stage 7 (optional, local): fit topics + cross-tab
+  08_run_replicates.py        stage 8 (optional): repeated-run variance
   09_build_pdf_pages.py       stage 9 (optional, local): chunk -> PDF page map
   10_build_article_pdfs.py    stage 10 (optional, local): RTF dumps -> one PDF
                               per press record, + the chunk -> article map
+  11_bundle_cloud_sources.py  stage 11 (local): bundle sources for deploy
+  12_run_keyword_agreement.py stage 12 (optional): exact-match keyword judge
+  13_run_topic_keywords.py    stage 13 (optional): topic-keyword retention +
+                              the word-pair calibration it scores against
 tests/                offline unit tests (pytest; all API calls stubbed)
-app.py                Streamlit GUI (Run / Results / Audit / Hallucination / Compare)
+app.py                Streamlit GUI (Run / Results / Audit / Hallucination /
+                      Topics / Analyse a document / Compare runs)
 Launch IL Profiler.command   double-clickable launcher (macOS)
 Launch IL Profiler.bat       double-clickable launcher (Windows)
 ```

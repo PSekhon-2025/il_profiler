@@ -227,14 +227,22 @@ questionnaire that produced it**, and a `meta.json`.
 
 ## 9. Validation & hallucination checks
 
-All five are **opt-in and post-hoc** — a default run is byte-identical without
-them, and they operate on a saved run. They live on the GUI's **Hallucination**
-tab and as `scripts/03`–`04` and `scripts/06`.
+All six are **opt-in and post-hoc** — a default run is byte-identical without
+them, and they operate on a saved run. §9.1–§9.5 live on the GUI's
+**Hallucination** tab and as `scripts/03`–`04` and `scripts/06`; §9.6 lives on
+the **Topics** tab as `scripts/13`, because what it measures is a property of
+the inductive topic layer rather than of a quote.
 
 §9.5 is a refinement of §9.2 rather than an independent signal: §9.2 asks
 whether a quoted span is verbatim in the sources, §9.5 grades what a "no"
 actually means and adds an entailment axis. §9.5 reads §9.2's verdict and never
 rewrites it, so both can be reported side by side.
+
+§9.6 stands in the same relation to `il_rag/keyword_agreement.py`: that judge
+asks whether an answer contains a keyword, §9.6 grades what a "no" means by
+placing the keyword on a distance ladder. It likewise never rewrites the other's
+verdict — they use different keyword sets to answer different questions, and both
+are reported.
 
 ### 9.1 Retrieval grounding (`il_rag/grounding.py`, `--grounding` on a run)
 
@@ -994,6 +1002,200 @@ Rashkin et al.)
 
 ---
 
+### 9.6 Topic-keyword semantic matching (`il_rag/topic_keywords.py`, `scripts/13_run_topic_keywords.py`)
+
+The odd one out in this section: it lives on the **Topics** tab, not the
+Hallucination tab, because what it measures is a property of the *inductive*
+layer (§ the topic model) rather than of a quote. It is included here because it
+is the same kind of instrument — an opt-in, post-hoc, graded check over a saved
+run.
+
+**The question.** BERTopic names each topic by its ten most distinctive
+c-TF-IDF terms. Those terms were, until this stage, descriptive labels that
+nothing scored. This asks: when the pipeline answered a question from evidence
+belonging to topic *k*, how much of topic *k*'s vocabulary actually reached the
+answer — verbatim, as an inflection, as a semantic neighbour, or not at all?
+
+**Relation to §9.2/§9.5, and to the keyword judge.** §9.5 is to §9.2 what this
+is to `il_rag/keyword_agreement.py`: a yes/no predicate replaced by a graded
+ladder. `keyword_agreement.py`'s own docstring names the limitation —
+
+> it cannot see synonymy — an answer saying "government" earns no credit for a
+> reference that says "state" — so its miss rate is structurally high
+
+— and this closes it. It does **not** replace that judge, and the two are not
+interchangeable: `keyword_agreement` matches *per-logic reference* keywords to
+classify an answer; this matches *topic c-TF-IDF* keywords to measure vocabulary
+survival. Different keywords, different target, different question.
+
+**The ladder** (`locate_span`'s shape — cheapest first, first bar cleared wins):
+
+```
+exact          κ occurs as a whole token, or (bigram) as two ADJACENT tokens
+                                                                    -> 1.0
+morphological  some answer word shares κ's stem: shared leading prefix
+               >= p* AND difflib ratio >= τ_morph                   -> ratio
+semantic       some answer word w* has π(cos(κ, w*)) >= τ_sem       -> min(π, σ_max)
+absent         nothing cleared a bar                                -> 0
+```
+
+Every verdict carries `{tier, score, rule, matched, cosine, near_miss}`.
+`matched` is the answer word that produced the match — the analogue of §9.5's
+`best_span`, and the reason a reviewer can read the evidence rather than take
+the tier on faith.
+
+Three details are load-bearing:
+
+- **`absent` scores exactly 0**, not its near-miss percentile. A keyword that
+  cleared no bar must contribute nothing to retention, or `dropped_share` and
+  `retention` tell contradictory stories. How close it came is kept separately
+  in `near_miss`, which is diagnostic only: it is what distinguishes "nowhere
+  near" from "a hair under the bar" when retuning τ_sem.
+- **Bigram adjacency.** "export controls" is `exact` only if it occurs
+  adjacently, because adjacency is what makes it the phrase. Otherwise each
+  part is scored and the phrase takes the **minimum**, capped at
+  `morphological`. Minimum, not mean: the phrase is present only to the extent
+  that *both* concepts are, and a mean would let "controls" alone carry it.
+- **The exact rung tokenizes UNFILTERED** (`_words`, not
+  `grounding.content_tokens`). Stopwords and two-character tokens must stay
+  matchable, or a legitimate topic keyword like `ai` would be structurally
+  unmatchable. The semantic rung *does* use `content_tokens` — there a cosine
+  against "the" is noise.
+
+**Why the semantic rung reports a percentile, not a cosine.** This is the
+design's one hard constraint, and it follows directly from the measurement
+recorded at `QUOTE_PARAPHRASE_COS_THRESHOLD` (§9.5): e5 put a faithful reword at
+0.849 and a wholly unrelated claim at 0.807 — 0.04 apart. Single *words* are
+worse; this corpus's whole vocabulary sits in a band roughly 0.74–0.82 wide. No
+absolute cutoff discriminates in that band, and a number from it cannot be shown
+to a reader as a "% match" without misleading them.
+
+So the score is the cosine's **percentile in the distribution of cosines between
+random pairs of this corpus's own vocabulary**:
+
+```
+π(x) = |{ g ∈ G : g ≤ x }| / |G|     G = { cos(u,v) : {u,v} ⊂ V, u ≠ v }
+```
+
+That is also what makes the bar selective rather than a rubber stamp. The corpus
+is entirely about AI labs, so `manager`/`sales` genuinely *is* fairly close in
+absolute cosine — but it is a *typical* pair here and lands near the background
+median, while `manager`/`hierarchy` lands in the tail. Measured on a synthetic
+fixture the difference is 95th percentile against 18th, from raw cosines that
+differ by less than the eye would trust.
+
+`G` is computed **exhaustively, not sampled**: all C(|V|, 2) pairs, swept in row
+blocks of the cosine matrix and accumulated into a fixed histogram, so ~8M pairs
+cost bounded memory. Computing every pair removes a random seed from the design
+entirely — same corpus and same model give the same file, byte for byte. Only
+`CALIBRATION_GRID_POINTS` quantiles are stored, not the pairs.
+
+**When the calibration is missing the semantic rung is disabled outright.**
+There is deliberately no fallback to raw cosine: an 0.80 rendered as "80%
+match" between two unrelated words would misrepresent the entire measure. The
+run still completes on the two lexical rungs and records
+`summary["calibrated"] = false`.
+
+**Rollup.** A row's keywords are the union over the topics of its retrieved
+chunks (outlier topic −1 excluded; ids missing from the map skipped, as in
+§topics). Retention is the mean score; the per-topic figure weights each
+answered row equally, so a heavily-retrieved topic cannot dominate its own
+average:
+
+```
+V_i = (1/|K(i)|) Σ_{κ ∈ K(i)} S(κ, a_i)
+V_k = (1/|A_k|) Σ_{i ∈ A_k} (1/|K_k|) Σ_{κ ∈ K_k} S(κ, a_i)
+L_i = V_i − σ_exact_i          "semantic lift" — the headline
+```
+
+`L_i` is this check's `paraphrase_rescue_rate`: exactly the part of retention an
+exact-match judge is blind to.
+
+**Two reference arms**, because a retention figure with no referent is not a
+finding:
+
+- **Ceiling `C_i`** — the same keywords, exact rung only, against the retrieved
+  *chunks*. Keywords are derived *from* those chunks by c-TF-IDF, so it runs
+  high by construction. This is the circularity objection stated as a displayed
+  number rather than caveated away. Free (no embeddings); degrades to `null`
+  when Chroma is absent.
+- **Floor `N_i`** — the full ladder against `KEYWORD_NULL_DRAWS` topics the row
+  never retrieved, seeded from the row's own identifiers so the draw is stable
+  regardless of row order, resumption, or parallelism. Same role the metamorphic
+  control arm (§9.3) plays for flip rates.
+
+Read as `N ≤ V ≤ C`. If `V` sits at `N`, the answers carry no more of the
+topic's vocabulary than a random topic's — and that is the finding.
+
+**Cost.** Word vectors are cached to disk, append-only and unit-normalized
+before a float16 cast (cosine error under 1e-3, an order of magnitude below the
+grid's resolution). A first run embeds a few hundred new words; a rerun embeds
+zero. Cosines are never cached — they are a matmul over cached vectors, so
+retuning a threshold costs nothing. `--no-embeddings` disables the semantic rung
+and makes the whole ladder pure computation, which is what the offline tests
+use.
+
+**Output files.** Corpus-level, built locally and shipped like `data/topics/`:
+
+- `data/lexicon/word_vectors.npz` — `words` (fixed-width `U32`, so `np.load`
+  needs no pickle) and `vectors` (float16 unit vectors).
+- `data/lexicon/calibration.json` — the quantile grid, the vocabulary and its
+  document frequencies (so the neighborhood explorer needs no Chroma), and full
+  provenance: `built_at`, `embedding_model`, `vocab_size`, `n_pairs`, and the
+  cosine band.
+
+Run-level, inside `<run_dir>/topic_keywords/`:
+
+- `rows.jsonl` — per answered row: `topics, n_keywords, skipped, retention,
+  verbatim_share, morph_share, semantic_share, dropped_share, semantic_lift,
+  verbatim_ceiling, retention_null, null_topics`, plus an **uncapped**
+  `keywords` list of per-keyword verdicts. Uncapped because that list *is* the
+  audit trail (`keyword_agreement` caps its matched words at 12 because there
+  they are a by-product; here they are the product).
+- `terms.jsonl` — per (topic, keyword): `retention`, the tier histogram,
+  `verbatim_ceiling`, and the three most frequent matched words.
+- `summary.json` — `overall` / `by_topic` / `by_category` / `by_org_source`
+  slices, the calibration provenance, the thresholds in force, and the embedding
+  cost actually incurred.
+
+**Config** (`il_rag/config.py`): `KEYWORD_MORPH_MIN_PREFIX`,
+`KEYWORD_MORPH_MIN_RATIO`, `KEYWORD_MIN_WORD_CHARS`,
+`KEYWORD_SEMANTIC_MIN_PERCENTILE`, `KEYWORD_SEMANTIC_MAX_SCORE`,
+`KEYWORD_MAX_CANDIDATES`, `CALIBRATION_VOCAB_SIZE`, `CALIBRATION_MIN_DF`,
+`CALIBRATION_BINS`, `CALIBRATION_GRID_POINTS`, `KEYWORD_NULL_DRAWS`,
+`KEYWORD_NULL_SEED`.
+
+**Known limitations**, restated verbatim in the GUI expander:
+
+1. **Circularity** — topic keywords are derived *from* the corpus chunks, so
+   scoring them against those chunks is near-tautological. That is what the
+   ceiling arm measures. The non-trivial comparison is against the answers.
+2. **These vectors capture topical relatedness, not synonymy.** `manager` and
+   `hierarchy` are related, not synonyms — the motivating example is itself a
+   relatedness judgment, and that is the honest claim this rung supports.
+   Antonyms embed close (`permit`/`prohibit`), so a high semantic score can mean
+   the answer discusses the concept *and takes the opposite position*. Read the
+   matched word, never the score alone.
+3. **Percentiles are readable, not absolute** — a rank within *this* corpus
+   under *this* model. Both are recorded in `calibration.json`.
+4. **The keyword sets are vectorizer artifacts**: ten c-TF-IDF terms under one
+   particular `min_df` / `ngram_range` / `n_keywords`. Changing any of those
+   changes every retention figure.
+5. **The morphological rung is a prefix heuristic, not a stemmer.** It
+   over-fires on shared-prefix pairs (`policy`/`police` at ratio 0.833) and
+   under-fires on suppletive forms (`good`/`better`). It never fabricates a
+   claim: the matched surface form is always stored and shown.
+6. **Per-row retention is noisy** — ten keywords against one answer. Read the
+   per-topic rollup.
+7. **Attribution inherits the cross-tab's imprecision**: a row's topics are the
+   topics of *all* its retrieved chunks, including ones the answer legitimately
+   ignored (the `1/k` argument in `topics.py` applies here too).
+8. **Every keyword counts equally** — no IDF re-weighting within a topic.
+   c-TF-IDF already filtered for distinctiveness once; weighting again would
+   double-count it.
+
+---
+
 ## 10. Confidence intervals
 
 `il_rag/bootstrap_ci.py` (`scripts/05`, and the Results-tab error bars).
@@ -1193,6 +1395,9 @@ il_rag/
   metamorphic.py         (check) control / paraphrase / ablation / distractor
   embedding_agreement.py (check) non-LLM second judge
   quote_provenance.py    (check) graded quote provenance x veracity
+  topics.py              (local) inductive BERTopic layer + topic x logic cross-tab
+  keyword_agreement.py   (check) exact-match lexical third judge
+  topic_keywords.py      (check) graded topic-keyword distance ladder (§9.6)
   pdf_sources.py         chunk → source PDF, for the audit trail's links (§12.1)
   article_pdfs.py        (local) RTF press dumps → one PDF per record (§12.2)
   bootstrap_ci.py        confidence intervals over the profiles
@@ -1200,8 +1405,16 @@ il_rag/
 scripts/
   01_ingest.py  02_run_profiles.py  03_run_metamorphic_eval.py
   04_run_embedding_agreement.py  05_run_bootstrap_ci.py
-  06_run_quote_provenance.py  09_build_pdf_pages.py  10_build_article_pdfs.py
-app.py                   Streamlit GUI (Run / Results / Audit / Hallucination / Compare)
+  06_run_quote_provenance.py  07_run_topics.py  08_run_replicates.py
+  09_build_pdf_pages.py  10_build_article_pdfs.py  11_bundle_cloud_sources.py
+  12_run_keyword_agreement.py  13_run_topic_keywords.py
+data/
+  chroma/                the vector index
+  topics/                (local, shipped) fitted topic model: topic_info, chunk_topics
+  lexicon/               (local, shipped) word vectors + word-pair calibration (§9.6)
+  profiles/runs/         immutable per-run snapshots and every check's output
+app.py                   Streamlit GUI (Run / Results / Audit / Hallucination /
+                         Topics / Analyse a document / Compare runs)
 tests/                   offline unit tests
 Dockerfile, fly.toml, DEPLOY.md   deployment
 ```
@@ -1231,6 +1444,15 @@ Dockerfile, fly.toml, DEPLOY.md   deployment
   design. So §9.5's `unsupported` means *this corpus does not support it*, not
   *it is untrue* — a true claim the corpus is simply silent on lands there. Only
   the `contradicted` label is evidence against a span.
+- **Word embeddings measure relatedness, not synonymy.** §9.6's semantic rung
+  can say that *manager* and *hierarchy* sit close in this corpus; it cannot say
+  they mean the same thing, and antonyms sit close too. Its percentiles are also
+  a rank within *this* corpus under *this* embedding model — refit either and
+  every number moves. Read the matched word, never the score alone.
+- **The topic layer's keywords describe, they do not define.** §9.6 scores an
+  answer against c-TF-IDF terms that were themselves derived from the chunks
+  being answered from, which is why it reports a verbatim ceiling and a null
+  floor alongside the measurement rather than the measurement alone.
 - **Copyright.** The third-party corpus is licensed news content — keep any
   deployment private/gated.
 ```

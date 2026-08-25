@@ -121,6 +121,78 @@ QUOTE_PARAPHRASE_COS_THRESHOLD = 0.90
 # ("alignment", "safety"), not claims about what a source says.
 QUOTE_MIN_SPAN_TOKENS = 3
 
+# Feature 6 (topic-keyword semantic matching). Takes BERTopic's per-topic
+# c-TF-IDF keywords and asks how much of each topic's vocabulary survives into
+# the answers grounded in it — verbatim, as an inflection, or only as a
+# semantic neighbour. It COMPLEMENTS, never replaces, the exact-set keyword
+# judge in keyword_agreement.py, whose docstring names synonymy blindness as
+# its own structural limit. Opt-in; a default run never reads these.
+#
+# Morphological tier ("managers", "managerial", "management" all count for
+# "manager"). Two conditions, BOTH required: a shared leading stem of at least
+# this many characters, and a difflib ratio above the bar below. Neither alone
+# is safe — the prefix rule on its own accepts manage/mandate at 3 characters,
+# the ratio on its own accepts pairs with no shared root at all. 5 is what
+# separates manager/management (prefix 6) from manager/mandate (prefix 3), and
+# the requirement drops to len(shorter) so safety/safe still matches.
+KEYWORD_MORPH_MIN_PREFIX = 5
+# 0.70 is set by manager/management, the longest real inflection pair in this
+# vocabulary, at ratio 0.706; raising the bar to 0.75 loses it. Known cost of
+# going this low: shared-prefix pairs that are NOT inflections slip through
+# (policy/police at 0.833, state/statement at 0.714). Deliberately accepted —
+# both are topically adjacent anyway, so the failure inflates "retained
+# morphologically" by a hair rather than asserting anything false, and every
+# match stores its matched surface form so the drill-down shows which fired.
+# A Porter-lite stemmer would need a ~40-entry suffix table plus consonant
+# doubling and i->y restoration to reach the same recall, and would STILL
+# collapse policy/police. Two tunable numbers beat a table here.
+KEYWORD_MORPH_MIN_RATIO = 0.70
+# Words shorter than this are refused by the morphological tier outright: a
+# shared-prefix rule over 3-letter words is noise. Matches the len > 2 filter
+# in grounding.content_tokens, so the two notions of "a word" agree.
+KEYWORD_MIN_WORD_CHARS = 3
+
+# Semantic tier. The bar is a PERCENTILE of the corpus background distribution,
+# not a raw cosine, for the reason documented at QUOTE_PARAPHRASE_COS_THRESHOLD
+# above: e5 compresses cosine into a narrow high band, and single WORDS are
+# worse than sentences — the whole corpus vocabulary sits around 0.74-0.82, so
+# no absolute cutoff discriminates.
+#
+# Calibrating against THIS corpus is also what makes the bar selective rather
+# than a rubber stamp. Everything here is about AI labs, so manager/sales
+# really is fairly close in absolute cosine — but it is a TYPICAL pair for this
+# corpus and therefore lands near the background median, while manager/
+# hierarchy lands in the tail. 0.90 reads as "closer than 90% of random corpus
+# word pairs". Wants recalibrating once a real topic model is fitted.
+KEYWORD_SEMANTIC_MIN_PERCENTILE = 0.90
+# A synonym never scores a full 100%. 100% is reserved for a literal
+# occurrence, which is a categorically stronger claim than "close in embedding
+# space" — and the top of the percentile grid is one corpus's most extreme
+# pair, not a match.
+KEYWORD_SEMANTIC_MAX_SCORE = 0.99
+# Per-answer cap on candidate words compared against each keyword. Answers run
+# a few hundred words, so 120 distinct content tokens covers essentially all of
+# them: a guard against a pathological answer, not routine truncation.
+KEYWORD_MAX_CANDIDATES = 120
+
+# Background calibration, built LOCALLY like the topic model and shipped as two
+# small files in data/lexicon/. The distribution is over ALL pairs of the
+# corpus's most frequent words — every pair, not a sample, accumulated into a
+# histogram blockwise. Computing it exhaustively rather than sampling removes a
+# random seed from the design entirely: same corpus and model, same file.
+CALIBRATION_VOCAB_SIZE = 4000   # ~8.0M pairs; ~125 embedding batches, one time
+CALIBRATION_MIN_DF = 5          # a word must appear in >= 5 chunks to be vocabulary
+CALIBRATION_BINS = 20000        # cosine resolution 1e-4 over [-1, 1]
+CALIBRATION_GRID_POINTS = 1001  # stored quantiles: 0.1-percentile resolution, ~15 KB
+
+# Null arm: each answer is also scored against topics its evidence did NOT come
+# from, so a retention figure has a floor to be read against — the same role the
+# metamorphic control arm plays for flip rates. 3 draws average out an unlucky
+# foreign topic; the seed is combined with the row's own identifiers so the draw
+# is stable regardless of row order, resumption, or parallelism.
+KEYWORD_NULL_DRAWS = 3
+KEYWORD_NULL_SEED = 42
+
 # Feature 3 (metamorphic eval: label stability + evidence sensitivity).
 # Four probes, each independently toggleable. "control" is the no-perturbation
 # null arm whose flip rate is the noise floor the others are read against;
