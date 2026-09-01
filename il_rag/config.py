@@ -124,9 +124,10 @@ QUOTE_MIN_SPAN_TOKENS = 3
 # Feature 6 (topic-keyword semantic matching). Takes BERTopic's per-topic
 # c-TF-IDF keywords and asks how much of each topic's vocabulary survives into
 # the answers grounded in it — verbatim, as an inflection, or only as a
-# semantic neighbour. It COMPLEMENTS, never replaces, the exact-set keyword
-# judge in keyword_agreement.py, whose docstring names synonymy blindness as
-# its own structural limit. Opt-in; a default run never reads these.
+# semantic neighbour. The keyword judge in keyword_agreement.py now scores its
+# curated lexicon on this same ladder (sharing these thresholds and the
+# calibration below), so the two keyword features have one matching
+# methodology. Opt-in; a default run never reads these.
 #
 # Morphological tier ("managers", "managerial", "management" all count for
 # "manager"). Two conditions, BOTH required: a shared leading stem of at least
