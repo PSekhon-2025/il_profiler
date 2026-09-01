@@ -2018,53 +2018,82 @@ with tab_results:
         with st.expander("Keyword agreement (lexical third judge)",
                          expanded=False):
             st.caption(
-                "The bluntest and most transparent judge: each question's seven "
-                "reference answers are reduced to **distinctive keywords**, each "
-                "RAG answer to its content words, and the verdict is which logic's "
-                "keywords the answer actually contains. No LLM, no embeddings — "
-                "every verdict is a visible list of matched words."
+                "The most transparent judge: a **hand-curated keyword lexicon** "
+                "per logic, scored against each RAG answer on a graded ladder — "
+                "verbatim, as an inflection, or as a calibrated semantic "
+                "neighbour. No LLM anywhere; every verdict is still a visible "
+                "list of matched words, each annotated with the rung that "
+                "matched it."
             )
 
             with st.expander("ℹ️ How keyword agreement is computed", expanded=False):
                 st.markdown(
-                    "Implemented in `il_rag/keyword_agreement.py`. Deterministic "
-                    "and free: pure set arithmetic over words."
+                    "Implemented in `il_rag/keyword_agreement.py`. No LLM "
+                    "calls; without the local semantic lexicon it is pure, "
+                    "deterministic computation, and with it the only cost is "
+                    "embedding uncached answer words."
                 )
                 st.markdown(
-                    "**Step 1 — derive distinctive keywords.** Take the content "
-                    "tokens of each reference answer (lowercased, stopwords and "
-                    "≤2-character tokens removed — the same tokenizer the grounding "
-                    "check uses). Within one question the seven references share "
-                    "framing vocabulary (*lab, conduct, appropriate*) that says "
-                    "nothing about **which** logic, so a token is kept only if it "
-                    "appears in at most $\\tau$ of the seven sets:"
+                    "**Step 1 — the lexicon.** One hand-curated keyword list "
+                    "per logic ($K_\\ell$, 12-17 entries), drawn from Thornton "
+                    "& Ocasio's ideal types and the questionnaire's reference "
+                    "vocabulary. Curation rules: institutional signal only "
+                    "(*welfare*, not *made*); one surface form per stem (the "
+                    "morphological rung credits inflections); no token in two "
+                    "logics' lists; phrases allowed (*peer review*). v1 derived "
+                    "keywords per question from the reference answers instead — "
+                    "distinctiveness within one question let generic words "
+                    "through, which is why the sets read as noise and were "
+                    "replaced."
+                )
+                with st.expander("The lexicon — all seven lists", expanded=False):
+                    st.dataframe(pd.DataFrame(
+                        [{"logic": k, "n": len(v), "keywords": ", ".join(v)}
+                         for k, v in ka_mod.LOGIC_KEYWORDS.items()]),
+                        hide_index=True, width="stretch")
+                st.markdown(
+                    "**Step 2 — the ladder.** Each keyword is scored against "
+                    "the answer by the same graded ladder as the topic-keyword "
+                    "check (`il_rag/topic_keywords.py`), cheapest rung first:"
+                )
+                st.markdown(
+                    "| rung | fires when | score |\n|---|---|---|\n"
+                    "| **exact** | the keyword occurs as a token (phrases: "
+                    "adjacent) | 1.00 |\n"
+                    "| **morphological** | an answer word shares its stem "
+                    "(*regulation* ← *regulators*) | difflib ratio |\n"
+                    "| **semantic** | an answer word is closer than "
+                    "$\\tau_{sem}$ of random corpus word pairs | percentile, "
+                    "cap 0.99 |\n"
+                    "| **absent** | nothing cleared a bar | 0 |"
+                )
+                st.markdown(
+                    "The semantic rung scores a **percentile against this "
+                    "corpus's own background distribution** of word-pair "
+                    "cosines, never a raw cosine — e5 compresses word cosines "
+                    "into a ~0.74-0.82 band, so no absolute cutoff "
+                    "discriminates. It engages only when the local lexicon "
+                    "files exist (`data/lexicon/`, built once by "
+                    "`scripts/13_run_topic_keywords.py calibrate`); otherwise "
+                    "the ladder stops at the morphological rung."
+                )
+                st.markdown(
+                    "**Step 3 — graded recall per logic.** Each keyword earns "
+                    "its ladder score $s_k$, and a logic's raw score is the "
+                    "mean over its list:"
                 )
                 st.latex(
-                    r"K_\ell=\bigl\{\,t \in T(\mathrm{ref}_\ell)\;\big|\;"
-                    r"\mathrm{df}(t)\le\tau\,\bigr\},\qquad "
-                    r"\mathrm{df}(t)=\bigl|\{m : t \in T(\mathrm{ref}_m)\}\bigr|"
+                    r"r_\ell=\frac{1}{\lvert K_\ell\rvert}"
+                    r"\sum_{k \in K_\ell} s_k"
                 )
                 st.markdown(
-                    f"$\\tau$ = `--max-df` (default "
-                    f"**{ka_mod.KEYWORD_MAX_LOGIC_DF}**): 1 keeps strictly unique "
-                    "tokens; 2 tolerates natural pairwise sharing (the *capitalism* "
-                    "variants) without letting category-wide vocabulary through."
-                )
-                st.markdown(
-                    "**Step 2 — score each logic by keyword recall.** What fraction "
-                    "of a logic's keywords does the answer contain?"
-                )
-                st.latex(
-                    r"r_\ell=\frac{\bigl|\,T(\text{answer})\cap K_\ell\,\bigr|}"
-                    r"{\bigl|\,K_\ell\,\bigr|}"
-                )
-                st.markdown(
-                    "Recall, not raw count, so a logic with many keywords is not "
+                    "Mean, not count, so a logic with many keywords is not "
                     "rewarded merely for having a longer list."
                 )
                 st.markdown(
-                    "**Step 3 — normalize to shares and pick a winner.** Same shape "
-                    "as the embedding judge, so the two are directly comparable:"
+                    "**Step 4 — normalize to shares and pick a winner.** Same "
+                    "shape as the embedding judge, so the two are directly "
+                    "comparable:"
                 )
                 st.latex(
                     r"\sigma_\ell=\frac{r_\ell}{\sum_m r_m},\qquad "
@@ -2072,8 +2101,8 @@ with tab_results:
                     r"\mathrm{overlap}=\sum_\ell \min(\sigma_\ell, w_\ell)"
                 )
                 st.markdown(
-                    "**Rows with no overlap at all** — the answer shares not one "
-                    "keyword with any logic — are reported separately as "
+                    "**Rows with no overlap at all** — no keyword of any logic "
+                    "cleared any rung — are reported separately as "
                     "`no_overlap` and **excluded from the rates** rather than "
                     "forced to a uniform guess."
                 )
@@ -2083,20 +2112,17 @@ with tab_results:
                     (r"$m$", "*another* logic — a second letter exists only so a "
                              "formula can hold $\\ell$ fixed while counting across "
                              "all the others"),
-                    (r"$t$", "**a token** — one content word, e.g. `investors`"),
-                    (r"$T(x)$", "the **content tokens** of text $x$: lowercased "
-                                "words, minus stopwords and ≤2-character tokens"),
-                    (r"$\mathrm{ref}_\ell$", "the **reference answer** written for "
-                                             "logic $\\ell$ for this question"),
-                    (r"$\mathrm{df}(t)$", "**document frequency** — how many of "
-                                          "this question's 7 references contain "
-                                          "token $t$"),
-                    (r"$\tau$", f"the **df cutoff** (`--max-df`, default "
-                                f"**{ka_mod.KEYWORD_MAX_LOGIC_DF}**): keep a token "
-                                "only if $\\mathrm{df}(t)\\le\\tau$"),
-                    (r"$K_\ell$", "logic $\\ell$'s resulting **keyword set**"),
-                    (r"$r_\ell$", "**keyword recall** — the share of $K_\\ell$ the "
-                                  "answer contains, in $[0,1]$"),
+                    (r"$K_\ell$", "logic $\\ell$'s **curated keyword list**"),
+                    (r"$k$", "**one keyword** from that list"),
+                    (r"$s_k$", "keyword $k$'s **ladder score** in $[0,1]$: 1.0 "
+                               "exact, the character ratio if morphological, the "
+                               "capped percentile if semantic, 0 if absent"),
+                    (r"$\tau_{sem}$", "the **semantic bar** (config "
+                                      "`KEYWORD_SEMANTIC_MIN_PERCENTILE`, 0.90): "
+                                      "an answer word must be closer than 90% of "
+                                      "random corpus word pairs"),
+                    (r"$r_\ell$", "**graded recall** — the mean ladder score of "
+                                  "$K_\\ell$, in $[0,1]$"),
                     (r"$\sigma_\ell$", "the **normalized share** — $r_\\ell$ as a "
                                        "fraction of all seven, so they sum to 1"),
                     (r"$\hat{\ell}$", "the **predicted logic** (the hat means "
@@ -2104,33 +2130,36 @@ with tab_results:
                     (r"$w_\ell$", "the **LLM matcher's weight** for logic $\\ell$ "
                                   "— what this judge is compared against"),
                     *_SET_NOTATION,
-                ], note="In the set-builder braces, the vertical bar reads “such "
-                        "that”, not division.")
+                ])
                 st.markdown(
                     "**Design decisions**\n"
-                    "- *Keywords are derived, not hand-written (v1).* They come "
-                    "from the run's own questionnaire snapshot, honoring "
-                    "per-question overrides, so they always describe the references "
-                    "that actually graded that run. Hand-authored keyword sets can "
-                    "replace them later without touching the scoring.\n"
-                    "- *Why the distinctiveness filter is load-bearing.* Without "
-                    "it, shared framing words would dominate every set and every "
-                    "logic would score alike — the filter is what turns reference "
-                    "text into a discriminating signal.\n"
-                    "- *Its weakness is synonymy, and it is structural.* An answer "
-                    "saying \"government\" earns nothing from a reference saying "
-                    "\"state\". Misses are therefore common **by construction**; "
-                    "this judge is here for transparency and triangulation, not "
-                    "accuracy.\n"
-                    "- *Why add a third judge at all.* The three fail in different "
-                    "ways — the matcher can be swayed by rhetoric, embeddings by "
-                    "topical similarity, keywords by wording. Where all three "
-                    "agree, the classification is hard to dismiss; where they "
-                    "split, the matched-word lists show exactly why."
+                    "- *Curated, not derived (v2).* v1's per-question derivation "
+                    "kept any token unique to one reference — including framing "
+                    "noise like *made* or *fill*. A fixed lexicon is auditable "
+                    "as a document, identical across runs, and changes only "
+                    "deliberately.\n"
+                    "- *One ladder for both keyword features.* The thresholds, "
+                    "the word-vector cache and the corpus calibration are "
+                    "shared with the topic-keyword check, so a rung means the "
+                    "same thing wherever it appears.\n"
+                    "- *Synonymy is now visible, not fixed.* The semantic rung "
+                    "sees *government* ≈ *state*, but e5 word vectors capture "
+                    "topical relatedness rather than true synonymy (antonyms "
+                    "embed close), so a semantic match is graded evidence, and "
+                    "the annotated word pair is stored so you read the match, "
+                    "never the score alone.\n"
+                    "- *Why keep a third judge at all.* The three fail in "
+                    "different ways — the matcher can be swayed by rhetoric, "
+                    "embeddings by topical similarity, keywords by wording. "
+                    "Where all three agree, the classification is hard to "
+                    "dismiss; where they split, the matched-word lists show "
+                    "exactly why."
                 )
 
             if st.button("Compute keyword agreement",
-                         help="Pure computation over the saved run — no API calls. "
+                         help="No LLM calls. Without the local semantic lexicon "
+                              "this is pure computation; with it, only uncached "
+                              "answer words are embedded (append-only cache). "
                               "Recomputing overwrites the previous result.",
                          key="kw_run_btn"):
                 args = [PYTHON, "scripts/12_run_keyword_agreement.py",
@@ -2158,8 +2187,22 @@ with tab_results:
                 m3.metric("Distribution overlap",
                           f"{o.get('mean_overlap', 0):.3f}")
                 m4.metric("No keyword overlap", o.get("n_no_overlap", 0),
-                          help="answers sharing no keyword with ANY logic — "
-                               "excluded from the rates rather than guessed")
+                          help="answers where no keyword of any logic cleared "
+                               "any rung — excluded from the rates rather than "
+                               "guessed")
+                if "semantic_enabled" in kw:
+                    tiers = kw.get("tier_totals") or {}
+                    tier_txt = " · ".join(
+                        f"{tiers.get(k, 0)} {k}" for k in
+                        ("exact", "morphological", "semantic") if tiers.get(k))
+                    st.caption(
+                        ("Semantic rung **on** (calibrated percentile ≥ 0.90)"
+                         if kw["semantic_enabled"] else
+                         "Semantic rung **off** — exact + morphological only. "
+                         "Build the lexicon locally with "
+                         "`scripts/13_run_topic_keywords.py calibrate` to "
+                         "enable it.")
+                        + (f" — matches by rung: {tier_txt}." if tier_txt else ""))
 
                 # --- The profile this judge implies, in the profile style ---
                 krows = load_keyword_rows(res_run)
@@ -2212,9 +2255,11 @@ with tab_results:
                     with st.expander("Matched words behind every verdict",
                                      expanded=False):
                         st.caption(
-                            "The whole point of a lexical judge: each verdict is "
+                            "The whole point of this judge: each verdict is "
                             "auditable by eye. Pick a row to see which of each "
-                            "logic's keywords the answer actually contained."
+                            "logic's keywords the answer matched — plain = "
+                            "verbatim, `kw~word` = same stem, `kw≈word` = "
+                            "semantic neighbour."
                         )
                         only_dis = st.checkbox("Only where it disagrees with the "
                                                "matcher", value=False, key="kw_dis")
@@ -2239,7 +2284,7 @@ with tab_results:
                             if mw:
                                 st.dataframe(pd.DataFrame(
                                     [{"logic": k,
-                                      "keyword recall": r["keyword_scores"].get(k),
+                                      "keyword score": r["keyword_scores"].get(k),
                                       "matched words": ", ".join(v)}
                                      for k, v in mw.items()]),
                                     hide_index=True, width="stretch")
