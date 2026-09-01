@@ -444,6 +444,72 @@ def load_embedding_rows(run_id: str | None) -> pd.DataFrame | None:
     return pd.DataFrame(rows) if rows else None
 
 
+def render_judge_profiles(rows: pd.DataFrame, share_col: str) -> None:
+    """Per-lab grouped bars of the % profile a judge's shares imply.
+
+    Mirrors the alignment-profile charts exactly — one chart per lab, the
+    seven logics on x, a 0-100 scale, published vs thirdparty in the same
+    source colors — so a judge's picture can be read directly against the
+    matcher's profiles above it. Each bar is the mean share the judge put on
+    that logic across the scored answers of one (lab, source), x100, and the
+    per-source dominant-logic metrics underneath mirror the profile charts'.
+    """
+    import altair as alt
+
+    recs = []
+    for _, r in rows.iterrows():
+        shares = r[share_col]
+        if not isinstance(shares, dict):
+            continue
+        for logic in LOGICS:
+            recs.append({"lab": r["org"], "source": r["source_type"],
+                         "logic": logic,
+                         "share": float(shares.get(logic) or 0.0)})
+    if not recs:
+        st.info("No per-logic shares found in this run's rows file.")
+        return
+    jl = (pd.DataFrame(recs)
+          .groupby(["lab", "source", "logic"], as_index=False)
+          .agg(pct=("share", "mean"), n=("share", "size")))
+    jl["pct"] = 100.0 * jl["pct"]
+
+    for org in [o for o in ORGS if o in jl["lab"].unique()]:
+        st.subheader(org)
+        sub = jl[jl["lab"] == org]
+        chart = (
+            alt.Chart(sub)
+            .mark_bar()
+            .encode(
+                x=alt.X("logic:N", sort=LOGICS, title=None),
+                xOffset=alt.XOffset("source:N"),
+                y=alt.Y("pct:Q", title="% of judge profile",
+                        scale=alt.Scale(domain=[0, 100])),
+                color=alt.Color(
+                    "source:N", title="source",
+                    scale=alt.Scale(domain=SOURCE_TYPES,
+                                    range=["#4C78A8", "#F58518"]),
+                ),
+                tooltip=["lab", "source", "logic",
+                         alt.Tooltip("pct:Q", format=".1f"),
+                         alt.Tooltip("n:Q", title="answers")],
+            )
+            .properties(height=260)
+        )
+        st.altair_chart(chart, width="stretch")
+
+        sources_here = [s for s in SOURCE_TYPES if s in sub["source"].unique()]
+        cols = st.columns(len(sources_here))
+        for col, stype in zip(cols, sources_here):
+            ssub = sub[sub["source"] == stype]
+            top = ssub.loc[ssub["pct"].idxmax()]
+            col.metric(
+                f"{stype} — judge's dominant logic",
+                f"{top['logic']} ({top['pct']:.0f}%)",
+                help=f"mean share over {int(top['n'])} scored answer(s)",
+            )
+
+
+
 def load_quote_provenance(run_id: str | None) -> dict | None:
     """The quote-provenance summary for a run, if the stage has run."""
     if not run_id:
@@ -1810,6 +1876,29 @@ with tab_results:
                              "matcher's weights (1 = identical); compare against "
                              "what a totally uninformative judge would score")
 
+                # --- The profile this judge implies, in the profile style ---
+                erows = load_embedding_rows(res_run)
+                if erows is not None and not erows.empty:
+                    st.markdown(
+                        "**The profile this judge implies.** The same chart "
+                        "as the alignment profiles above — same axes, 0-100 "
+                        "scale, same source colors — but each bar is the mean "
+                        "**closeness share** the embedding judge put on that "
+                        "logic, x100, over the scored answers. Expect it far "
+                        "flatter than the matcher's: e5 compresses "
+                        "similarities, so shares hover near the uniform "
+                        "1/7 = 14% — read the ranking and the gaps, not the "
+                        "absolute heights.")
+                    if "embedding_shares" in erows.columns \
+                            and erows["embedding_shares"].notna().any():
+                        render_judge_profiles(
+                            erows[erows["embedding_shares"].notna()],
+                            "embedding_shares")
+                    else:
+                        st.info("Closeness shares are not in this run's file "
+                                "— it predates the graded metrics. Recompute "
+                                "the check above to add them.")
+
                 cat_rows = [{"category": c, "rate": v["rate"], "n": v["n"],
                              "share": v.get("mean_share_on_matcher_top"),
                              "overlap": v.get("mean_overlap")}
@@ -1860,7 +1949,6 @@ with tab_results:
                         emb_chart = emb_chart + rule
                     st.altair_chart(emb_chart, width="stretch")
 
-                erows = load_embedding_rows(res_run)
                 if erows is not None and not erows.empty:
                     dis = erows[~erows["agree"]]
                     if dis.empty:
@@ -2073,6 +2161,23 @@ with tab_results:
                           help="answers sharing no keyword with ANY logic — "
                                "excluded from the rates rather than guessed")
 
+                # --- The profile this judge implies, in the profile style ---
+                krows = load_keyword_rows(res_run)
+                if krows is not None and not krows.empty:
+                    st.markdown(
+                        "**The profile this judge implies.** The same chart "
+                        "as the alignment profiles above, but each bar is the "
+                        "mean **keyword share** the lexical judge put on that "
+                        "logic, x100, over the scored answers. Answers "
+                        "matching no keyword of any logic are excluded, "
+                        "exactly as they are from the agreement rates.")
+                    kscored = krows[~krows["no_overlap"]]
+                    if kscored.empty:
+                        st.info("Every answer was no_overlap — nothing to "
+                                "chart yet.")
+                    else:
+                        render_judge_profiles(kscored, "keyword_shares")
+
                 # Head-to-head with the embedding judge when both have been run.
                 if emb and emb["overall"].get("rate") is not None:
                     cmp_rows = []
@@ -2103,7 +2208,6 @@ with tab_results:
                         )
                         st.altair_chart(ccht, width="stretch")
 
-                krows = load_keyword_rows(res_run)
                 if krows is not None and not krows.empty:
                     with st.expander("Matched words behind every verdict",
                                      expanded=False):
