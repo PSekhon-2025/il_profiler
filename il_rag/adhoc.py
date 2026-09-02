@@ -22,17 +22,34 @@ a real one — only the evidence source differs.
 The questionnaire is templated with a subject name, so the caller must supply
 one: the questions literally ask what "{org}" does, and answering them about an
 unnamed entity would change what is being measured.
+
+An analysis can be SAVED (save_run) as a real run snapshot — same folder, same
+filenames as a corpus run, so the post-hoc judges read it with no special
+casing — but stamped kind="adhoc" in meta.json so the study's own pickers can
+filter it out. Two deliberate differences from a corpus snapshot:
+
+  - the rows keep their `retrieved` evidence text. Corpus rows store only
+    chunk ids because the ids resolve against Chroma; ad-hoc chunk ids resolve
+    against nothing once the upload is gone, so the text has to travel with
+    the row or the saved audit trail would be empty.
+  - CURRENT is never moved. That pointer is the corpus pipeline's resume
+    cursor, and a saved document analysis is not something to resume into.
 """
+import csv
 import io
+import json
 import re
 from dataclasses import dataclass
+from datetime import datetime
 
+from . import runs
+from .config import EMBEDDING_MODEL, GENERATION_MODEL
 from .embedding_agreement import _cosine
 from .graded_matcher import match_graded
 from .ingest import chunk_text
 from .llm import embed
 from .profile_harness import aggregate
-from .questionnaire import build_questionnaire
+from .questionnaire import LOGICS, build_questionnaire
 from .rag_qa import answer_question
 from .retriever import Chunk
 
@@ -171,3 +188,102 @@ def analyze(chunks: list[Chunk], vectors: list[list[float]], subject: str,
     profiles = aggregate(rows, [subject], [ADHOC_SOURCE_TYPE])
     return {"subject": subject, "rows": rows,
             "profile": profiles[subject][ADHOC_SOURCE_TYPE]}
+
+
+# ---------------------------------------------------------------------------
+# Persistence: an analysis as a tagged run snapshot
+# ---------------------------------------------------------------------------
+def save_run(result: dict, *, k: int, label: str | None = None,
+             documents: list[str] | None = None) -> str:
+    """Persist one analyze() result as a run snapshot. Returns the run id.
+
+    Writes exactly the files a corpus run writes — per_question.jsonl,
+    company_profiles.json, profiles_matrix.csv, questionnaire.json, meta.json —
+    so every reader in the app and every post-hoc check works on it unchanged.
+    The snapshot is stamped kind="adhoc", and CURRENT is deliberately left
+    alone (see the module docstring).
+    """
+    subject = result["subject"]
+    rows = result["rows"]
+    profile = result["profile"]
+
+    run_id = runs._mint_run_id()
+    paths = runs.run_paths(run_id)
+    paths["dir"].mkdir(parents=True, exist_ok=True)
+
+    with open(paths["per_question"], "w", encoding="utf-8") as f:
+        for r in rows:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+    profiles = {subject: {ADHOC_SOURCE_TYPE: profile}}
+    paths["profiles_json"].write_text(
+        json.dumps(profiles, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    with open(paths["profiles_csv"], "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["org", "source_type", "answered", "abstained", *LOGICS])
+        w.writerow([subject, ADHOC_SOURCE_TYPE, profile["answered"],
+                    profile["abstained"],
+                    *[profile["logic_pct"].get(logic, 0.0) for logic in LOGICS]])
+
+    # The judges (embedding agreement, keyword agreement) read this to recover
+    # the references a row was graded against, so it is not optional.
+    paths["questionnaire"].write_text(
+        json.dumps(runs.snapshot_questionnaire(), ensure_ascii=False, indent=2),
+        encoding="utf-8")
+
+    now = datetime.now().isoformat(timespec="seconds")
+    runs.write_meta(run_id, {
+        "run_id": run_id,
+        "kind": runs.KIND_ADHOC,
+        "label": label or "",
+        "subject": subject,
+        "documents": list(documents or []),
+        "created_at": now,
+        "updated_at": now,
+        "orgs": [subject],
+        "source_types": [ADHOC_SOURCE_TYPE],
+        "k": k,
+        "generation_model": GENERATION_MODEL,
+        "embedding_model": EMBEDDING_MODEL,
+        # An ad-hoc run answers the whole questionnaire in one pass or fails;
+        # there is no resumption, so a saved one is complete by construction.
+        "status": "complete",
+        "answered": sum(1 for r in rows if not r.get("abstain")),
+        "abstained": sum(1 for r in rows if r.get("abstain")),
+        "questions": len(rows),
+    })
+    return run_id
+
+
+def load_run(run_id: str) -> dict | None:
+    """Rebuild an analyze()-shaped result from a saved ad-hoc snapshot.
+
+    Returns None for a run that is missing, unreadable, or not an ad-hoc run —
+    the caller is a picker over ad-hoc runs, so a corpus id reaching here is a
+    bug to degrade on, not to render.
+    """
+    meta = runs.read_meta(run_id)
+    if not runs.is_adhoc(meta):
+        return None
+    paths = runs.run_paths(run_id)
+    if not paths["per_question"].exists() or not paths["profiles_json"].exists():
+        return None
+
+    rows = []
+    with open(paths["per_question"], encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+
+    profiles = json.loads(paths["profiles_json"].read_text(encoding="utf-8"))
+    subject = meta.get("subject") or next(iter(profiles), "")
+    profile = (profiles.get(subject) or {}).get(ADHOC_SOURCE_TYPE)
+    if profile is None or not rows:
+        return None
+    return {"subject": subject, "rows": rows, "profile": profile,
+            "run_id": run_id, "meta": meta}
