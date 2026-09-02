@@ -883,9 +883,22 @@ def zip_members(members: list[tuple[str, bytes]]) -> bytes:
     return buf.getvalue()
 
 
+def visible_runs() -> list[dict]:
+    """Runs the corpus-facing pickers should offer.
+
+    Saved document analyses are hidden by default: they are not part of the
+    study, and the ORGS-keyed charts cannot render an arbitrary subject. The
+    sidebar toggle (shown only once one exists) opts back in, so nothing is
+    permanently unreachable.
+    """
+    if st.session_state.get("show_adhoc_runs"):
+        return runs.list_runs()
+    return runs.list_runs(kind=runs.KIND_CORPUS)
+
+
 def run_selectbox(label: str, key: str, default_run_id: str | None = None) -> str | None:
-    """Dropdown of all runs (newest first); returns the chosen run_id."""
-    metas = runs.list_runs()
+    """Dropdown of selectable runs (newest first); returns the chosen run_id."""
+    metas = visible_runs()
     if not metas:
         return None
     ids = [m["run_id"] for m in metas]
@@ -1002,8 +1015,21 @@ with st.sidebar:
     if all_metas:
         cur_meta = next((m for m in all_metas if m["run_id"] == current_run),
                         all_metas[0])
+        n_adhoc = sum(1 for m in all_metas if runs.is_adhoc(m))
+        n_corpus = len(all_metas) - n_adhoc
         st.caption(f"Active run: **{runs.display_name(cur_meta)}**  \n"
-                   f"{len(all_metas)} run(s) saved")
+                   f"{n_corpus} run(s) saved"
+                   + (f" · {n_adhoc} document analysis(es)" if n_adhoc else ""))
+        if n_adhoc:
+            st.checkbox(
+                "Show document analyses in run pickers",
+                key="show_adhoc_runs",
+                help="Saved document analyses are real run snapshots, so the "
+                     "Audit tab and the post-hoc judges work on them. They are "
+                     "hidden from the run pickers by default because they are "
+                     "not part of the six-profile study, and the Results "
+                     "charts key on the three labs so they cannot plot an "
+                     "uploaded subject.")
 
 (tab_run, tab_results, tab_audit, tab_halluc, tab_topics, tab_adhoc,
  tab_compare) = st.tabs(
@@ -4905,10 +4931,44 @@ with tab_adhoc:
             "what \"{org}\" does. Answering them about an unnamed entity would "
             "change what is being measured, so the name is an input, not a "
             "label.\n"
-            "- *Scope.* Results live in this browser session and can be "
-            "downloaded. They are not saved as a run snapshot, so they never "
-            "appear in Results, Compare, or the other checks."
+            "- *Scope.* A result lives in this browser session until you "
+            "**save** it. Saving writes a real run snapshot — the same files a "
+            "corpus run writes — tagged as a document analysis, so the Audit "
+            "tab and the post-hoc judges read it unchanged. It stays out of "
+            "the run pickers by default (a sidebar toggle opts in): an "
+            "uploaded document is not part of the six-profile study, and the "
+            "Results charts key on the three labs, so they cannot plot an "
+            "arbitrary subject."
         )
+
+    saved = runs.list_runs(kind=runs.KIND_ADHOC)
+    if saved:
+        with st.expander(f"📂 Saved analyses ({len(saved)})", expanded=False):
+            st.caption(
+                "Each one is a run snapshot on disk. Reloading shows it below "
+                "exactly as it looked when saved — including the evidence text, "
+                "which travels with the row because uploaded chunks are never "
+                "indexed."
+            )
+            ids = [m["run_id"] for m in saved]
+            names = {m["run_id"]: runs.display_name(m) for m in saved}
+            pick = st.selectbox("Analysis", ids, key="adhoc_saved_pick",
+                                format_func=lambda r: names.get(r, r))
+            pm = next((m for m in saved if m["run_id"] == pick), {})
+            docs_in = pm.get("documents") or []
+            st.caption(
+                f"Saved {pm.get('created_at', '?')} · k={pm.get('k', '?')} · "
+                f"{pm.get('answered', 0)} answered / {pm.get('abstained', 0)} "
+                "abstained"
+                + (f" · files: {', '.join(docs_in)}" if docs_in else ""))
+            if st.button("Load this analysis", key="adhoc_load"):
+                loaded = adhoc_mod.load_run(pick)
+                if loaded is None:
+                    st.error("That snapshot could not be read.")
+                else:
+                    st.session_state["adhoc_result"] = loaded
+                    st.session_state["adhoc_saved_as"] = pick
+                    st.rerun()
 
     ad1, ad2 = st.columns([2, 1])
     subject = ad1.text_input(
@@ -4969,7 +5029,10 @@ with tab_adhoc:
                     result = None
                 else:
                     bar.empty()
+                    result["documents"] = [d.filename for d in ok]
+                    result["k"] = adhoc_k
                     st.session_state["adhoc_result"] = result
+                    st.session_state.pop("adhoc_saved_as", None)
                     st.success("Done.")
 
     res = st.session_state.get("adhoc_result")
@@ -5025,6 +5088,41 @@ with tab_adhoc:
                                          f"(similarity {ev['score']:.3f})"):
                             st.text(ev["text"])
 
+        # --- Save this analysis as a run snapshot ---
+        saved_as = st.session_state.get("adhoc_saved_as")
+        if saved_as:
+            st.success(
+                f"Saved as **{saved_as}**. It is on disk under "
+                "`data/profiles/runs/`, reloadable above, and the Audit tab "
+                "and post-hoc judges can read it — enable **Show document "
+                "analyses in run pickers** in the sidebar to select it there.",
+                icon="💾")
+        else:
+            with st.container(border=True):
+                st.markdown("**Save this analysis**")
+                st.caption(
+                    "Writes a run snapshot so the result survives closing this "
+                    "tab. Tagged as a document analysis, so it stays out of the "
+                    "study's run pickers unless you opt in from the sidebar."
+                )
+                sv1, sv2 = st.columns([2, 1])
+                save_label = sv1.text_input(
+                    "Label (optional)", key="adhoc_save_label",
+                    placeholder="e.g. Acme 2026 annual report")
+                sv2.markdown("&nbsp;", unsafe_allow_html=True)
+                if sv2.button("💾 Save analysis", type="primary",
+                              key="adhoc_save"):
+                    try:
+                        rid = adhoc_mod.save_run(
+                            res, k=res.get("k", TOP_K),
+                            label=save_label.strip() or None,
+                            documents=res.get("documents"))
+                    except Exception as e:  # noqa: BLE001 — surface, don't crash
+                        st.error(f"Could not save: {e}")
+                    else:
+                        st.session_state["adhoc_saved_as"] = rid
+                        st.rerun()
+
         dl1, dl2 = st.columns(2)
         dl1.download_button(
             "profile.json",
@@ -5037,6 +5135,7 @@ with tab_adhoc:
             file_name=f"adhoc_rows_{res['subject']}.jsonl")
         if st.button("Clear result", key="adhoc_clear"):
             del st.session_state["adhoc_result"]
+            st.session_state.pop("adhoc_saved_as", None)
             st.rerun()
 
 
@@ -5045,7 +5144,7 @@ with tab_adhoc:
 # ---------------------------------------------------------------------------
 with tab_compare:
     st.header("Compare two runs")
-    metas = runs.list_runs()
+    metas = visible_runs()
     if len(metas) < 2:
         st.info(
             "Need at least two saved runs to compare. After you change the "
