@@ -126,9 +126,29 @@ def test_superset_first_still_suppresses_the_subset():
 
 
 def test_inflections_collapse_to_the_higher_ranked_form():
-    kws, _ = tp.select_keywords(["evaluation", "evaluations", "american",
-                                 "americas", "safety"])
-    assert kws == ["evaluation", "american", "safety"]
+    kws, _ = tp.select_keywords(["evaluation", "evaluations", "model",
+                                 "models", "safety"])
+    assert kws == ["evaluation", "model", "safety"]
+
+
+def test_inflection_rule_covers_the_y_and_e_endings():
+    """company/companies and evaluate/evaluating are still one word each."""
+    assert tp._same_stem("company", "companies")
+    assert tp._same_stem("evaluate", "evaluating")
+    assert tp._same_stem("train", "training")
+
+
+def test_terms_of_art_are_not_treated_as_inflections():
+    """'r' and 'y'/'e' are not English inflections, so these are two words.
+
+    'compute' is a term of art in this corpus and must not lose its slot to
+    'computer'; policy/police was a known collision of the older length-based
+    rule.
+    """
+    assert not tp._same_stem("compute", "computer")
+    assert not tp._same_stem("policy", "police")
+    kws, _ = tp.select_keywords(["compute", "computer", "cluster"])
+    assert kws == ["compute", "computer", "cluster"]
 
 
 def test_distinct_words_sharing_a_prefix_are_kept():
@@ -193,7 +213,9 @@ def test_describe_topic_flags_templated_clusters_but_keeps_keywords():
     d = tp.describe_topic(["dividend", "quarterly", "moving average"],
                           duplication=0.61)
     assert d["is_boilerplate"] is True
-    assert d["label"].startswith("⚠ ")
+    # The label is plain data — the flag lives in is_boilerplate, and the
+    # marker is applied by display_label at render time.
+    assert d["label"] == "dividend, quarterly, moving average"
     # The keywords stay: which boilerplate it is is what makes the flag useful.
     assert d["keywords"] == ["dividend", "quarterly", "moving average"]
     assert d["duplication"] == 0.61
@@ -217,3 +239,22 @@ def test_describe_topic_without_a_duplication_signal_omits_the_field():
     d = tp.describe_topic(["settlement", "copyright", "authors"])
     assert "duplication" not in d
     assert d["is_boilerplate"] is False
+
+
+def test_display_label_applies_the_marker_only_to_flagged_topics():
+    flagged = {"label": "dividend, quarterly", "is_boilerplate": True}
+    real = {"label": "settlement, copyright", "is_boilerplate": False}
+    assert tp.display_label(flagged) == "\u26a0 dividend, quarterly"
+    assert tp.display_label(real) == "settlement, copyright"
+
+
+def test_display_label_does_not_double_mark_a_legacy_label():
+    """Snapshots written before the marker moved out of the data carry it."""
+    legacy = {"label": "\u26a0 dividend, quarterly", "is_boilerplate": True}
+    assert tp.display_label(legacy) == "\u26a0 dividend, quarterly"
+
+
+def test_clean_label_strips_a_legacy_marker_and_tolerates_junk():
+    assert tp.clean_label("\u26a0 motley fool") == "motley fool"
+    assert tp.clean_label("motley fool") == "motley fool"
+    assert tp.clean_label(None) == ""
