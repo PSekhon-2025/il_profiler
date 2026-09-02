@@ -4065,6 +4065,39 @@ with tab_topics:
                 "the c-TF-IDF one is a word count, the cross-tab one is a set "
                 "of questions.")
         st.markdown(
+            "**Naming, in detail.** c-TF-IDF ranks far more terms than the ten "
+            "kept, because most of the top of that list restates the same "
+            "thing: measured on this model, **21% of keyword slots** held a "
+            "redundant phrase (*opus* then *claude opus*, *opus 46*), an "
+            "inflection (*evaluation* then *evaluations*) or a bare number. "
+            "`select_keywords` walks the ranked list and keeps a term only if "
+            "it is not a token-subset, token-superset or inflection of one "
+            "already kept, so every slot carries a distinct idea. Corpus "
+            "furniture that survived ingest — the Newstex licensing footer, "
+            "citation fragments like *arxiv*, *doi*, *et al* — is dropped by a "
+            "narrow stoplist applied both here and to the vectorizer."
+        )
+        st.markdown(
+            "**Boilerplate topics.** Some clusters *are* furniture: wire "
+            "licensing text and auto-generated market reports repeat "
+            "near-verbatim across documents, so they cluster tightly and would "
+            "otherwise read as themes. They are detected structurally rather "
+            "than by vocabulary — the mean pairwise overlap of a topic's own "
+            "chunks:"
+        )
+        st.latex(r"D_k=\operatorname*{mean}_{a\neq b \in S_k}"
+                 r"\frac{\lvert T(a)\cap T(b)\rvert}"
+                 r"{\lvert T(a)\cup T(b)\rvert}")
+        st.markdown(
+            "over a seeded sample $S_k$ of the topic's chunks, flagged at "
+            f"$D_k \\ge {topics_mod.KEYWORD_BOILERPLATE_DUPLICATION}$. On this "
+            "corpus every hand-checked real topic scored at most 0.08 and "
+            "every boilerplate cluster at least 0.30, so the bar sits in an "
+            "empty band. Reference sections are the known gap: they cite "
+            "*different* papers, so they do not repeat and are not caught "
+            "this way."
+        )
+        st.markdown(
             "**Coverage audit.** Topics that appear in **no** row's retrieved "
             "evidence are corpus regions the questionnaire never reaches — a "
             "structural blind spot of the instrument, not of the corpus."
@@ -4112,15 +4145,40 @@ with tab_topics:
                   delta=f"{tinfo['n_outliers']:,} unclustered",
                   delta_color="off")
         c3.metric("Min topic size", tinfo["min_topic_size"])
-        c4.metric("Seed", tinfo["seed"],
-                  help="UMAP random_state — fixed so topics reproduce")
-        st.caption(f"Fitted {tinfo.get('fitted_at', '?')}")
+        n_boiler = sum(1 for r in tinfo["topics"]
+                       if r.get("is_boilerplate") and not r["is_outlier"])
+        if n_boiler:
+            c4.metric("Boilerplate topics", n_boiler,
+                      help="clusters of templated text (wire-service licensing "
+                           "footers, auto-generated stock reports) rather than "
+                           "themes — flagged by how much their chunks repeat "
+                           "each other, and excluded below by default")
+        else:
+            c4.metric("Seed", tinfo["seed"],
+                      help="UMAP random_state — fixed so topics reproduce")
+        st.caption(
+            f"Fitted {tinfo.get('fitted_at', '?')}"
+            + (f" · relabelled {tinfo['relabelled_at']}"
+               if tinfo.get("relabelled_at") else "")
+            + f" · seed {tinfo.get('seed', '?')}")
+
+        real = [r for r in tinfo["topics"] if not r["is_outlier"]]
+        if n_boiler:
+            show_boiler = st.checkbox(
+                f"Include the {n_boiler} boilerplate topic(s)", value=False,
+                key="topics_show_boiler",
+                help="They are real clusters, so they are kept and labelled "
+                     "with a warning rather than deleted — but they describe "
+                     "the corpus's licensing footers and templated market "
+                     "reports, not what the labs talk about.")
+            if not show_boiler:
+                real = [r for r in real if not r.get("is_boilerplate")]
 
         tdf = pd.DataFrame([
             {"topic": r["topic"], "size": r["size"], "label": r["label"],
              **{f"n_{o}": r["by_org"].get(o, 0) for o in ORGS},
              **{f"n_{s}": r["by_source"].get(s, 0) for s in SOURCE_TYPES}}
-            for r in tinfo["topics"] if not r["is_outlier"]
+            for r in real
         ])
 
         st.subheader("What the corpus is about")
