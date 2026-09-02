@@ -2570,7 +2570,7 @@ with tab_audit:
             chunk_topic_map = topics_mod.load_chunk_topics() or {}
             tinfo_a = topics_mod.load_topic_info()
             if tinfo_a:
-                topic_label_map = {r["topic"]: r["label"]
+                topic_label_map = {r["topic"]: topics_mod.clean_label(r["label"])
                                    for r in tinfo_a["topics"]}
 
         for _, row in view.iterrows():
@@ -4175,7 +4175,8 @@ with tab_topics:
                 real = [r for r in real if not r.get("is_boilerplate")]
 
         tdf = pd.DataFrame([
-            {"topic": r["topic"], "size": r["size"], "label": r["label"],
+            {"topic": r["topic"], "size": r["size"],
+             "label": topics_mod.display_label(r),
              **{f"n_{o}": r["by_org"].get(o, 0) for o in ORGS},
              **{f"n_{s}": r["by_source"].get(s, 0) for s in SOURCE_TYPES}}
             for r in real
@@ -4231,7 +4232,7 @@ with tab_topics:
                 st.warning("No topic meets that retrieval threshold.")
             else:
                 heat = pd.DataFrame([
-                    {"topic": f"{r['topic']}: {r['label'][:34]}",
+                    {"topic": f"{r['topic']}: {topics_mod.clean_label(r['label'])[:34]}",
                      "logic": logic, "pct": r["logic_pct"][logic],
                      "retrievals": r["retrievals"]}
                     for r in shown for logic in LOGICS
@@ -4242,7 +4243,8 @@ with tab_topics:
                     .encode(
                         x=alt.X("logic:N", sort=LOGICS, title=None),
                         y=alt.Y("topic:N", title=None,
-                                sort=[f"{r['topic']}: {r['label'][:34]}"
+                                sort=[f"{r['topic']}: "
+                                      f"{topics_mod.clean_label(r['label'])[:34]}"
                                       for r in shown]),
                         color=alt.Color("pct:Q", title="% of logic mass",
                                         scale=alt.Scale(scheme="blues")),
@@ -4342,7 +4344,9 @@ with tab_topics:
                     "questionnaire, not of the corpus:")
                 st.dataframe(
                     pd.DataFrame(cov["never_retrieved"])[
-                        ["topic", "size", "label"]],
+                        ["topic", "size", "label"]].assign(
+                            label=lambda d: d["label"].map(
+                                topics_mod.clean_label)),
                     hide_index=True, width="stretch")
             else:
                 st.success("Every topic was reached by at least one question.")
@@ -4732,9 +4736,12 @@ with tab_topics:
                 if not shown:
                     st.warning("No topic meets that threshold.")
                 else:
-                    labels = [f"{t['topic']}: {str(t['label'])[:34]}" for t in shown]
+                    labels = [f"{t['topic']}: "
+                              f"{topics_mod.clean_label(t['label'])[:34]}"
+                              for t in shown]
                     heat = pd.DataFrame([
-                        {"topic": f"{t['topic']}: {str(t['label'])[:34]}",
+                        {"topic": f"{t['topic']}: "
+                                  f"{topics_mod.clean_label(t['label'])[:34]}",
                          "tier": tier,
                          "share": t.get(col) or 0.0,
                          "rows": t["n_rows"]}
@@ -4767,7 +4774,7 @@ with tab_topics:
                 if worst and (worst.get("dropped_share") or 0) > 0.75:
                     st.warning(
                         f"Topic **{worst['topic']}** "
-                        f"({str(worst['label'])[:60]}) loses "
+                        f"({topics_mod.clean_label(worst['label'])[:60]}) loses "
                         f"{worst['dropped_share']:.0%} of its vocabulary: the "
                         "answers grounded in it do not carry those words "
                         "verbatim, as inflections, or as neighbours. Worth "

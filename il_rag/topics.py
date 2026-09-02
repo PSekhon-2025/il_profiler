@@ -123,6 +123,11 @@ KEYWORD_STOP_PHRASES = frozenset({
 # everything, what is left is not a theme.
 KEYWORD_MIN_USEFUL = 3
 
+# Presentation only. A stored `label` is plain data — the marker is added when
+# a topic is rendered, so nothing downstream (CSV exports, chart axes, saved
+# cross-tabs) inherits a glyph it then has to strip.
+BOILERPLATE_MARK = "\u26a0 "
+
 # The stoplist cleans furniture OUT of real topics; this catches clusters that
 # ARE furniture. Machine-generated text (Newstex licensing footers,
 # BuySellSignals templated stock reports) repeats near-verbatim across
@@ -183,15 +188,30 @@ def load_corpus_vectors() -> tuple[list[str], list[str], list[dict], list]:
 _NON_WORD_RE = re.compile(r"^[\d\W_]+$")
 
 
+# What the two remainders after a shared prefix may be for the pair to count as
+# one word inflected, keyed by the SHORTER remainder. A length bound alone is
+# not enough: "compute"/"computer" leaves "" and "r", which is within any
+# sane bound but is not an English inflection — and in this corpus "compute"
+# is a term of art distinct from "computer", so collapsing them costs a real
+# keyword. Requiring an actual inflectional ending also retires the
+# policy/police collision the previous rule knowingly accepted ("y"/"e" is not
+# a pair here). Pairs like american/americas are no longer collapsed either:
+# they are different words, and spending a second slot on one is the cheaper
+# error.
+_INFLECTION_PAIRS = {
+    "":  frozenset({"s", "es", "d", "ed", "ing"}),
+    "e": frozenset({"es", "ed", "ing"}),
+    "y": frozenset({"ies", "ied", "ying"}),
+}
+
+
 def _same_stem(a: str, b: str) -> bool:
     """Cheap inflection test for two single tokens: evaluation/evaluations.
 
-    A shared prefix of >= 5 characters with both remainders <= 3. Deliberately
-    NOT topic_keywords.morph_score, which would be a circular import (that
-    module imports this one); the rule is also tighter, because here a false
-    positive only costs one label slot. It accepts the same documented
-    collision class as the morph rung does (policy/police), which is why the
-    prefix bar is 5 rather than 3.
+    A shared prefix of >= 5 characters, and the two remainders must form one of
+    _INFLECTION_PAIRS. Deliberately NOT topic_keywords.morph_score, which would
+    be a circular import (that module imports this one); the rule is also
+    tighter, because a false positive here silently costs a label slot.
     """
     if a == b:
         return True
@@ -200,7 +220,10 @@ def _same_stem(a: str, b: str) -> bool:
         if x != y:
             break
         n += 1
-    return n >= 5 and (len(a) - n) <= 3 and (len(b) - n) <= 3
+    if n < 5:
+        return False
+    short, long = sorted((a[n:], b[n:]), key=len)
+    return long in _INFLECTION_PAIRS.get(short, frozenset())
 
 
 def _is_redundant(term: str, kept: list[str]) -> bool:
@@ -283,6 +306,26 @@ def duplication_score(texts: list[str], cap: int = DUPLICATION_SAMPLE,
     return (total / pairs) if pairs else 0.0
 
 
+def clean_label(label) -> str:
+    """A stored label with any presentation marker stripped.
+
+    Snapshots written before the marker moved out of the data carry a leading
+    "\u26a0 ", including topic_info.json on the deployed volume and the labels
+    copied into saved run cross-tabs. Stripping on the way out keeps those
+    readable without a migration.
+    """
+    text = str(label or "")
+    while text.startswith(BOILERPLATE_MARK):
+        text = text[len(BOILERPLATE_MARK):]
+    return text
+
+
+def display_label(record: dict) -> str:
+    """How a topic is named in the UI — the one place the marker is applied."""
+    label = clean_label(record.get("label"))
+    return BOILERPLATE_MARK + label if record.get("is_boilerplate") else label
+
+
 def describe_topic(candidates: list[str], n: int = DEFAULT_N_KEYWORDS,
                    duplication: float | None = None) -> dict:
     """Keywords, display label and a boilerplate verdict for one topic.
@@ -302,9 +345,9 @@ def describe_topic(candidates: list[str], n: int = DEFAULT_N_KEYWORDS,
     else:
         # The keywords are kept even when flagged — knowing WHICH boilerplate
         # a cluster is (a dividend template vs a licensing footer) is what
-        # makes the flag actionable. The marker just stops it being read as a
-        # finding.
-        label = ("⚠ " if boilerplate else "") + ", ".join(keywords[:4])
+        # makes the flag actionable. The label stays clean data: `is_boilerplate`
+        # is the signal, and display_label is where it becomes a marker.
+        label = ", ".join(keywords[:4])
     out = {"keywords": keywords, "label": label,
            "is_boilerplate": boilerplate, "n_furniture_terms": furniture}
     if duplication is not None:
