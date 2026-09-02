@@ -40,17 +40,35 @@ Design notes:
   - Seeded. UMAP is stochastic; without a fixed random_state the topics move
     between runs. The seed is recorded in the output.
 
+Naming a topic is its own problem, handled in select_keywords/describe_topic:
+c-TF-IDF's top terms are heavily redundant (measured on the fitted model, 21%
+of keyword slots held a restatement like "opus" -> "claude opus" -> "opus 46",
+an inflection, or a bare number), and the corpus's own furniture — Newstex
+licensing footers, citation fragments — ranks highly wherever it survived
+ingest. Keywords are therefore selected from a deep candidate pool with
+redundancy and furniture removed, and whole clusters that ARE furniture are
+flagged by how much their chunks repeat one another rather than by vocabulary.
+Known gap: reference sections cite different papers, so they do not repeat and
+are not flagged; they surface as an ordinary "citations" topic.
+
+`relabel_topics` recomputes all of that over the EXISTING clusters, so the
+naming can be improved without a re-fit renumbering every topic and
+invalidating the cross-tabs already saved in run folders.
+
 Outputs:
-  data/topics/topic_info.json    per-topic keywords, sizes, lab/source splits
+  data/topics/topic_info.json    per-topic keywords, sizes, lab/source splits,
+                                 duplication score and boilerplate flag
   data/topics/chunk_topics.json  {chunk_id: topic_id} for every indexed chunk
   <run>/topics/topic_logic.json  the cross-tab + coverage audit for one run
 """
 import json
+import re
 from collections import defaultdict
 from datetime import datetime
 
 from . import runs
 from .config import CHROMA_DIR, COLLECTION_NAME, DATA_DIR, ORGS, SOURCE_TYPES
+from .grounding import content_tokens
 from .questionnaire import LOGICS
 
 TOPICS_DIR = DATA_DIR / "topics"
@@ -65,6 +83,62 @@ RUN_CROSSTAB_NAME = "topic_logic.json"
 OUTLIER_TOPIC = -1
 
 DEFAULT_MIN_TOPIC_SIZE = 25
+DEFAULT_N_KEYWORDS = 10
+# c-TF-IDF is asked for this many times the keywords actually wanted, because
+# select_keywords throws most of them away. Measured on the fitted model, 21%
+# of stored slots were redundant or numeric, and filtering a 10-term list just
+# leaves a shorter list — the pool is what refills the freed slots with real
+# vocabulary.
+KEYWORD_CANDIDATE_MULTIPLIER = 4
+
+# Corpus furniture that survives ingest.strip_boilerplate and reaches c-TF-IDF.
+# Every entry was found by mining the fitted model's own labels, not guessed:
+# Newstex is the wire service whose licensing footer is appended to press
+# records, and the citation block is reference sections in published PDFs.
+# Deliberately narrow — only tokens with no plausible institutional reading, so
+# ordinary words are never silenced. Passed to the vectorizer (which stops the
+# bigrams too, since they cannot form without their tokens) AND re-checked in
+# select_keywords, so a model fitted before this existed still benefits.
+KEYWORD_STOP_TOKENS = frozenset({
+    # Newstex press-feed licensing footer
+    "newstex", "redistributors", "authoritative",
+    # reference sections / citation furniture, including the fragments URLs
+    # leave behind once punctuation is stripped (arxiv.org/abs/... -> org, abs)
+    "arxiv", "preprint", "doi", "url", "http", "https", "isbn", "pp",
+    "et", "al", "eprint", "bibtex", "org", "abs", "www", "html", "vol",
+    # honorifics left by the press exports
+    "mr", "mrs", "ms",
+})
+
+# Multi-word boilerplate whose individual tokens ARE ordinary English, so they
+# must not go in KEYWORD_STOP_TOKENS. Matched as whole phrases only.
+KEYWORD_STOP_PHRASES = frozenset({
+    "sole discretion", "expressly reserve", "reserve right", "right delete",
+    "delete stories", "stories sole", "discretion journal",
+    "redistributors expressly", "authoritative content",
+})
+
+# A topic whose surviving keywords fall below this is reported as boilerplate
+# rather than given a label that reads like a theme: if the stoplist ate almost
+# everything, what is left is not a theme.
+KEYWORD_MIN_USEFUL = 3
+
+# The stoplist cleans furniture OUT of real topics; this catches clusters that
+# ARE furniture. Machine-generated text (Newstex licensing footers,
+# BuySellSignals templated stock reports) repeats near-verbatim across
+# documents, so a topic's chunks overlap each other far more than a real
+# theme's do. Measured on the fitted model with mean pairwise Jaccard over
+# content tokens: every hand-checked real topic scored <= 0.082 (opus 0.036,
+# copyright lawsuit 0.063, interpretability 0.082) and every hand-checked
+# boilerplate cluster >= 0.303 (Motley Fool 0.303, Newstex footer 0.619). The
+# bar sits in that empty band. It does NOT catch reference sections, which
+# cite different papers and so do not repeat — see the module docstring.
+KEYWORD_BOILERPLATE_DUPLICATION = 0.25
+# Chunks sampled per topic for that estimate. Pairwise cost is quadratic and
+# the statistic is stable well before this, so the cap is what keeps
+# relabelling a seconds-long operation on a 15.5k-chunk corpus.
+DUPLICATION_SAMPLE = 25
+DUPLICATION_SEED = 0
 DEFAULT_SEED = 42
 # Chroma is paged rather than read in one call: .get() with no limit
 # materializes every embedding at once, which is the one place this module
@@ -104,11 +178,146 @@ def load_corpus_vectors() -> tuple[list[str], list[str], list[dict], list]:
 
 
 # ---------------------------------------------------------------------------
+# Keyword selection (pure — no BERTopic, no corpus)
+# ---------------------------------------------------------------------------
+_NON_WORD_RE = re.compile(r"^[\d\W_]+$")
+
+
+def _same_stem(a: str, b: str) -> bool:
+    """Cheap inflection test for two single tokens: evaluation/evaluations.
+
+    A shared prefix of >= 5 characters with both remainders <= 3. Deliberately
+    NOT topic_keywords.morph_score, which would be a circular import (that
+    module imports this one); the rule is also tighter, because here a false
+    positive only costs one label slot. It accepts the same documented
+    collision class as the morph rung does (policy/police), which is why the
+    prefix bar is 5 rather than 3.
+    """
+    if a == b:
+        return True
+    n = 0
+    for x, y in zip(a, b):
+        if x != y:
+            break
+        n += 1
+    return n >= 5 and (len(a) - n) <= 3 and (len(b) - n) <= 3
+
+
+def _is_redundant(term: str, kept: list[str]) -> bool:
+    """Does `term` restate something already kept?
+
+    Two ways, both seen in the fitted model:
+      - phrase containment: "opus" already kept makes "claude opus", "opus 46"
+        and "opus 45" redundant (they are the same subject, spending three more
+        of ten slots).
+      - inflection: "evaluations" after "evaluation", "americas" after
+        "american".
+    Containment is checked on TOKEN SETS rather than substrings so that
+    "national security" is caught by "national" but "inter" does not swallow
+    "interpretability".
+    """
+    tokens = set(term.split())
+    for k in kept:
+        ktokens = set(k.split())
+        if tokens <= ktokens or ktokens <= tokens:
+            return True
+        if len(tokens) == 1 and len(ktokens) == 1 and _same_stem(term, k):
+            return True
+    return False
+
+
+def select_keywords(candidates: list[str],
+                    n: int = DEFAULT_N_KEYWORDS) -> tuple[list[str], int]:
+    """Pick up to `n` informative, non-redundant keywords from a ranked list.
+
+    `candidates` is c-TF-IDF order (most distinctive first) and is walked in
+    that order, so the strongest term always wins its slot and only weaker
+    restatements are dropped. Returns (keywords, n_dropped_as_furniture) — the
+    second value is what flags a topic as boilerplate, and it counts only
+    stoplist hits, never redundancy, because a topic full of synonyms is a real
+    topic while a topic full of licensing text is not.
+    """
+    kept: list[str] = []
+    furniture = 0
+    for raw in candidates:
+        term = " ".join(str(raw).lower().split())
+        if not term or _NON_WORD_RE.match(term):
+            continue                                  # "46", "2021", "-"
+        if term in KEYWORD_STOP_PHRASES:
+            furniture += 1
+            continue
+        if any(tok in KEYWORD_STOP_TOKENS for tok in term.split()):
+            furniture += 1
+            continue
+        if _is_redundant(term, kept):
+            continue
+        kept.append(term)
+        if len(kept) >= n:
+            break
+    return kept, furniture
+
+
+def duplication_score(texts: list[str], cap: int = DUPLICATION_SAMPLE,
+                      seed: int = DUPLICATION_SEED) -> float:
+    """Mean pairwise Jaccard overlap of a topic's chunks, in [0, 1].
+
+    How much the same words recur across a topic's documents. A real theme
+    discusses one subject in many different ways and scores low; templated
+    text repeats itself and scores high. Sampled (seeded, so a rerun
+    reproduces the number) because the pair count is quadratic.
+    """
+    import random as _random
+
+    rnd = _random.Random(seed)
+    sample = texts if len(texts) <= cap else rnd.sample(texts, cap)
+    token_sets = [ts for ts in (content_tokens(x or "") for x in sample) if ts]
+    if len(token_sets) < 2:
+        return 0.0
+    total = pairs = 0.0
+    for i, a in enumerate(token_sets):
+        for b in token_sets[i + 1:]:
+            union = len(a | b)
+            if union:
+                total += len(a & b) / union
+                pairs += 1
+    return (total / pairs) if pairs else 0.0
+
+
+def describe_topic(candidates: list[str], n: int = DEFAULT_N_KEYWORDS,
+                   duplication: float | None = None) -> dict:
+    """Keywords, display label and a boilerplate verdict for one topic.
+
+    Two independent boilerplate signals, because they catch different things:
+    a high `duplication` means the cluster IS templated text, while an
+    exhausted keyword list means the stoplist removed nearly everything the
+    cluster had to say. Either one marks the topic.
+    """
+    keywords, furniture = select_keywords(candidates, n)
+    templated = (duplication is not None
+                 and duplication >= KEYWORD_BOILERPLATE_DUPLICATION)
+    starved = len(keywords) < KEYWORD_MIN_USEFUL and furniture > 0
+    boilerplate = templated or starved
+    if not keywords:
+        label = "(no distinctive terms)"
+    else:
+        # The keywords are kept even when flagged — knowing WHICH boilerplate
+        # a cluster is (a dividend template vs a licensing footer) is what
+        # makes the flag actionable. The marker just stops it being read as a
+        # finding.
+        label = ("⚠ " if boilerplate else "") + ", ".join(keywords[:4])
+    out = {"keywords": keywords, "label": label,
+           "is_boilerplate": boilerplate, "n_furniture_terms": furniture}
+    if duplication is not None:
+        out["duplication"] = round(float(duplication), 4)
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Fitting (the only part that needs BERTopic)
 # ---------------------------------------------------------------------------
 def fit_topics(min_topic_size: int = DEFAULT_MIN_TOPIC_SIZE,
                seed: int = DEFAULT_SEED,
-               n_keywords: int = 10) -> dict:
+               n_keywords: int = DEFAULT_N_KEYWORDS) -> dict:
     """Cluster the corpus into topics from the stored embeddings.
 
     Heavy imports happen here and nowhere else, so this module stays importable
@@ -137,11 +346,12 @@ def fit_topics(min_topic_size: int = DEFAULT_MIN_TOPIC_SIZE,
     # rerun reproduces the same topics — the same reason the bootstrap is seeded.
     umap_model = UMAP(n_neighbors=15, n_components=5, min_dist=0.0,
                       metric="cosine", random_state=seed)
-    # English stopwords at the REPRESENTATION stage only: clustering already
-    # happened in embedding space, this just keeps "the/and/of" out of the
-    # keywords that name each topic.
-    vectorizer = CountVectorizer(stop_words="english", min_df=2,
-                                 ngram_range=(1, 2))
+    # Stopwords at the REPRESENTATION stage only: clustering already happened
+    # in embedding space, this just decides which words NAME each topic. The
+    # corpus furniture goes in here as well as in select_keywords, because a
+    # stopped token cannot form a bigram either — which is what removes
+    # "newstex authoritative" and "arxiv preprint" at the source.
+    vectorizer = _keyword_vectorizer()
 
     model = BERTopic(
         embedding_model=None,          # embeddings are supplied, never computed
@@ -150,6 +360,9 @@ def fit_topics(min_topic_size: int = DEFAULT_MIN_TOPIC_SIZE,
         ctfidf_model=ClassTfidfTransformer(reduce_frequent_words=True),
         min_topic_size=min_topic_size,
         calculate_probabilities=False,
+        # Ask for far more terms than are kept: select_keywords discards the
+        # redundant ones, and without a deep pool the freed slots stay empty.
+        top_n_words=n_keywords * KEYWORD_CANDIDATE_MULTIPLIER,
         verbose=True,
     )
     topics, _ = model.fit_transform(docs, embeddings=embeddings)
@@ -165,16 +378,23 @@ def fit_topics(min_topic_size: int = DEFAULT_MIN_TOPIC_SIZE,
         by_org[t][m.get("org", "?")] += 1
         by_source[t][m.get("source_type", "?")] += 1
 
+    texts_by_topic: dict = defaultdict(list)
+    for t, doc in zip(topics, docs):
+        texts_by_topic[t].append(doc)
+
     topic_records = []
     for t in sorted(sizes):
-        words = [w for w, _ in (model.get_topic(t) or [])][:n_keywords]
+        candidates = [w for w, _ in (model.get_topic(t) or [])]
+        described = describe_topic(
+            candidates, n_keywords,
+            duplication=duplication_score(texts_by_topic[t]))
         topic_records.append({
             "topic": t,
             "size": sizes[t],
             "is_outlier": t == OUTLIER_TOPIC,
-            "keywords": words,
+            **described,
             "label": ("(unclustered)" if t == OUTLIER_TOPIC
-                      else ", ".join(words[:4])),
+                      else described["label"]),
             "by_org": {o: by_org[t].get(o, 0) for o in ORGS},
             "by_source": {s: by_source[t].get(s, 0) for s in SOURCE_TYPES},
         })
@@ -200,6 +420,186 @@ def fit_topics(min_topic_size: int = DEFAULT_MIN_TOPIC_SIZE,
         if not r["is_outlier"]:
             print(f"  topic {r['topic']:>3}  n={r['size']:<5} {r['label']}")
     return info
+
+
+def _keyword_vectorizer():
+    """The CountVectorizer both fitting and relabelling name topics with.
+
+    One definition so a relabel can never disagree with the fit that produced
+    the clusters it is renaming.
+    """
+    from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS, CountVectorizer
+    return CountVectorizer(
+        stop_words=sorted(set(ENGLISH_STOP_WORDS) | KEYWORD_STOP_TOKENS),
+        min_df=2, ngram_range=(1, 2))
+
+
+def load_corpus_documents() -> tuple[list[str], list[str]]:
+    """Every indexed chunk's id and text — WITHOUT the embeddings.
+
+    load_corpus_vectors' light half. Relabelling only needs the words, and
+    pulling 15.5k x 1024 floats to count them would be the one thing that
+    makes a cheap operation expensive.
+    """
+    import chromadb
+    from chromadb.config import Settings
+
+    client = chromadb.PersistentClient(
+        path=str(CHROMA_DIR), settings=Settings(anonymized_telemetry=False))
+    col = client.get_collection(COLLECTION_NAME)
+    total = col.count()
+    ids: list[str] = []
+    docs: list[str] = []
+    for offset in range(0, total, FETCH_PAGE):
+        page = col.get(limit=FETCH_PAGE, offset=offset, include=["documents"])
+        ids.extend(page["ids"])
+        docs.extend(page["documents"])
+    return ids, docs
+
+
+def relabel_topics(n_keywords: int = DEFAULT_N_KEYWORDS) -> dict:
+    """Recompute every topic's keywords WITHOUT re-clustering.
+
+    The clusters are read from chunk_topics.json and left exactly as they are;
+    only c-TF-IDF is recomputed, over the same corpus with the improved
+    vectorizer, and re-selected. That matters because re-fitting would renumber
+    every topic and silently invalidate the cross-tabs already saved inside run
+    folders — whereas a label is just a name for a cluster that has not moved.
+
+    Needs scikit-learn and BERTopic's c-TF-IDF (both local-only extras), plus
+    the Chroma index for the text. No embeddings, no API calls, no UMAP.
+    """
+    try:
+        import numpy as np
+        from bertopic.vectorizers import ClassTfidfTransformer
+        from scipy import sparse
+    except ImportError as e:  # noqa: BLE001 — actionable message beats a traceback
+        raise SystemExit(
+            f"Relabelling needs the local-only extras ({e}); install with:\n"
+            "    .venv/bin/pip install -r requirements-topics.txt") from e
+
+    info = load_topic_info()
+    chunk_topics = load_chunk_topics()
+    if info is None or chunk_topics is None:
+        raise SystemExit(
+            "no topic model on disk — run `scripts/07_run_topics.py fit` first")
+
+    ids, docs = load_corpus_documents()
+    print(f"loaded {len(ids)} chunk texts (no embeddings)")
+    known = [(i, chunk_topics.get(cid)) for i, cid in enumerate(ids)]
+    missing = sum(1 for _, t in known if t is None)
+    if missing:
+        print(f"warning: {missing} indexed chunks are absent from the topic "
+              "map (reingested since the fit?) and are skipped")
+
+    # The vectorizer is fitted on CHUNKS, exactly as at fit time, so min_df
+    # keeps its meaning ("appears in >= 2 chunks"). Fitting it on the 128
+    # concatenated topic documents instead would silently reinterpret min_df
+    # as "appears in >= 2 topics" and delete every topic-specific term.
+    vectorizer = _keyword_vectorizer()
+    X = vectorizer.fit_transform(docs)
+    terms = np.array(vectorizer.get_feature_names_out())
+
+    # Sum each topic's chunk rows with a sparse indicator matrix rather than
+    # fancy-indexing per topic: one matmul instead of 129 slices, and the
+    # result stays sparse, which is what ClassTfidfTransformer expects.
+    order = sorted({t for _, t in known if t is not None})
+    topic_row = {topic: r for r, topic in enumerate(order)}
+    pairs = [(topic_row[t], i) for i, t in known if t is not None]
+    indicator = sparse.csr_matrix(
+        (np.ones(len(pairs), dtype=np.float32),
+         ([r for r, _ in pairs], [i for _, i in pairs])),
+        shape=(len(order), X.shape[0]))
+    counts = indicator @ X
+
+    ctfidf = ClassTfidfTransformer(reduce_frequent_words=True)
+    weights = np.asarray(ctfidf.fit_transform(counts).todense())
+
+    texts_by_topic: dict = defaultdict(list)
+    for i, topic in known:
+        if topic is not None:
+            texts_by_topic[topic].append(docs[i])
+
+    pool = n_keywords * KEYWORD_CANDIDATE_MULTIPLIER
+    described_by_topic = {}
+    for row, topic in zip(weights, order):
+        top = np.argsort(row)[::-1][:pool * 2]
+        candidates = [terms[i] for i in top if row[i] > 0]
+        described_by_topic[topic] = describe_topic(
+            candidates, n_keywords,
+            duplication=duplication_score(texts_by_topic[topic]))
+
+    changed = n_boiler = 0
+    for r in info["topics"]:
+        d = described_by_topic.get(r["topic"])
+        if d is None:
+            continue
+        before = list(r.get("keywords") or [])
+        r.update(d)
+        if r["topic"] == OUTLIER_TOPIC:
+            r["label"] = "(unclustered)"
+        changed += int(before != r["keywords"])
+        n_boiler += int(r.get("is_boilerplate", False) and not r["is_outlier"])
+
+    info["relabelled_at"] = datetime.now().isoformat(timespec="seconds")
+    info["n_boilerplate_topics"] = n_boiler
+    (TOPICS_DIR / TOPIC_INFO_NAME).write_text(
+        json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    refreshed = _refresh_crosstab_labels(info)
+
+    print(f"\nrelabelled {changed} topic(s); {n_boiler} flagged as boilerplate "
+          f"(templated text, duplication >= {KEYWORD_BOILERPLATE_DUPLICATION})")
+    flagged = [r for r in info["topics"]
+               if r.get("is_boilerplate") and not r["is_outlier"]]
+    for r in sorted(flagged, key=lambda r: -r.get("duplication", 0))[:10]:
+        print(f"    t{r['topic']:>3} n={r['size']:<5} "
+              f"dup={r.get('duplication', 0):.2f}  {r['label'][:52]}")
+    if refreshed:
+        print(f"refreshed labels in {refreshed} saved cross-tab(s)")
+    print(f"outputs: {TOPICS_DIR / TOPIC_INFO_NAME}")
+    for r in sorted((r for r in info["topics"] if not r["is_outlier"]),
+                    key=lambda r: -r["size"])[:12]:
+        print(f"  topic {r['topic']:>3}  n={r['size']:<5} {r['label']}")
+    return info
+
+
+def _refresh_crosstab_labels(info: dict) -> int:
+    """Copy new labels into cross-tabs already saved in run folders.
+
+    build_crosstab denormalizes label/keywords into its own records, so without
+    this a relabel would leave every saved cross-tab showing the old names —
+    the exact drift that makes two artifacts disagree about the same topic.
+    """
+    from . import runs as runs_mod
+
+    by_topic = {r["topic"]: r for r in info["topics"]}
+    n = 0
+    if not runs_mod.RUNS_DIR.exists():
+        return 0
+    for d in runs_mod.RUNS_DIR.iterdir():
+        path = d / RUN_SUBDIR / RUN_CROSSTAB_NAME
+        if not path.exists():
+            continue
+        try:
+            xtab = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            continue
+        for rec in xtab.get("topics", []):
+            src = by_topic.get(rec.get("topic"))
+            if src:
+                rec["label"] = src["label"]
+                rec["keywords"] = src["keywords"]
+                rec["is_boilerplate"] = src.get("is_boilerplate", False)
+        for rec in xtab.get("coverage", {}).get("never_retrieved", []):
+            src = by_topic.get(rec.get("topic"))
+            if src:
+                rec["label"] = src["label"]
+                rec["keywords"] = src["keywords"]
+        path.write_text(json.dumps(xtab, ensure_ascii=False, indent=2),
+                        encoding="utf-8")
+        n += 1
+    return n
 
 
 # ---------------------------------------------------------------------------
