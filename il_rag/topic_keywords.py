@@ -385,8 +385,27 @@ def corpus_vocabulary(min_df: int = CALIBRATION_MIN_DF,
 
     client = chromadb.PersistentClient(
         path=str(CHROMA_DIR), settings=Settings(anonymized_telemetry=False))
-    col = client.get_collection(COLLECTION_NAME)
+    # An absent index is the single most likely way this stage is run wrong, so
+    # it gets an actionable message rather than a Chroma traceback — the same
+    # courtesy topics.py extends for a missing topic model.
+    try:
+        col = client.get_collection(COLLECTION_NAME)
+    except Exception as e:  # noqa: BLE001 — the message is the point
+        raise SystemExit(
+            f"no vector index at {CHROMA_DIR} (collection '{COLLECTION_NAME}' "
+            f"not found: {type(e).__name__}).\n"
+            "Calibration is built FROM the corpus, so it needs the index that "
+            "the corpus was embedded into. Either:\n"
+            "  - build it here:  python scripts/01_ingest.py\n"
+            "  - or copy an existing data/chroma/ into this checkout\n"
+            "Nothing else in this stage runs without it."
+        ) from e
     total = col.count()
+    if total == 0:
+        raise SystemExit(
+            f"the index at {CHROMA_DIR} is empty (0 chunks). Ingest the corpus "
+            "before calibrating: python scripts/01_ingest.py"
+        )
     df: Counter = Counter()
     for offset in range(0, total, topics_mod.FETCH_PAGE):
         page = col.get(limit=topics_mod.FETCH_PAGE, offset=offset,
