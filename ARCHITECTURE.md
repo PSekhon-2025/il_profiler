@@ -1234,20 +1234,32 @@ resampling of the questions rather than from re-rolling the model.
 
 ## 12. The GUI
 
-`app.py` (Streamlit). Five tabs:
+`app.py` (Streamlit). Seven tabs, ordered by what the reader is doing rather
+than by when each feature was built. Two conventions hold across all of them:
+the **active run is chosen once in the sidebar**, so no two tabs can be showing
+different snapshots (Compare is the exception — diffing needs two), and the
+"how this is computed" derivations are behind one **Show methodology** toggle,
+so the numbers read cleanly by default without any explanation being deleted.
 
-- **Run** — save the API key, build the index (hidden in cloud mode), and run
+- **Setup** — save the API key, build the index (hidden in cloud mode), and run
   the questionnaire for any subset of labs/sources, with live logs. Stages run
   as resumable subprocesses.
-- **Results** — the six profiles as charts (published vs. thirdparty per lab),
-  the Family/Religion sanity banner, per-category breakdown, bootstrap-CI error
-  bars, and downloads.
-- **Audit** — every question's RAG answer, weights, matcher reasoning, and (when
-  enabled) quotes + grounding bucket.
-- **Hallucination** — the four checks from §9, with alert banners when a
-  detection fires.
+- **Profiles** — the finding and nothing else: the six profiles as charts
+  (published vs. thirdparty per lab), run provenance, the Family/Religion sanity
+  banner, per-category breakdown, bootstrap-CI error bars, and downloads.
+- **Confidence** — the one place that answers *can I believe this run?*. A
+  verdict board lists every check with what it tests, its number, and a verdict
+  (including the ones that have **not** run, since an unrun check is not a
+  passed one), then each check's own section follows: bootstrap CIs, replicate
+  runs, the two non-LLM judges, and the four checks of §9.
+- **Evidence** — every question's RAG answer, weights, matcher reasoning, and
+  (when enabled) quotes + grounding bucket, with the excerpts behind each.
+- **Corpus** — the inductive topic layer: what the corpus talks about, topic ×
+  logic, the coverage audit, keyword retention, and the neighbourhood explorer.
 - **Compare** — diff two run snapshots: profile deltas, question-wording diff,
   and per-question label changes.
+- **Document** — run the questionnaire against uploaded files, saveable as a
+  tagged run snapshot.
 
 ### 12.1 Source links in the audit trail (`il_rag/pdf_sources.py`)
 
@@ -1413,8 +1425,8 @@ data/
   topics/                (local, shipped) fitted topic model: topic_info, chunk_topics
   lexicon/               (local, shipped) word vectors + word-pair calibration (§9.6)
   profiles/runs/         immutable per-run snapshots and every check's output
-app.py                   Streamlit GUI (Run / Results / Audit / Hallucination /
-                         Topics / Analyse a document / Compare runs)
+app.py                   Streamlit GUI (Setup / Profiles / Confidence /
+                         Evidence / Corpus / Compare / Document)
 tests/                   offline unit tests
 Dockerfile, fly.toml, DEPLOY.md   deployment
 ```
