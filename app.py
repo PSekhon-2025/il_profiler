@@ -23,6 +23,7 @@ Areas:
                   detection fires.
   Compare       — diff two run snapshots.
 """
+import contextlib
 import io
 import json
 import os
@@ -896,16 +897,160 @@ def visible_runs() -> list[dict]:
     return runs.list_runs(kind=runs.KIND_CORPUS)
 
 
-def run_selectbox(label: str, key: str, default_run_id: str | None = None) -> str | None:
-    """Dropdown of selectable runs (newest first); returns the chosen run_id."""
-    metas = visible_runs()
-    if not metas:
+OK, CHECK, FLAG, NOTRUN = "✅ clean", "⚠️ worth a look", "🔴 flagged", "— not run"
+
+
+def _verdict_rows(profiles, ci_data, emb, kw, dfh, stab, prov) -> list[dict]:
+    """One row per check: what it tests, its number, and a verdict.
+
+    Every check is listed whether or not it has run, because "this was never
+    run" is itself part of the answer to whether a run can be trusted — the
+    thing a table of only-the-checks-that-ran quietly hides.
+    """
+    rows = []
+
+    def add(name, tests, reading, status):
+        rows.append({"Check": name, "What it tests": tests,
+                     "Reading": reading, "Verdict": status})
+
+    # Family/Religion should be ~0 for AI labs: the method's own falsification test.
+    peak = None
+    if profiles:
+        vals = [p["logic_pct"].get(l, 0.0)
+                for by_st in profiles.values() for p in by_st.values()
+                for l in ("Family", "Religion")]
+        peak = max(vals) if vals else None
+    add("Family/Religion sanity", "the falsification check built into the method",
+        "—" if peak is None else f"peaks at {peak:.1f}% (expect ≈0%)",
+        NOTRUN if peak is None else
+        OK if peak <= 5 else CHECK if peak <= 15 else FLAG)
+
+    # Bootstrap CI: how much the profile depends on WHICH questions were asked.
+    width = None
+    if ci_data:
+        w = [s["hi"] - s["lo"] for by_st in ci_data["profiles"].values()
+             for by_logic in by_st.values() for s in by_logic.values()]
+        width = (sorted(w)[len(w) // 2] if w else None)
+    add("Bootstrap CI", "how much the profile rides on which questions were asked",
+        "—" if width is None else f"median band {width:.0f} points wide",
+        NOTRUN if width is None else OK if width <= 30 else CHECK)
+
+    # Retrieval grounding: did the retriever find anything to answer from?
+    missed = None
+    if dfh is not None and "grounding_bucket" in dfh.columns:
+        g = dfh[dfh["grounding_bucket"].notna()]
+        missed = int((g["grounding_bucket"] == "retrieval_missed").sum()) if len(g) else None
+    add("Retrieval grounding", "whether the evidence was there to answer from",
+        "—" if missed is None else f"{missed} question(s) retrieved nothing usable",
+        NOTRUN if missed is None else OK if missed == 0 else CHECK)
+
+    # Quote verification: is every cited span actually in the sources?
+    fab = None
+    if dfh is not None and "quotes_verified" in dfh.columns:
+        q = dfh[dfh["quotes_verified"].notna()]
+        if len(q):
+            fab = int(q.apply(lambda r: isinstance(r["quotes"], list)
+                              and len(r["quotes"]) > 0
+                              and not bool(r["quotes_verified"]), axis=1).sum())
+    add("Quote verification", "whether cited spans occur verbatim in the sources",
+        "—" if fab is None else f"{fab} answer(s) with an unverifiable span",
+        NOTRUN if fab is None else OK if fab == 0 else FLAG)
+
+    # Quote provenance: grades what verification collapses into one ❌.
+    n_fab = n_misq = None
+    if prov:
+        v = (prov.get("overall") or {}).get("verdicts") or {}
+        n_fab, n_misq = v.get("fabricated", 0), v.get("misquote_but_true", 0)
+    add("Quote provenance", "fabrication vs. a drifted quote that is still true",
+        "—" if n_fab is None else f"{n_fab} fabricated · {n_misq} misquoted but true",
+        NOTRUN if n_fab is None else OK if not n_fab else FLAG)
+
+    # Metamorphic: does the label survive losing the evidence it rested on?
+    leak = unstable = None
+    if stab:
+        s = stab.get("summary") or {}
+        leak, unstable = s.get("n_prior_keyed", 0), s.get("n_unstable", 0)
+    add("Metamorphic stability", "whether the label came from the text or the prior",
+        "—" if leak is None else f"{leak} prior leak(s) · {unstable} unstable item(s)",
+        NOTRUN if leak is None else OK if not leak else FLAG)
+
+    # Two non-LLM judges. Low agreement is expected, not a defect - see their
+    # own sections - so neither can raise anything louder than "worth a look".
+    for label, obj, what in (
+            ("Embedding agreement", emb, "a non-LLM judge over whole answers"),
+            ("Keyword agreement", kw, "a hand-curated lexicon, no model at all")):
+        rate = (obj.get("overall") or {}).get("rate") if obj else None
+        add(label, what, "—" if rate is None else f"agrees with the matcher {rate:.0%}",
+            NOTRUN if rate is None else OK if rate >= 0.4 else CHECK)
+    return rows
+
+
+def render_verdict_board(profiles, ci_data, emb, kw, dfh, stab, prov) -> None:
+    """The one screen that answers "can I believe this run?"."""
+    rows = _verdict_rows(profiles, ci_data, emb, kw, dfh, stab, prov)
+    flagged = [r for r in rows if r["Verdict"] == FLAG]
+    checks = [r for r in rows if r["Verdict"] == CHECK]
+    notrun = [r for r in rows if r["Verdict"] == NOTRUN]
+    if flagged:
+        st.error(f"**{len(flagged)} check(s) flagged:** "
+                 + ", ".join(r["Check"] for r in flagged)
+                 + ". Read those sections below before citing this run.")
+    elif checks:
+        st.warning(f"**{len(checks)} check(s) worth a look:** "
+                   + ", ".join(r["Check"] for r in checks) + ".")
+    elif notrun and len(notrun) == len(rows):
+        st.info("None of the checks have run for this snapshot yet.")
+    else:
+        st.success("Every check that ran came back clean.")
+    if notrun and len(notrun) != len(rows):
+        st.caption("Not yet run: " + ", ".join(r["Check"] for r in notrun)
+                   + " — an unrun check is not a passed one.")
+    st.dataframe(
+        pd.DataFrame(rows), hide_index=True, width="stretch",
+        # Explicit widths: auto-sizing squeezes the two prose columns to a few
+        # characters, which is the whole point of the board.
+        column_config={
+            "Check": st.column_config.TextColumn(width="medium"),
+            "What it tests": st.column_config.TextColumn(width="large"),
+            "Reading": st.column_config.TextColumn(width="medium"),
+            "Verdict": st.column_config.TextColumn(width="small"),
+        })
+
+
+def active_run() -> str | None:
+    """The run every read-only tab reads, chosen once in the sidebar.
+
+    Each tab used to carry its own picker with its own default, so Profiles
+    could be showing one snapshot while the checks showed another and nothing
+    on screen said so. One selection means one answer to "which run is this".
+    Compare is the deliberate exception: diffing needs two.
+    """
+    ids = [m["run_id"] for m in visible_runs()]
+    if not ids:
         return None
-    ids = [m["run_id"] for m in metas]
-    names = {m["run_id"]: runs.display_name(m) for m in metas}
-    idx = ids.index(default_run_id) if default_run_id in ids else 0
-    return st.selectbox(label, ids, index=idx,
-                        format_func=lambda r: names.get(r, r), key=key)
+    chosen = st.session_state.get("active_run")
+    return chosen if chosen in ids else (
+        runs.get_current() if runs.get_current() in ids else ids[0])
+
+
+@contextlib.contextmanager
+def methodology(label: str):
+    """The "how this is computed" derivation under a number.
+
+    These are the paper trail for everything the app claims, so none of them
+    are deleted — the sidebar toggle hides them all at once, so a reader
+    following the numbers is not reading past a derivation on every screen.
+    When hidden the body still runs (it is only markdown) but is written into
+    a placeholder that is cleared before the page is drawn.
+    """
+    if st.session_state.get("show_methodology"):
+        with st.expander(label, expanded=False):
+            yield
+        return
+    holder = st.empty()
+    with holder.container():
+        yield
+    holder.empty()
 
 
 def symbol_glossary(pairs: list[tuple[str, str]], note: str | None = None) -> None:
@@ -996,7 +1141,7 @@ with st.sidebar:
 
     counts = index_counts()
     if counts is None or counts["chunks"].sum() == 0:
-        st.markdown("❌ Vector index — build it on the **Run** tab")
+        st.markdown("❌ Vector index — build it on the **Setup** tab")
     else:
         st.markdown(f"✅ Vector index ({counts['chunks'].sum():,} chunks)")
         with st.expander("chunks per corpus"):
@@ -1025,21 +1170,44 @@ with st.sidebar:
                 "Show document analyses in run pickers",
                 key="show_adhoc_runs",
                 help="Saved document analyses are real run snapshots, so the "
-                     "Audit tab and the post-hoc judges work on them. They are "
+                     "Evidence tab and the post-hoc judges work on them. They are "
                      "hidden from the run pickers by default because they are "
                      "not part of the six-profile study, and the Results "
                      "charts key on the three labs so they cannot plot an "
                      "uploaded subject.")
 
-(tab_run, tab_results, tab_audit, tab_halluc, tab_topics, tab_adhoc,
- tab_compare) = st.tabs(
-    ["▶️ Run", "📊 Results", "🔍 Audit", "🚨 Hallucination", "🧭 Topics",
-     "📄 Analyse a document", "🆚 Compare runs"])
+    # --- The one run selection every read-only tab follows ----------------
+    _metas = visible_runs()
+    if _metas:
+        _ids = [m["run_id"] for m in _metas]
+        _names = {m["run_id"]: runs.display_name(m) for m in _metas}
+        if st.session_state.get("active_run") not in _ids:
+            st.session_state["active_run"] = (
+                runs.get_current() if runs.get_current() in _ids else _ids[0])
+        st.divider()
+        st.selectbox(
+            "Active run", _ids, key="active_run",
+            format_func=lambda r: _names.get(r, r),
+            help="Profiles, Confidence, Evidence and Corpus all read this "
+                 "run, so they can never be showing different snapshots. "
+                 "Compare picks its own two.")
+
+    st.divider()
+    st.toggle(
+        "Show methodology", key="show_methodology",
+        help="Reveals the derivation under every number — what it measures, "
+             "the formula, and what the symbols mean. Off by default so the "
+             "numbers read cleanly; nothing is removed.")
+
+(tab_setup, tab_profiles, tab_confidence, tab_evidence, tab_corpus,
+ tab_compare, tab_document) = st.tabs(
+    ["⚙️ Setup", "📊 Profiles", "🔬 Confidence", "🔍 Evidence", "🧭 Corpus",
+     "🆚 Compare", "📄 Document"])
 
 # ---------------------------------------------------------------------------
-# Run tab
+# Setup tab — API key, vector index, and launching a run.
 # ---------------------------------------------------------------------------
-with tab_run:
+with tab_setup:
     st.header("Setup & pipeline")
 
     # --- API key ---
@@ -1092,8 +1260,7 @@ with tab_run:
             "pair: RAG answer + graded matching per question. Resumable — "
             "completed questions are skipped on rerun."
         )
-        with st.expander("ℹ️ How the pipeline computes each answer",
-                         expanded=False):
+        with methodology("ℹ️ How the pipeline computes each answer"):
             st.markdown(
                 "What one question costs and how it is processed, end to end. "
                 "Everything before the LLM is deterministic arithmetic; the "
@@ -1224,12 +1391,12 @@ with tab_run:
             "Grounding pre-check (--grounding)", value=False, key="opt_grounding",
             help="Scores question↔chunk overlap and buckets each row as "
                  "retrieval_missed / abstained / committed. No extra API calls. "
-                 "Results appear on the Hallucination tab.")
+                 "Results appear on the Confidence tab.")
         opt_quotes = h2.checkbox(
             "Quote-grounded answers (--quotes)", value=False, key="opt_quotes",
             help="Requires the answer model to return verbatim supporting quotes, "
                  "verified in code against the retrieved chunks. Same call count; "
-                 "results appear on the Audit and Hallucination tabs.")
+                 "results appear on the Evidence and Confidence tabs.")
         n_pairs = len(sel_orgs) * len(sel_sources)
         st.caption(f"Selected: {n_pairs} profile(s) × {n_q} questions = "
                    f"{n_pairs * n_q} RAG + {n_pairs * n_q} matcher calls.")
@@ -1254,19 +1421,17 @@ with tab_run:
             st.rerun()
 
 # ---------------------------------------------------------------------------
-# Results tab
+# Profiles tab — the finding itself and nothing else.
+# Everything that TESTS the finding lives on Confidence.
 # ---------------------------------------------------------------------------
-with tab_results:
-    # Imported here explicitly: the analysis expanders below chart with
-    # altair before the profile charts further down would have imported it.
+with tab_profiles:
     import altair as alt
 
-    res_run = run_selectbox("Run to view", key="results_run",
-                            default_run_id=runs.get_current())
+    res_run = active_run()
     res_meta = runs.read_meta(res_run) if res_run else {}
     profiles = load_profiles(res_run)
     if not profiles:
-        st.info("No results yet — run the pipeline on the **Run** tab first.")
+        st.info("No results yet — run the pipeline on the **Setup** tab first.")
     else:
         st.header("Alignment profiles")
         if res_meta:
@@ -1316,8 +1481,7 @@ with tab_results:
                 "reading it as a real change."
             )
 
-        with st.expander("ℹ️ How the profile percentages are computed",
-                         expanded=False):
+        with methodology("ℹ️ How the profile percentages are computed"):
             st.markdown(
                 "Aggregation happens in `il_rag/profile_harness.py`. Every "
                 "**answered** question contributed a weight vector over the "
@@ -1399,6 +1563,171 @@ with tab_results:
 
         # --- Bootstrap confidence intervals (optional, zero-API, post-hoc) ---
         ci_data = load_bootstrap_ci(res_run)
+        # ci_long: lo/hi per (lab, source, logic) for error-bar overlays.
+        ci_recs = []
+        if ci_data:
+            for org, by_st in ci_data["profiles"].items():
+                for stype, by_logic in by_st.items():
+                    for logic, s in by_logic.items():
+                        ci_recs.append({"lab": org, "source": stype,
+                                        "logic": logic,
+                                        "lo": s["lo"], "hi": s["hi"]})
+        ci_long = pd.DataFrame(ci_recs)
+
+        # Long-form dataframe of every profile for charting.
+        recs = []
+        for org, by_st in profiles.items():
+            for stype, p in by_st.items():
+                if p["answered"] == 0:
+                    continue
+                for logic, pct in p["logic_pct"].items():
+                    recs.append({"lab": org, "source": stype,
+                                 "logic": logic, "pct": pct})
+        long = pd.DataFrame(recs)
+
+        if long.empty:
+            st.warning("Profiles exist but contain no answered questions yet.")
+        else:
+            # --- Sanity check banner ---
+            sanity = long[long["logic"].isin(["Family", "Religion"])]["pct"]
+            worst = sanity.max() if not sanity.empty else 0.0
+            if worst <= 5:
+                st.success(f"Sanity check passed: Family/Religion peak at "
+                           f"{worst:.1f}% (expected ≈0%).")
+            elif worst <= 15:
+                st.warning(f"Sanity check borderline: Family/Religion reach "
+                           f"{worst:.1f}% somewhere — inspect the audit trail.")
+            else:
+                st.error(f"Sanity check FAILED: Family/Religion reach "
+                         f"{worst:.1f}% — the method may be misfiring.")
+
+            # --- One chart per lab: published vs thirdparty side by side ---
+            for org in [o for o in ORGS if o in long["lab"].unique()]:
+                st.subheader(org)
+                sub = long[long["lab"] == org]
+                bars = (
+                    alt.Chart(sub)
+                    .mark_bar()
+                    .encode(
+                        x=alt.X("logic:N", sort=LOGICS, title=None),
+                        xOffset=alt.XOffset("source:N"),
+                        y=alt.Y("pct:Q", title="% of profile",
+                                scale=alt.Scale(domain=[0, 100])),
+                        color=alt.Color(
+                            "source:N", title="source",
+                            scale=alt.Scale(domain=SOURCE_TYPES,
+                                            range=["#4C78A8", "#F58518"]),
+                        ),
+                        tooltip=["lab", "source", "logic",
+                                 alt.Tooltip("pct:Q", format=".1f")],
+                    )
+                )
+                layers = [bars]
+                # Overlay bootstrap CI whiskers when available.
+                if not ci_long.empty:
+                    csub = ci_long[ci_long["lab"] == org]
+                    if not csub.empty:
+                        whiskers = (
+                            alt.Chart(csub)
+                            .mark_rule(strokeWidth=1.5, color="#333")
+                            .encode(
+                                x=alt.X("logic:N", sort=LOGICS, title=None),
+                                xOffset=alt.XOffset("source:N"),
+                                y=alt.Y("lo:Q", title="% of profile"),
+                                y2="hi:Q",
+                                tooltip=["lab", "source", "logic",
+                                         alt.Tooltip("lo:Q", format=".1f"),
+                                         alt.Tooltip("hi:Q", format=".1f")],
+                            )
+                        )
+                        layers.append(whiskers)
+                chart = alt.layer(*layers).properties(height=260)
+                st.altair_chart(chart, width="stretch")
+
+                cols = st.columns(len([s for s in SOURCE_TYPES
+                                       if s in profiles.get(org, {})]))
+                for col, stype in zip(cols, [s for s in SOURCE_TYPES
+                                             if s in profiles.get(org, {})]):
+                    p = profiles[org][stype]
+                    if p["answered"]:
+                        top = max(p["logic_pct"], key=p["logic_pct"].get)
+                        col.metric(
+                            f"{stype} — dominant logic",
+                            f"{top} ({p['logic_pct'][top]:.0f}%)",
+                            help=f"answered {p['answered']}, abstained {p['abstained']}",
+                        )
+
+            # --- Per-category breakdown ---
+            st.subheader("Per-category breakdown")
+            c1, c2 = st.columns(2)
+            sel_org = c1.selectbox("Lab", [o for o in ORGS if o in profiles])
+            sel_st = c2.selectbox(
+                "Source", [s for s in SOURCE_TYPES
+                           if s in profiles.get(sel_org, {})
+                           and profiles[sel_org][s]["answered"]],
+            )
+            by_cat = profiles[sel_org][sel_st]["by_category"]
+            if by_cat:
+                cat_df = (
+                    pd.DataFrame(by_cat).T
+                    .reindex([c for c in CATEGORIES if c in by_cat])
+                    [LOGICS]
+                )
+                st.dataframe(
+                    cat_df.style.background_gradient(cmap="Blues", axis=None)
+                    .format("{:.0f}%"),
+                    width="stretch",
+                )
+
+            # --- Downloads ---
+            st.subheader("Downloads")
+            rp = runs.run_paths(res_run)
+            d1, d2, d3 = st.columns(3)
+            d1.download_button("company_profiles.json",
+                               rp["profiles_json"].read_bytes(),
+                               file_name=f"company_profiles_{res_run}.json")
+            if rp["profiles_csv"].exists():
+                d2.download_button("profiles_matrix.csv",
+                                   rp["profiles_csv"].read_bytes(),
+                                   file_name=f"profiles_matrix_{res_run}.csv")
+            if rp["per_question"].exists():
+                d3.download_button("per_question.jsonl",
+                                   rp["per_question"].read_bytes(),
+                                   file_name=f"per_question_{res_run}.jsonl")
+
+# ---------------------------------------------------------------------------
+# Confidence tab — one place to answer "can I believe this run?".
+# The verdict board summarises every check; each check's own
+# section follows it, in the order the pipeline runs them.
+# ---------------------------------------------------------------------------
+with tab_confidence:
+    import altair as alt
+
+    st.header("Confidence — can this run be trusted?")
+    st.caption(
+        "Every check the pipeline can run against a saved snapshot, in one "
+        "place. The board is the summary; the sections below it are the "
+        "working. A check that has not run is not a check that passed."
+    )
+
+    # One run, one set of loads: every block below reads the same snapshot.
+    res_run = hal_run = active_run()
+    profiles = load_profiles(res_run)
+    ci_data = load_bootstrap_ci(res_run)
+    dfh = load_per_question(hal_run)
+    stab = load_stability(hal_run)
+    emb = load_embedding_summary(hal_run)
+    kw_overall = load_keyword_summary(hal_run)
+    prov = load_quote_provenance(hal_run)
+    prov_spans = load_quote_spans(hal_run)
+
+    if dfh is None or dfh.empty:
+        st.info("No per-question results yet — run the pipeline on the "
+                "**Setup** tab first.")
+    else:
+        render_verdict_board(profiles, ci_data, emb, kw_overall, dfh, stab,
+                             prov)
+        st.divider()
         with st.expander("Confidence intervals (bootstrap over questions)",
                          expanded=bool(ci_data)):
             st.caption(
@@ -1407,8 +1736,7 @@ with tab_results:
                 "bars mean the estimate leans on which questions were asked — "
                 "expected with ~27 questions. Zero API cost, deterministic."
             )
-            with st.expander("ℹ️ How the confidence intervals are computed",
-                             expanded=False):
+            with methodology("ℹ️ How the confidence intervals are computed"):
                 st.markdown(
                     "The nonparametric bootstrap (Efron, 1979), implemented in "
                     "`il_rag/bootstrap_ci.py`. A profile percentage is a "
@@ -1562,7 +1890,7 @@ with tab_results:
                 "profiles. Averaging replicates cancels that; the spread across "
                 "them measures how big it is."
             )
-            with st.expander("ℹ️ How replicate averaging works", expanded=False):
+            with methodology("ℹ️ How replicate averaging works"):
                 st.markdown(
                     "Implemented in `il_rag/replicates.py`. For one "
                     "(lab, source, logic) observed across $R$ replicate runs "
@@ -1733,8 +2061,7 @@ with tab_results:
                 "cosine values are NOT interpretable (e5 compresses them into a "
                 "narrow band) — only the ranking and the top1–top2 margin are."
             )
-            with st.expander("ℹ️ How embedding agreement is computed",
-                             expanded=False):
+            with methodology("ℹ️ How embedding agreement is computed"):
                 st.markdown(
                     "Implemented in `il_rag/embedding_agreement.py`. Every "
                     "**committed** answer is compared against the seven reference "
@@ -2052,7 +2379,7 @@ with tab_results:
                 "matched it."
             )
 
-            with st.expander("ℹ️ How keyword agreement is computed", expanded=False):
+            with methodology("ℹ️ How keyword agreement is computed"):
                 st.markdown(
                     "Implemented in `il_rag/keyword_agreement.py`. No LLM "
                     "calls; without the local semantic lexicon it is pure, "
@@ -2328,367 +2655,6 @@ with tab_results:
                         col.download_button(name, (kdir / name).read_bytes(),
                                             file_name=fname, key=f"kw_dl_{name}")
 
-        # ci_long: lo/hi per (lab, source, logic) for error-bar overlays.
-        ci_recs = []
-        if ci_data:
-            for org, by_st in ci_data["profiles"].items():
-                for stype, by_logic in by_st.items():
-                    for logic, s in by_logic.items():
-                        ci_recs.append({"lab": org, "source": stype,
-                                        "logic": logic,
-                                        "lo": s["lo"], "hi": s["hi"]})
-        ci_long = pd.DataFrame(ci_recs)
-
-        # Long-form dataframe of every profile for charting.
-        recs = []
-        for org, by_st in profiles.items():
-            for stype, p in by_st.items():
-                if p["answered"] == 0:
-                    continue
-                for logic, pct in p["logic_pct"].items():
-                    recs.append({"lab": org, "source": stype,
-                                 "logic": logic, "pct": pct})
-        long = pd.DataFrame(recs)
-
-        if long.empty:
-            st.warning("Profiles exist but contain no answered questions yet.")
-        else:
-            # --- Sanity check banner ---
-            sanity = long[long["logic"].isin(["Family", "Religion"])]["pct"]
-            worst = sanity.max() if not sanity.empty else 0.0
-            if worst <= 5:
-                st.success(f"Sanity check passed: Family/Religion peak at "
-                           f"{worst:.1f}% (expected ≈0%).")
-            elif worst <= 15:
-                st.warning(f"Sanity check borderline: Family/Religion reach "
-                           f"{worst:.1f}% somewhere — inspect the audit trail.")
-            else:
-                st.error(f"Sanity check FAILED: Family/Religion reach "
-                         f"{worst:.1f}% — the method may be misfiring.")
-
-            # --- One chart per lab: published vs thirdparty side by side ---
-            for org in [o for o in ORGS if o in long["lab"].unique()]:
-                st.subheader(org)
-                sub = long[long["lab"] == org]
-                bars = (
-                    alt.Chart(sub)
-                    .mark_bar()
-                    .encode(
-                        x=alt.X("logic:N", sort=LOGICS, title=None),
-                        xOffset=alt.XOffset("source:N"),
-                        y=alt.Y("pct:Q", title="% of profile",
-                                scale=alt.Scale(domain=[0, 100])),
-                        color=alt.Color(
-                            "source:N", title="source",
-                            scale=alt.Scale(domain=SOURCE_TYPES,
-                                            range=["#4C78A8", "#F58518"]),
-                        ),
-                        tooltip=["lab", "source", "logic",
-                                 alt.Tooltip("pct:Q", format=".1f")],
-                    )
-                )
-                layers = [bars]
-                # Overlay bootstrap CI whiskers when available.
-                if not ci_long.empty:
-                    csub = ci_long[ci_long["lab"] == org]
-                    if not csub.empty:
-                        whiskers = (
-                            alt.Chart(csub)
-                            .mark_rule(strokeWidth=1.5, color="#333")
-                            .encode(
-                                x=alt.X("logic:N", sort=LOGICS, title=None),
-                                xOffset=alt.XOffset("source:N"),
-                                y=alt.Y("lo:Q", title="% of profile"),
-                                y2="hi:Q",
-                                tooltip=["lab", "source", "logic",
-                                         alt.Tooltip("lo:Q", format=".1f"),
-                                         alt.Tooltip("hi:Q", format=".1f")],
-                            )
-                        )
-                        layers.append(whiskers)
-                chart = alt.layer(*layers).properties(height=260)
-                st.altair_chart(chart, width="stretch")
-
-                cols = st.columns(len([s for s in SOURCE_TYPES
-                                       if s in profiles.get(org, {})]))
-                for col, stype in zip(cols, [s for s in SOURCE_TYPES
-                                             if s in profiles.get(org, {})]):
-                    p = profiles[org][stype]
-                    if p["answered"]:
-                        top = max(p["logic_pct"], key=p["logic_pct"].get)
-                        col.metric(
-                            f"{stype} — dominant logic",
-                            f"{top} ({p['logic_pct'][top]:.0f}%)",
-                            help=f"answered {p['answered']}, abstained {p['abstained']}",
-                        )
-
-            # --- Per-category breakdown ---
-            st.subheader("Per-category breakdown")
-            c1, c2 = st.columns(2)
-            sel_org = c1.selectbox("Lab", [o for o in ORGS if o in profiles])
-            sel_st = c2.selectbox(
-                "Source", [s for s in SOURCE_TYPES
-                           if s in profiles.get(sel_org, {})
-                           and profiles[sel_org][s]["answered"]],
-            )
-            by_cat = profiles[sel_org][sel_st]["by_category"]
-            if by_cat:
-                cat_df = (
-                    pd.DataFrame(by_cat).T
-                    .reindex([c for c in CATEGORIES if c in by_cat])
-                    [LOGICS]
-                )
-                st.dataframe(
-                    cat_df.style.background_gradient(cmap="Blues", axis=None)
-                    .format("{:.0f}%"),
-                    width="stretch",
-                )
-
-            # --- Downloads ---
-            st.subheader("Downloads")
-            rp = runs.run_paths(res_run)
-            d1, d2, d3 = st.columns(3)
-            d1.download_button("company_profiles.json",
-                               rp["profiles_json"].read_bytes(),
-                               file_name=f"company_profiles_{res_run}.json")
-            if rp["profiles_csv"].exists():
-                d2.download_button("profiles_matrix.csv",
-                                   rp["profiles_csv"].read_bytes(),
-                                   file_name=f"profiles_matrix_{res_run}.csv")
-            if rp["per_question"].exists():
-                d3.download_button("per_question.jsonl",
-                                   rp["per_question"].read_bytes(),
-                                   file_name=f"per_question_{res_run}.jsonl")
-
-# ---------------------------------------------------------------------------
-# Audit tab
-# ---------------------------------------------------------------------------
-with tab_audit:
-    aud_run = run_selectbox("Run to audit", key="audit_run",
-                            default_run_id=runs.get_current())
-    dfq = load_per_question(aud_run)
-    if dfq is None or dfq.empty:
-        st.info("No per-question results yet.")
-    else:
-        st.header("Audit trail")
-        st.caption("Every question's RAG answer, graded weights, and matcher "
-                   "reasoning — the evidence behind the percentages.")
-        with st.expander("ℹ️ How to read a row", expanded=False):
-            st.markdown(
-                "Each row is one **(lab, source, question)** triple — the "
-                "atomic unit everything else aggregates. The header shows the "
-                "row's *dominant* logic, i.e. the argmax of its weight vector "
-                "(ties break by the fixed logic order, so the label is "
-                "deterministic):"
-            )
-            st.latex(r"\mathrm{label}=\begin{cases}"
-                     r"\texttt{ABSTAINED} & \text{if the row abstained}\\[2pt]"
-                     r"\arg\max_k w_k & \text{otherwise}\end{cases}")
-            symbol_glossary([
-                (r"$k$", "**a logic** — one of the seven"),
-                (r"$w_k$", "the **weight** this row's answer earned on logic "
-                           "$k$; the seven sum to 1"),
-                (r"$\arg\max_k w_k$", "**which** logic carries the largest "
-                                      "weight — the row's dominant label"),
-                (r"$\mathrm{label}$", "what the row header displays"),
-            ], note="Ties break by the fixed logic order, so the label is "
-                    "deterministic for a given weight vector.")
-            st.markdown(
-                "**Fields**\n"
-                "- **Weights** — the matcher's distribution over the seven "
-                "logics, clamped non-negative and normalized to sum to 1. Only "
-                "non-zero entries are listed. This exact vector is what the "
-                "profile percentages average.\n"
-                "- **Matcher reasoning** — the one-sentence justification the "
-                "matcher returned. It is recorded for auditing and **never "
-                "used in any calculation**.\n"
-                "- **retrieved** — the ids of the chunks the answer was "
-                "written from. These make the row replayable: the metamorphic "
-                "and quote-provenance checks refetch exactly these chunks.\n"
-                "- **Supporting quotes** (only when the run used `--quotes`) — "
-                "spans the model claims to have copied, each ✅/❌ by a "
-                "code-side verbatim check after whitespace normalization. The "
-                "excerpt number links to the source PDF when the raw dataset "
-                "is available locally; because a span verifies against *any* "
-                "retrieved excerpt, a ✅ does not certify it is in the linked "
-                "document, and where it isn't, the row names the one that "
-                "actually holds it.\n"
-                "- **grounding** (only when the run used `--grounding`) — the "
-                "row's lexical grounding score, best cosine, and bucket.\n\n"
-                "**Abstentions** carry an all-zero weight vector and are "
-                "excluded from the profile denominator, so they reduce "
-                "confidence without shifting the distribution. Filter to them "
-                "with the *Abstentions only* checkbox to see where the corpus "
-                "was silent."
-            )
-        f1, f2, f3, f4 = st.columns(4)
-        orgs_f = f1.multiselect("Lab", sorted(dfq["org"].unique()))
-        st_f = f2.multiselect("Source", sorted(dfq["source_type"].unique()))
-        cat_f = f3.multiselect("Category", [c for c in CATEGORIES
-                                            if c in set(dfq["category"])])
-        only_abstain = f4.checkbox("Abstentions only")
-        show_evidence = st.checkbox(
-            "Show the retrieved evidence each answer was written from",
-            value=False, key="audit_show_evidence",
-            help="Fetches the actual chunk text by id from the vector index "
-                 "(one batched lookup for the filtered rows — no API calls). "
-                 "Off by default because it makes the page much longer.")
-
-        view = dfq
-        if orgs_f:
-            view = view[view["org"].isin(orgs_f)]
-        if st_f:
-            view = view[view["source_type"].isin(st_f)]
-        if cat_f:
-            view = view[view["category"].isin(cat_f)]
-        if only_abstain:
-            view = view[view["abstain"]]
-
-        st.caption(f"{len(view)} of {len(dfq)} rows "
-                   f"({int(dfq['abstain'].sum())} abstentions overall)")
-
-        # One batched lookup for every chunk in the filtered view, plus the
-        # topic map if the inductive layer has been fitted — so each piece of
-        # evidence can be labelled with the theme it belongs to.
-        #
-        # The chunk lookup now feeds TWO things: the evidence list below, and
-        # the [excerpt N] links in the quote block, which need each cited
-        # chunk's filename and org. So it is no longer gated on show_evidence —
-        # it is gated on there being something to use it for, which keeps a run
-        # without quotes exactly as cheap as before. Ids need no embedding, so
-        # this stays one local sqlite get, cached (see fetch_chunks).
-        evidence: dict = {}
-        chunk_topic_map: dict = {}
-        topic_label_map: dict = {}
-        has_quote_rows = "quotes" in view.columns and view["quotes"].apply(
-            lambda q: isinstance(q, list) and bool(q)).any()
-        if len(view) and (show_evidence or has_quote_rows):
-            ids = tuple(sorted({cid for r in view["retrieved_ids"]
-                                if isinstance(r, list) for cid in r}))
-            evidence = fetch_chunks(ids)
-        if show_evidence and len(view):
-            chunk_topic_map = topics_mod.load_chunk_topics() or {}
-            tinfo_a = topics_mod.load_topic_info()
-            if tinfo_a:
-                topic_label_map = {r["topic"]: topics_mod.clean_label(r["label"])
-                                   for r in tinfo_a["topics"]}
-
-        for _, row in view.iterrows():
-            top = ("ABSTAINED" if row["abstain"] else
-                   max(row["weights"], key=row["weights"].get))
-            label = (f"{row['org']} · {row['source_type']} · {row['qid']} → "
-                     f"{top}" + ("" if row["abstain"] else
-                                 f" ({100 * row['weights'][top]:.0f}%)"))
-            with st.expander(label):
-                st.markdown(f"**Q:** {row['question']}")
-                st.markdown(f"**RAG answer:**\n\n{row['answer']}")
-                if not row["abstain"]:
-                    wdf = pd.DataFrame(
-                        [{"logic": k, "weight": v}
-                         for k, v in row["weights"].items() if v > 0]
-                    ).sort_values("weight", ascending=False)
-                    st.dataframe(wdf, hide_index=True)
-                st.markdown(f"**Matcher reasoning:** {row['reasoning']}")
-                if isinstance(row.get("quotes"), list):
-                    ok = bool(row.get("quotes_verified"))
-                    st.markdown("**Supporting quotes:** "
-                                + ("✅ all verified in sources" if ok
-                                   else "⚠️ not verified"))
-                    linked = False
-                    for q in row["quotes"]:
-                        mark = "✅" if q.get("verified") else "❌"
-                        # The excerpt number becomes a link to the PDF it names;
-                        # `note` calls out the case where the span is real but
-                        # lives in a different document than the one cited.
-                        cite = pdf_sources.excerpt_citation(
-                            q.get("excerpt"), row.get("retrieved_ids"),
-                            evidence, pdf_url)
-                        note = pdf_sources.misattribution_note(
-                            q.get("quote", ""), q.get("excerpt"),
-                            row.get("retrieved_ids"), evidence, pdf_url)
-                        # A linked citation opens the markdown link "[";
-                        # the plain fallback opens the escaped bracket "\[".
-                        linked = linked or cite.startswith("[")
-                        st.markdown(f"> {mark} {cite} "
-                                    f"“{q.get('quote', '')}”{note}")
-                    if linked:
-                        st.caption(
-                            "Excerpt numbers link to the source the answer "
-                            "CITED. Verification runs against every retrieved "
-                            "excerpt, not just the cited one, so ✅ does not "
-                            "certify the span is in the linked document — "
-                            "where they differ, the real source is named "
-                            "above. Press-clipping links open **our rendering "
-                            "of the record the index was built from**, not the "
-                            "publisher's page; the exports carry no URL.")
-                gb = row.get("grounding_bucket")
-                if isinstance(gb, str):
-                    st.caption(f"grounding: {gb} · score "
-                               f"{row.get('retrieval_grounding_score', 0):.2f} · "
-                               f"cosine {row.get('retrieval_cosine_top', 0):.2f}")
-                st.caption("retrieved: " + ", ".join(row["retrieved_ids"][:5]))
-                if show_evidence:
-                    st.markdown("**Evidence the answer was written from** "
-                                "(the only text the answering model saw):")
-                    for i, cid in enumerate(row["retrieved_ids"], 1):
-                        ch = evidence.get(cid)
-                        # `label` is the headline for press records and the
-                        # filename for published docs — "O1.RTF" named 500
-                        # articles and identified none of them.
-                        tag = (f"[{i}] {ch['label'] or ch['filename']}" if ch
-                               else f"[{i}] {cid}")
-                        if ch and ch.get("sublabel"):
-                            tag += f"  ·  {ch['sublabel']}"
-                        if chunk_topic_map:
-                            t = chunk_topic_map.get(cid)
-                            if t is not None:
-                                tag += f"  ·  topic {t}: {topic_label_map.get(t, '')}"
-                        if ch:
-                            with st.expander(tag, expanded=False):
-                                # In the body, not the label: a click on a link
-                                # inside an expander header also toggles it.
-                                doc = pdf_url(ch["filename"], ch["org"], cid,
-                                              ch.get("source_type", ""))
-                                if doc:
-                                    name = pdf_sources.md_escape(
-                                        ch["label"] or ch["filename"])
-                                    st.markdown(f"[📄 open {name}]({doc})")
-                                st.text(ch["text"])
-                        else:
-                            st.caption(f"{tag} — not in the current index "
-                                       "(re-ingested since this run?)")
-
-# ---------------------------------------------------------------------------
-# Hallucination tab — the five opt-in checks, with alerts when one fires
-# ---------------------------------------------------------------------------
-with tab_halluc:
-    st.header("Hallucination & grounding checks")
-    st.caption(
-        "Four black-box checks: **retrieval grounding** (was there relevant "
-        "text to answer from?), **quote verification** (does the cited support "
-        "actually appear in the sources?), **quote provenance** (if it doesn't, "
-        "is it a paraphrase, a figure of speech, or a fabrication — and is its "
-        "content true anyway?), and **metamorphic stability & evidence "
-        "sensitivity** (does the label survive a reword — and does it stop when "
-        "the supporting evidence is taken away?). The two non-LLM judges — "
-        "**embedding agreement** and **keyword agreement** — grade the same "
-        "run and now sit on the **Results** tab, beside the profiles they "
-        "judge."
-    )
-    hal_run = run_selectbox("Run to inspect", key="halluc_run",
-                            default_run_id=runs.get_current())
-    dfh = load_per_question(hal_run)
-    stab = load_stability(hal_run)
-    # Still loaded here although the check itself moved to the Results tab:
-    # the alert banner and the download bundle below both read it.
-    emb = load_embedding_summary(hal_run)
-    prov = load_quote_provenance(hal_run)
-    prov_spans = load_quote_spans(hal_run)
-
-    if dfh is None or dfh.empty:
-        st.info("No per-question results yet — run the pipeline on the **Run** "
-                "tab first.")
-    else:
         import altair as alt
 
         has_grounding = ("grounding_bucket" in dfh.columns
@@ -2770,10 +2736,10 @@ with tab_halluc:
                            f"({emb['overall']['rate']:.0%}): the non-LLM judge "
                            f"often ranks a different logic's reference nearest "
                            f"than the matcher's top pick. See the "
-                           f"**Results** tab."))
+                           f"embedding-agreement section below."))
         if not (has_grounding or has_quotes or stab or emb or prov):
             st.info("None of the checks have run for this snapshot yet. Enable "
-                    "**--grounding** / **--quotes** on the Run tab for the next "
+                    "**--grounding** / **--quotes** on the Setup tab for the next "
                     "run, or launch the metamorphic eval / quote provenance "
                     "below (both work on any existing run).")
         elif alerts:
@@ -2792,9 +2758,9 @@ with tab_halluc:
             if not csv_members:
                 st.caption(
                     "No checks have produced results for this snapshot yet. "
-                    "Enable **--grounding** / **--quotes** on the Run tab, "
+                    "Enable **--grounding** / **--quotes** on the Setup tab, "
                     "launch the metamorphic eval below, or compute embedding "
-                    "agreement on the Results tab, then come back here.")
+                    "agreement in its section above, then come back here.")
             else:
                 st.caption(
                     "One row per decision across the "
@@ -2819,7 +2785,7 @@ with tab_halluc:
 
         # ---------------- 1 · Retrieval grounding ----------------
         st.subheader("1 · Retrieval grounding")
-        with st.expander("ℹ️ How this score is computed", expanded=False):
+        with methodology("ℹ️ How this score is computed"):
             st.markdown(
                 "Everything below is pure computation over the chunks the "
                 "retriever already returned (`il_rag/grounding.py`) — no LLM "
@@ -2927,7 +2893,7 @@ with tab_halluc:
             )
         if not has_grounding:
             st.caption("Not scored for this run — check **Grounding pre-check** "
-                       "on the Run tab (adds no API calls).")
+                       "on the Setup tab (adds no API calls).")
         else:
             n_by = gdf["grounding_bucket"].value_counts()
             m1, m2, m3 = st.columns(3)
@@ -2974,7 +2940,7 @@ with tab_halluc:
 
         # ---------------- 2 · Quote verification ----------------
         st.subheader("2 · Quote verification")
-        with st.expander("ℹ️ How quotes are verified", expanded=False):
+        with methodology("ℹ️ How quotes are verified"):
             st.markdown(
                 "The model **attests**, the code **audits**: nothing the model "
                 "says about its own quotes is trusted — every claimed span is "
@@ -3085,7 +3051,7 @@ with tab_halluc:
             )
         if not has_quotes:
             st.caption("Not enabled for this run — check **Quote-grounded "
-                       "answers** on the Run tab.")
+                       "answers** on the Setup tab.")
         else:
             n_ok = int(qdf["quotes_verified"].astype(bool).sum())
             m1, m2, m3 = st.columns(3)
@@ -3096,7 +3062,7 @@ with tab_halluc:
             m3.metric("∅ no quotes returned", len(noq_rows),
                       help="empty quote list — expected for abstentions")
             if len(fab_rows):
-                # Same batched by-id lookup as the Audit tab, over the failing
+                # Same batched by-id lookup as the Evidence tab, over the failing
                 # rows only, so each [excerpt N] can link to the PDF it names.
                 # fetch_chunks caches per id-tuple, so ids shared with the Audit
                 # tab's view cost nothing.
@@ -3131,7 +3097,7 @@ with tab_halluc:
             "anything about a source, and asks whether a span's **content** "
             "holds up even when the span itself does not."
         )
-        with st.expander("ℹ️ How quote provenance is computed", expanded=False):
+        with methodology("ℹ️ How quote provenance is computed"):
             st.markdown(
                 "A single ❌ in section 2 conflates four different things: a "
                 "**copy that drifted** (curly quotes, an em-dash, an elided "
@@ -3485,7 +3451,7 @@ with tab_halluc:
 
         # ------- 3 · Metamorphic stability & evidence sensitivity -------
         st.subheader("3 · Metamorphic stability & evidence sensitivity")
-        with st.expander("ℹ️ How these checks work", expanded=False):
+        with methodology("ℹ️ How these checks work"):
             st.markdown(
                 "There are no gold labels in this pipeline, so correctness "
                 "can't be checked directly. Instead we **change the evidence "
@@ -3969,11 +3935,209 @@ with tab_halluc:
                                     file_name=f"variants_{hal_run}.jsonl")
 
 # ---------------------------------------------------------------------------
-# Topics tab — the inductive layer: what the corpus talks about, and how those
-# topics relate to the deductive logic scores. Read-only: fitting happens
-# locally (BERTopic is not installed in the container).
+# Evidence tab — every question, its answer, the matcher's
+# reasoning, and the excerpts the answer was built from.
 # ---------------------------------------------------------------------------
-with tab_topics:
+with tab_evidence:
+    aud_run = active_run()
+    dfq = load_per_question(aud_run)
+    if dfq is None or dfq.empty:
+        st.info("No per-question results yet.")
+    else:
+        st.header("Audit trail")
+        st.caption("Every question's RAG answer, graded weights, and matcher "
+                   "reasoning — the evidence behind the percentages.")
+        with methodology("ℹ️ How to read a row"):
+            st.markdown(
+                "Each row is one **(lab, source, question)** triple — the "
+                "atomic unit everything else aggregates. The header shows the "
+                "row's *dominant* logic, i.e. the argmax of its weight vector "
+                "(ties break by the fixed logic order, so the label is "
+                "deterministic):"
+            )
+            st.latex(r"\mathrm{label}=\begin{cases}"
+                     r"\texttt{ABSTAINED} & \text{if the row abstained}\\[2pt]"
+                     r"\arg\max_k w_k & \text{otherwise}\end{cases}")
+            symbol_glossary([
+                (r"$k$", "**a logic** — one of the seven"),
+                (r"$w_k$", "the **weight** this row's answer earned on logic "
+                           "$k$; the seven sum to 1"),
+                (r"$\arg\max_k w_k$", "**which** logic carries the largest "
+                                      "weight — the row's dominant label"),
+                (r"$\mathrm{label}$", "what the row header displays"),
+            ], note="Ties break by the fixed logic order, so the label is "
+                    "deterministic for a given weight vector.")
+            st.markdown(
+                "**Fields**\n"
+                "- **Weights** — the matcher's distribution over the seven "
+                "logics, clamped non-negative and normalized to sum to 1. Only "
+                "non-zero entries are listed. This exact vector is what the "
+                "profile percentages average.\n"
+                "- **Matcher reasoning** — the one-sentence justification the "
+                "matcher returned. It is recorded for auditing and **never "
+                "used in any calculation**.\n"
+                "- **retrieved** — the ids of the chunks the answer was "
+                "written from. These make the row replayable: the metamorphic "
+                "and quote-provenance checks refetch exactly these chunks.\n"
+                "- **Supporting quotes** (only when the run used `--quotes`) — "
+                "spans the model claims to have copied, each ✅/❌ by a "
+                "code-side verbatim check after whitespace normalization. The "
+                "excerpt number links to the source PDF when the raw dataset "
+                "is available locally; because a span verifies against *any* "
+                "retrieved excerpt, a ✅ does not certify it is in the linked "
+                "document, and where it isn't, the row names the one that "
+                "actually holds it.\n"
+                "- **grounding** (only when the run used `--grounding`) — the "
+                "row's lexical grounding score, best cosine, and bucket.\n\n"
+                "**Abstentions** carry an all-zero weight vector and are "
+                "excluded from the profile denominator, so they reduce "
+                "confidence without shifting the distribution. Filter to them "
+                "with the *Abstentions only* checkbox to see where the corpus "
+                "was silent."
+            )
+        f1, f2, f3, f4 = st.columns(4)
+        orgs_f = f1.multiselect("Lab", sorted(dfq["org"].unique()))
+        st_f = f2.multiselect("Source", sorted(dfq["source_type"].unique()))
+        cat_f = f3.multiselect("Category", [c for c in CATEGORIES
+                                            if c in set(dfq["category"])])
+        only_abstain = f4.checkbox("Abstentions only")
+        show_evidence = st.checkbox(
+            "Show the retrieved evidence each answer was written from",
+            value=False, key="audit_show_evidence",
+            help="Fetches the actual chunk text by id from the vector index "
+                 "(one batched lookup for the filtered rows — no API calls). "
+                 "Off by default because it makes the page much longer.")
+
+        view = dfq
+        if orgs_f:
+            view = view[view["org"].isin(orgs_f)]
+        if st_f:
+            view = view[view["source_type"].isin(st_f)]
+        if cat_f:
+            view = view[view["category"].isin(cat_f)]
+        if only_abstain:
+            view = view[view["abstain"]]
+
+        st.caption(f"{len(view)} of {len(dfq)} rows "
+                   f"({int(dfq['abstain'].sum())} abstentions overall)")
+
+        # One batched lookup for every chunk in the filtered view, plus the
+        # topic map if the inductive layer has been fitted — so each piece of
+        # evidence can be labelled with the theme it belongs to.
+        #
+        # The chunk lookup now feeds TWO things: the evidence list below, and
+        # the [excerpt N] links in the quote block, which need each cited
+        # chunk's filename and org. So it is no longer gated on show_evidence —
+        # it is gated on there being something to use it for, which keeps a run
+        # without quotes exactly as cheap as before. Ids need no embedding, so
+        # this stays one local sqlite get, cached (see fetch_chunks).
+        evidence: dict = {}
+        chunk_topic_map: dict = {}
+        topic_label_map: dict = {}
+        has_quote_rows = "quotes" in view.columns and view["quotes"].apply(
+            lambda q: isinstance(q, list) and bool(q)).any()
+        if len(view) and (show_evidence or has_quote_rows):
+            ids = tuple(sorted({cid for r in view["retrieved_ids"]
+                                if isinstance(r, list) for cid in r}))
+            evidence = fetch_chunks(ids)
+        if show_evidence and len(view):
+            chunk_topic_map = topics_mod.load_chunk_topics() or {}
+            tinfo_a = topics_mod.load_topic_info()
+            if tinfo_a:
+                topic_label_map = {r["topic"]: topics_mod.clean_label(r["label"])
+                                   for r in tinfo_a["topics"]}
+
+        for _, row in view.iterrows():
+            top = ("ABSTAINED" if row["abstain"] else
+                   max(row["weights"], key=row["weights"].get))
+            label = (f"{row['org']} · {row['source_type']} · {row['qid']} → "
+                     f"{top}" + ("" if row["abstain"] else
+                                 f" ({100 * row['weights'][top]:.0f}%)"))
+            with st.expander(label):
+                st.markdown(f"**Q:** {row['question']}")
+                st.markdown(f"**RAG answer:**\n\n{row['answer']}")
+                if not row["abstain"]:
+                    wdf = pd.DataFrame(
+                        [{"logic": k, "weight": v}
+                         for k, v in row["weights"].items() if v > 0]
+                    ).sort_values("weight", ascending=False)
+                    st.dataframe(wdf, hide_index=True)
+                st.markdown(f"**Matcher reasoning:** {row['reasoning']}")
+                if isinstance(row.get("quotes"), list):
+                    ok = bool(row.get("quotes_verified"))
+                    st.markdown("**Supporting quotes:** "
+                                + ("✅ all verified in sources" if ok
+                                   else "⚠️ not verified"))
+                    linked = False
+                    for q in row["quotes"]:
+                        mark = "✅" if q.get("verified") else "❌"
+                        # The excerpt number becomes a link to the PDF it names;
+                        # `note` calls out the case where the span is real but
+                        # lives in a different document than the one cited.
+                        cite = pdf_sources.excerpt_citation(
+                            q.get("excerpt"), row.get("retrieved_ids"),
+                            evidence, pdf_url)
+                        note = pdf_sources.misattribution_note(
+                            q.get("quote", ""), q.get("excerpt"),
+                            row.get("retrieved_ids"), evidence, pdf_url)
+                        # A linked citation opens the markdown link "[";
+                        # the plain fallback opens the escaped bracket "\[".
+                        linked = linked or cite.startswith("[")
+                        st.markdown(f"> {mark} {cite} "
+                                    f"“{q.get('quote', '')}”{note}")
+                    if linked:
+                        st.caption(
+                            "Excerpt numbers link to the source the answer "
+                            "CITED. Verification runs against every retrieved "
+                            "excerpt, not just the cited one, so ✅ does not "
+                            "certify the span is in the linked document — "
+                            "where they differ, the real source is named "
+                            "above. Press-clipping links open **our rendering "
+                            "of the record the index was built from**, not the "
+                            "publisher's page; the exports carry no URL.")
+                gb = row.get("grounding_bucket")
+                if isinstance(gb, str):
+                    st.caption(f"grounding: {gb} · score "
+                               f"{row.get('retrieval_grounding_score', 0):.2f} · "
+                               f"cosine {row.get('retrieval_cosine_top', 0):.2f}")
+                st.caption("retrieved: " + ", ".join(row["retrieved_ids"][:5]))
+                if show_evidence:
+                    st.markdown("**Evidence the answer was written from** "
+                                "(the only text the answering model saw):")
+                    for i, cid in enumerate(row["retrieved_ids"], 1):
+                        ch = evidence.get(cid)
+                        # `label` is the headline for press records and the
+                        # filename for published docs — "O1.RTF" named 500
+                        # articles and identified none of them.
+                        tag = (f"[{i}] {ch['label'] or ch['filename']}" if ch
+                               else f"[{i}] {cid}")
+                        if ch and ch.get("sublabel"):
+                            tag += f"  ·  {ch['sublabel']}"
+                        if chunk_topic_map:
+                            t = chunk_topic_map.get(cid)
+                            if t is not None:
+                                tag += f"  ·  topic {t}: {topic_label_map.get(t, '')}"
+                        if ch:
+                            with st.expander(tag, expanded=False):
+                                # In the body, not the label: a click on a link
+                                # inside an expander header also toggles it.
+                                doc = pdf_url(ch["filename"], ch["org"], cid,
+                                              ch.get("source_type", ""))
+                                if doc:
+                                    name = pdf_sources.md_escape(
+                                        ch["label"] or ch["filename"])
+                                    st.markdown(f"[📄 open {name}]({doc})")
+                                st.text(ch["text"])
+                        else:
+                            st.caption(f"{tag} — not in the current index "
+                                       "(re-ingested since this run?)")
+
+# ---------------------------------------------------------------------------
+# Corpus tab — the inductive topic layer: what the corpus talks
+# about, and how those topics relate to the deductive scores.
+# Read-only: fitting happens locally (no BERTopic in the container).
+# ---------------------------------------------------------------------------
+with tab_corpus:
     # Imported here explicitly: other tabs import altair inside conditional
     # branches, so it is not guaranteed to be bound when this tab renders.
     import altair as alt
@@ -3985,7 +4149,7 @@ with tab_topics:
         "with **no knowledge of the taxonomy**, then compares the two."
     )
 
-    with st.expander("ℹ️ How the topic layer is computed", expanded=False):
+    with methodology("ℹ️ How the topic layer is computed"):
         st.markdown(
             "Fitted with **BERTopic** (Grootendorst, 2022) in "
             "`il_rag/topics.py`, reusing the chunk embeddings already stored "
@@ -4206,8 +4370,7 @@ with tab_topics:
 
         # --- cross-tab against a run ---
         st.subheader("Topic × logic")
-        topic_run = run_selectbox("Run to cross-tab", key="topics_run",
-                                  default_run_id=runs.get_current())
+        topic_run = active_run()
         xtab = topics_mod.load_crosstab(topic_run)
         if xtab is None:
             st.info(
@@ -4272,8 +4435,7 @@ with tab_topics:
                       f"{cov['chunks_never_retrieved_share']:.1%}",
                       help="share of clustered chunks in topics no question "
                            "ever retrieved")
-            with st.expander("ℹ️ What “topics reached” actually means",
-                             expanded=False):
+            with methodology("ℹ️ What “topics reached” actually means"):
                 n_q = cov.get("questions")
                 slots = cov.get("retrieval_slots")
                 distinct = cov.get("distinct_chunks_retrieved")
@@ -4364,10 +4526,10 @@ with tab_topics:
             "actually made it into the answer — **verbatim**, as an "
             "**inflection**, as a **semantic neighbour**, or not at all. It is "
             "the graded counterpart of the exact-match keyword judge on the "
-            "Results tab, which by construction cannot see synonymy."
+            "Confidence tab, which by construction cannot see synonymy."
         )
 
-        with st.expander("ℹ️ How keyword retention is scored", expanded=False):
+        with methodology("ℹ️ How keyword retention is scored"):
             st.markdown(
                 "Implemented in `il_rag/topic_keywords.py`. Same shape as the "
                 "quote-provenance ladder: four rungs, cheapest first, and the "
@@ -4946,266 +5108,8 @@ with tab_topics:
 
 
 # ---------------------------------------------------------------------------
-# Ad-hoc tab — drop in documents and run the questionnaire against them alone.
-# Deliberately isolated from the corpus: nothing here is written to Chroma.
-# ---------------------------------------------------------------------------
-with tab_adhoc:
-    import altair as alt
-
-    st.header("Analyse a document")
-    st.caption(
-        "Drop in one or more documents and run the same 27-question "
-        "questionnaire against **only those files**. Nothing is added to the "
-        "vector index — the six research profiles cannot be affected by "
-        "anything you upload here."
-    )
-
-    with st.expander("ℹ️ How this differs from a corpus run", expanded=False):
-        st.markdown(
-            "**Same measurement, different evidence.** From retrieval onward "
-            "this is the production path — the identical questionnaire, the "
-            "identical answering prompt, the identical graded matcher, the "
-            "identical aggregation. Only the source of evidence changes, so a "
-            "percentage here means what it means on the Results tab."
-        )
-        st.markdown(
-            "**Retrieval is exhaustive, not indexed.** Uploaded text is "
-            "chunked with the same splitter as ingest, embedded once, and held "
-            "**in memory**. Each question then scores every chunk by cosine "
-            "similarity and takes the top $k$:"
-        )
-        st.latex(r"\mathrm{score}(q,c)=\frac{v_q\cdot v_c}"
-                 r"{\lVert v_q\rVert\,\lVert v_c\rVert},\qquad "
-                 r"R(q)=\operatorname*{top-}k_c\ \mathrm{score}(q,c)")
-        symbol_glossary([
-            (r"$q,\;c$", "**a question** and **an uploaded chunk**"),
-            (r"$v_q,\;v_c$", "their **embeddings** (1024 numbers each)"),
-            (r"$k$", "how many chunks are given to the answering model"),
-            (r"$R(q)$", "the **evidence set** for question $q$"),
-        ])
-        st.markdown(
-            "**Design decisions**\n"
-            "- *Why no Chroma.* The six profiles are the study's result, and a "
-            "stray upload must never be able to contaminate the index they are "
-            "computed from. Not writing at all is a stronger guarantee than "
-            "writing carefully and cleaning up afterwards.\n"
-            "- *Why exhaustive search is fine.* A handful of documents is a few "
-            "hundred chunks; comparing against all of them is instant and "
-            "needs no collection lifecycle.\n"
-            "- *Why a subject name is required.* The questions literally ask "
-            "what \"{org}\" does. Answering them about an unnamed entity would "
-            "change what is being measured, so the name is an input, not a "
-            "label.\n"
-            "- *Scope.* A result lives in this browser session until you "
-            "**save** it. Saving writes a real run snapshot — the same files a "
-            "corpus run writes — tagged as a document analysis, so the Audit "
-            "tab and the post-hoc judges read it unchanged. It stays out of "
-            "the run pickers by default (a sidebar toggle opts in): an "
-            "uploaded document is not part of the six-profile study, and the "
-            "Results charts key on the three labs, so they cannot plot an "
-            "arbitrary subject."
-        )
-
-    saved = runs.list_runs(kind=runs.KIND_ADHOC)
-    if saved:
-        with st.expander(f"📂 Saved analyses ({len(saved)})", expanded=False):
-            st.caption(
-                "Each one is a run snapshot on disk. Reloading shows it below "
-                "exactly as it looked when saved — including the evidence text, "
-                "which travels with the row because uploaded chunks are never "
-                "indexed."
-            )
-            ids = [m["run_id"] for m in saved]
-            names = {m["run_id"]: runs.display_name(m) for m in saved}
-            pick = st.selectbox("Analysis", ids, key="adhoc_saved_pick",
-                                format_func=lambda r: names.get(r, r))
-            pm = next((m for m in saved if m["run_id"] == pick), {})
-            docs_in = pm.get("documents") or []
-            st.caption(
-                f"Saved {pm.get('created_at', '?')} · k={pm.get('k', '?')} · "
-                f"{pm.get('answered', 0)} answered / {pm.get('abstained', 0)} "
-                "abstained"
-                + (f" · files: {', '.join(docs_in)}" if docs_in else ""))
-            if st.button("Load this analysis", key="adhoc_load"):
-                loaded = adhoc_mod.load_run(pick)
-                if loaded is None:
-                    st.error("That snapshot could not be read.")
-                else:
-                    st.session_state["adhoc_result"] = loaded
-                    st.session_state["adhoc_saved_as"] = pick
-                    st.rerun()
-
-    ad1, ad2 = st.columns([2, 1])
-    subject = ad1.text_input(
-        "Subject name — the organisation these documents are about",
-        placeholder="e.g. OpenAI, or Acme Corp",
-        help="Substituted into every question, so it must name the entity the "
-             "documents describe.")
-    adhoc_k = ad2.slider("Chunks per question (k)", 3, 10, TOP_K, key="adhoc_k")
-
-    uploads = st.file_uploader(
-        "Drag and drop documents here",
-        type=["pdf", "txt", "md", "rtf"], accept_multiple_files=True,
-        help="PDF, TXT, Markdown or RTF. Scanned PDFs need OCR first — there "
-             "is no text layer to extract.")
-
-    if uploads:
-        docs = [adhoc_mod.extract_text(f.name, f.getvalue()) for f in uploads]
-        ok = [d for d in docs if not d.error]
-        bad = [d for d in docs if d.error]
-        for d in bad:
-            st.warning(f"**{d.filename}** — {d.error}", icon="⚠️")
-        if ok:
-            chunks_preview = adhoc_mod.build_chunks(ok, subject or "SUBJECT")
-            n_q = runs.QUESTIONS_PER_ORG
-            st.dataframe(
-                pd.DataFrame([{"file": d.filename, "characters": d.n_chars,
-                               "chunks": sum(1 for c in chunks_preview
-                                             if c.filename == d.filename)}
-                              for d in ok]),
-                hide_index=True, width="stretch")
-            st.caption(
-                f"**{len(chunks_preview)} chunks** to embed, then {n_q} "
-                f"questions × (1 answer + 1 matcher call) = **{2 * n_q} LLM "
-                f"calls**, run sequentially — expect **3-5 minutes**. "
-                f"Keep this tab open; closing it loses the run."
-            )
-            can_run = bool(subject.strip()) and api_key_present()
-            if not subject.strip():
-                st.info("Enter a subject name above to enable the run.",
-                        icon="✏️")
-            if st.button("Run the questionnaire on these documents",
-                         type="primary", disabled=not can_run,
-                         key="adhoc_run"):
-                chunks = adhoc_mod.build_chunks(ok, subject.strip())
-                bar = st.progress(0.0, text="Embedding uploaded text…")
-                try:
-                    vecs = adhoc_mod.embed_chunks(
-                        chunks,
-                        progress=lambda i, n: bar.progress(
-                            i / n, text=f"Embedding {i}/{n} chunks…"))
-                    result = adhoc_mod.analyze(
-                        chunks, vecs, subject.strip(), k=adhoc_k,
-                        progress=lambda i, n: bar.progress(
-                            i / n, text=f"Question {i}/{n}…"))
-                except Exception as e:  # noqa: BLE001 — surface, don't crash the tab
-                    bar.empty()
-                    st.error(f"Analysis failed: {e}")
-                    result = None
-                else:
-                    bar.empty()
-                    result["documents"] = [d.filename for d in ok]
-                    result["k"] = adhoc_k
-                    st.session_state["adhoc_result"] = result
-                    st.session_state.pop("adhoc_saved_as", None)
-                    st.success("Done.")
-
-    res = st.session_state.get("adhoc_result")
-    if res:
-        prof = res["profile"]
-        st.subheader(f"Profile — {res['subject']}")
-        st.caption(f"{prof['answered']} answered · {prof['abstained']} "
-                   "abstained (abstentions are excluded from the percentages)")
-        if prof["answered"]:
-            pdf_ = pd.DataFrame([{"logic": k, "pct": v}
-                                 for k, v in prof["logic_pct"].items()])
-            st.altair_chart(
-                alt.Chart(pdf_).mark_bar().encode(
-                    x=alt.X("logic:N", sort=LOGICS, title=None),
-                    y=alt.Y("pct:Q", title="% of profile",
-                            scale=alt.Scale(domain=[0, 100])),
-                    color=alt.Color("logic:N", legend=None,
-                                    scale=alt.Scale(
-                                        domain=list(LOGIC_COLORS),
-                                        range=list(LOGIC_COLORS.values()))),
-                    tooltip=["logic", alt.Tooltip("pct:Q", format=".1f")],
-                ).properties(height=280), width="stretch")
-            sanity = max(prof["logic_pct"].get("Family", 0),
-                         prof["logic_pct"].get("Religion", 0))
-            if sanity > 15:
-                st.warning(f"Family/Religion reach {sanity:.1f}% — with a small "
-                           "document set this is easily noise, but worth "
-                           "reading the answers below before trusting it.")
-            st.caption(
-                "One document set is a much smaller sample than a corpus "
-                "profile, so treat the ranking as indicative and the exact "
-                "percentages as soft."
-            )
-
-        with st.expander("Every question, its answer and its evidence",
-                         expanded=False):
-            for row in res["rows"]:
-                top = ("ABSTAINED" if row["abstain"]
-                       else max(row["weights"], key=row["weights"].get))
-                with st.expander(f"{row['qid']} → {top}"):
-                    st.markdown(f"**Q:** {row['question']}")
-                    st.markdown(f"**Answer:**\n\n{row['answer']}")
-                    if not row["abstain"]:
-                        st.dataframe(pd.DataFrame(
-                            [{"logic": k, "weight": round(v, 3)}
-                             for k, v in row["weights"].items() if v > 0]
-                        ).sort_values("weight", ascending=False),
-                            hide_index=True)
-                    st.markdown(f"**Matcher reasoning:** {row['reasoning']}")
-                    st.markdown("**Evidence used:**")
-                    for i, ev in enumerate(row["retrieved"], 1):
-                        with st.expander(f"[{i}] {ev['filename']} "
-                                         f"(similarity {ev['score']:.3f})"):
-                            st.text(ev["text"])
-
-        # --- Save this analysis as a run snapshot ---
-        saved_as = st.session_state.get("adhoc_saved_as")
-        if saved_as:
-            st.success(
-                f"Saved as **{saved_as}**. It is on disk under "
-                "`data/profiles/runs/`, reloadable above, and the Audit tab "
-                "and post-hoc judges can read it — enable **Show document "
-                "analyses in run pickers** in the sidebar to select it there.",
-                icon="💾")
-        else:
-            with st.container(border=True):
-                st.markdown("**Save this analysis**")
-                st.caption(
-                    "Writes a run snapshot so the result survives closing this "
-                    "tab. Tagged as a document analysis, so it stays out of the "
-                    "study's run pickers unless you opt in from the sidebar."
-                )
-                sv1, sv2 = st.columns([2, 1])
-                save_label = sv1.text_input(
-                    "Label (optional)", key="adhoc_save_label",
-                    placeholder="e.g. Acme 2026 annual report")
-                sv2.markdown("&nbsp;", unsafe_allow_html=True)
-                if sv2.button("💾 Save analysis", type="primary",
-                              key="adhoc_save"):
-                    try:
-                        rid = adhoc_mod.save_run(
-                            res, k=res.get("k", TOP_K),
-                            label=save_label.strip() or None,
-                            documents=res.get("documents"))
-                    except Exception as e:  # noqa: BLE001 — surface, don't crash
-                        st.error(f"Could not save: {e}")
-                    else:
-                        st.session_state["adhoc_saved_as"] = rid
-                        st.rerun()
-
-        dl1, dl2 = st.columns(2)
-        dl1.download_button(
-            "profile.json",
-            json.dumps({"subject": res["subject"], "profile": prof},
-                       ensure_ascii=False, indent=2),
-            file_name=f"adhoc_profile_{res['subject']}.json")
-        dl2.download_button(
-            "per_question.jsonl",
-            "\n".join(json.dumps(r, ensure_ascii=False) for r in res["rows"]),
-            file_name=f"adhoc_rows_{res['subject']}.jsonl")
-        if st.button("Clear result", key="adhoc_clear"):
-            del st.session_state["adhoc_result"]
-            st.session_state.pop("adhoc_saved_as", None)
-            st.rerun()
-
-
-# ---------------------------------------------------------------------------
-# Compare tab — diff two run snapshots (the point of saving runs)
+# Compare tab — diff two run snapshots (the point of saving runs).
+# The only tab that picks its own runs, because diffing needs two.
 # ---------------------------------------------------------------------------
 with tab_compare:
     st.header("Compare two runs")
@@ -5213,7 +5117,7 @@ with tab_compare:
     if len(metas) < 2:
         st.info(
             "Need at least two saved runs to compare. After you change the "
-            "questionnaire, run again on the **Run** tab with **Start a NEW run "
+            "questionnaire, run again on the **Setup** tab with **Start a NEW run "
             "snapshot** checked — the previous run is preserved, and both will "
             "show up here."
         )
@@ -5240,8 +5144,7 @@ with tab_compare:
 
             # --- 1. Profile % deltas (B − A) ------------------------------
             with sub_delta:
-                with st.expander("ℹ️ How the deltas are computed",
-                                 expanded=False):
+                with methodology("ℹ️ How the deltas are computed"):
                     st.markdown(
                         "A plain arithmetic difference of the two runs' "
                         "profile percentages, per (lab, source, logic) — run B "
@@ -5274,7 +5177,7 @@ with tab_compare:
                         "**How to read a delta**\n"
                         "- Deltas are **not** significance-tested. Compare "
                         "each against the bootstrap confidence interval on the "
-                        "Results tab: a shift well inside the CI is "
+                        "Confidence tab: a shift well inside the CI is "
                         "indistinguishable from question-sampling noise.\n"
                         "- Two runs of the *same* questionnaire still differ, "
                         "because decoding at temperature 0 is greedy but not "
@@ -5490,3 +5393,265 @@ with tab_compare:
                                         width="stretch")
                         st.caption(f"{shown} question(s) shown of {len(common)} "
                                    "shared between the runs.")
+
+# ---------------------------------------------------------------------------
+# Document tab — drop in documents and run the questionnaire
+# against them alone. Isolated: nothing here reaches Chroma.
+# ---------------------------------------------------------------------------
+with tab_document:
+    import altair as alt
+
+    st.header("Analyse a document")
+    st.caption(
+        "Drop in one or more documents and run the same 27-question "
+        "questionnaire against **only those files**. Nothing is added to the "
+        "vector index — the six research profiles cannot be affected by "
+        "anything you upload here."
+    )
+
+    with methodology("ℹ️ How this differs from a corpus run"):
+        st.markdown(
+            "**Same measurement, different evidence.** From retrieval onward "
+            "this is the production path — the identical questionnaire, the "
+            "identical answering prompt, the identical graded matcher, the "
+            "identical aggregation. Only the source of evidence changes, so a "
+            "percentage here means what it means on the Profiles tab."
+        )
+        st.markdown(
+            "**Retrieval is exhaustive, not indexed.** Uploaded text is "
+            "chunked with the same splitter as ingest, embedded once, and held "
+            "**in memory**. Each question then scores every chunk by cosine "
+            "similarity and takes the top $k$:"
+        )
+        st.latex(r"\mathrm{score}(q,c)=\frac{v_q\cdot v_c}"
+                 r"{\lVert v_q\rVert\,\lVert v_c\rVert},\qquad "
+                 r"R(q)=\operatorname*{top-}k_c\ \mathrm{score}(q,c)")
+        symbol_glossary([
+            (r"$q,\;c$", "**a question** and **an uploaded chunk**"),
+            (r"$v_q,\;v_c$", "their **embeddings** (1024 numbers each)"),
+            (r"$k$", "how many chunks are given to the answering model"),
+            (r"$R(q)$", "the **evidence set** for question $q$"),
+        ])
+        st.markdown(
+            "**Design decisions**\n"
+            "- *Why no Chroma.* The six profiles are the study's result, and a "
+            "stray upload must never be able to contaminate the index they are "
+            "computed from. Not writing at all is a stronger guarantee than "
+            "writing carefully and cleaning up afterwards.\n"
+            "- *Why exhaustive search is fine.* A handful of documents is a few "
+            "hundred chunks; comparing against all of them is instant and "
+            "needs no collection lifecycle.\n"
+            "- *Why a subject name is required.* The questions literally ask "
+            "what \"{org}\" does. Answering them about an unnamed entity would "
+            "change what is being measured, so the name is an input, not a "
+            "label.\n"
+            "- *Scope.* A result lives in this browser session until you "
+            "**save** it. Saving writes a real run snapshot — the same files a "
+            "corpus run writes — tagged as a document analysis, so the Audit "
+            "tab and the post-hoc judges read it unchanged. It stays out of "
+            "the run pickers by default (a sidebar toggle opts in): an "
+            "uploaded document is not part of the six-profile study, and the "
+            "Results charts key on the three labs, so they cannot plot an "
+            "arbitrary subject."
+        )
+
+    saved = runs.list_runs(kind=runs.KIND_ADHOC)
+    if saved:
+        with st.expander(f"📂 Saved analyses ({len(saved)})", expanded=False):
+            st.caption(
+                "Each one is a run snapshot on disk. Reloading shows it below "
+                "exactly as it looked when saved — including the evidence text, "
+                "which travels with the row because uploaded chunks are never "
+                "indexed."
+            )
+            ids = [m["run_id"] for m in saved]
+            names = {m["run_id"]: runs.display_name(m) for m in saved}
+            pick = st.selectbox("Analysis", ids, key="adhoc_saved_pick",
+                                format_func=lambda r: names.get(r, r))
+            pm = next((m for m in saved if m["run_id"] == pick), {})
+            docs_in = pm.get("documents") or []
+            st.caption(
+                f"Saved {pm.get('created_at', '?')} · k={pm.get('k', '?')} · "
+                f"{pm.get('answered', 0)} answered / {pm.get('abstained', 0)} "
+                "abstained"
+                + (f" · files: {', '.join(docs_in)}" if docs_in else ""))
+            if st.button("Load this analysis", key="adhoc_load"):
+                loaded = adhoc_mod.load_run(pick)
+                if loaded is None:
+                    st.error("That snapshot could not be read.")
+                else:
+                    st.session_state["adhoc_result"] = loaded
+                    st.session_state["adhoc_saved_as"] = pick
+                    st.rerun()
+
+    ad1, ad2 = st.columns([2, 1])
+    subject = ad1.text_input(
+        "Subject name — the organisation these documents are about",
+        placeholder="e.g. OpenAI, or Acme Corp",
+        help="Substituted into every question, so it must name the entity the "
+             "documents describe.")
+    adhoc_k = ad2.slider("Chunks per question (k)", 3, 10, TOP_K, key="adhoc_k")
+
+    uploads = st.file_uploader(
+        "Drag and drop documents here",
+        type=["pdf", "txt", "md", "rtf"], accept_multiple_files=True,
+        help="PDF, TXT, Markdown or RTF. Scanned PDFs need OCR first — there "
+             "is no text layer to extract.")
+
+    if uploads:
+        docs = [adhoc_mod.extract_text(f.name, f.getvalue()) for f in uploads]
+        ok = [d for d in docs if not d.error]
+        bad = [d for d in docs if d.error]
+        for d in bad:
+            st.warning(f"**{d.filename}** — {d.error}", icon="⚠️")
+        if ok:
+            chunks_preview = adhoc_mod.build_chunks(ok, subject or "SUBJECT")
+            n_q = runs.QUESTIONS_PER_ORG
+            st.dataframe(
+                pd.DataFrame([{"file": d.filename, "characters": d.n_chars,
+                               "chunks": sum(1 for c in chunks_preview
+                                             if c.filename == d.filename)}
+                              for d in ok]),
+                hide_index=True, width="stretch")
+            st.caption(
+                f"**{len(chunks_preview)} chunks** to embed, then {n_q} "
+                f"questions × (1 answer + 1 matcher call) = **{2 * n_q} LLM "
+                f"calls**, run sequentially — expect **3-5 minutes**. "
+                f"Keep this tab open; closing it loses the run."
+            )
+            can_run = bool(subject.strip()) and api_key_present()
+            if not subject.strip():
+                st.info("Enter a subject name above to enable the run.",
+                        icon="✏️")
+            if st.button("Run the questionnaire on these documents",
+                         type="primary", disabled=not can_run,
+                         key="adhoc_run"):
+                chunks = adhoc_mod.build_chunks(ok, subject.strip())
+                bar = st.progress(0.0, text="Embedding uploaded text…")
+                try:
+                    vecs = adhoc_mod.embed_chunks(
+                        chunks,
+                        progress=lambda i, n: bar.progress(
+                            i / n, text=f"Embedding {i}/{n} chunks…"))
+                    result = adhoc_mod.analyze(
+                        chunks, vecs, subject.strip(), k=adhoc_k,
+                        progress=lambda i, n: bar.progress(
+                            i / n, text=f"Question {i}/{n}…"))
+                except Exception as e:  # noqa: BLE001 — surface, don't crash the tab
+                    bar.empty()
+                    st.error(f"Analysis failed: {e}")
+                    result = None
+                else:
+                    bar.empty()
+                    result["documents"] = [d.filename for d in ok]
+                    result["k"] = adhoc_k
+                    st.session_state["adhoc_result"] = result
+                    st.session_state.pop("adhoc_saved_as", None)
+                    st.success("Done.")
+
+    res = st.session_state.get("adhoc_result")
+    if res:
+        prof = res["profile"]
+        st.subheader(f"Profile — {res['subject']}")
+        st.caption(f"{prof['answered']} answered · {prof['abstained']} "
+                   "abstained (abstentions are excluded from the percentages)")
+        if prof["answered"]:
+            pdf_ = pd.DataFrame([{"logic": k, "pct": v}
+                                 for k, v in prof["logic_pct"].items()])
+            st.altair_chart(
+                alt.Chart(pdf_).mark_bar().encode(
+                    x=alt.X("logic:N", sort=LOGICS, title=None),
+                    y=alt.Y("pct:Q", title="% of profile",
+                            scale=alt.Scale(domain=[0, 100])),
+                    color=alt.Color("logic:N", legend=None,
+                                    scale=alt.Scale(
+                                        domain=list(LOGIC_COLORS),
+                                        range=list(LOGIC_COLORS.values()))),
+                    tooltip=["logic", alt.Tooltip("pct:Q", format=".1f")],
+                ).properties(height=280), width="stretch")
+            sanity = max(prof["logic_pct"].get("Family", 0),
+                         prof["logic_pct"].get("Religion", 0))
+            if sanity > 15:
+                st.warning(f"Family/Religion reach {sanity:.1f}% — with a small "
+                           "document set this is easily noise, but worth "
+                           "reading the answers below before trusting it.")
+            st.caption(
+                "One document set is a much smaller sample than a corpus "
+                "profile, so treat the ranking as indicative and the exact "
+                "percentages as soft."
+            )
+
+        with st.expander("Every question, its answer and its evidence",
+                         expanded=False):
+            for row in res["rows"]:
+                top = ("ABSTAINED" if row["abstain"]
+                       else max(row["weights"], key=row["weights"].get))
+                with st.expander(f"{row['qid']} → {top}"):
+                    st.markdown(f"**Q:** {row['question']}")
+                    st.markdown(f"**Answer:**\n\n{row['answer']}")
+                    if not row["abstain"]:
+                        st.dataframe(pd.DataFrame(
+                            [{"logic": k, "weight": round(v, 3)}
+                             for k, v in row["weights"].items() if v > 0]
+                        ).sort_values("weight", ascending=False),
+                            hide_index=True)
+                    st.markdown(f"**Matcher reasoning:** {row['reasoning']}")
+                    st.markdown("**Evidence used:**")
+                    for i, ev in enumerate(row["retrieved"], 1):
+                        with st.expander(f"[{i}] {ev['filename']} "
+                                         f"(similarity {ev['score']:.3f})"):
+                            st.text(ev["text"])
+
+        # --- Save this analysis as a run snapshot ---
+        saved_as = st.session_state.get("adhoc_saved_as")
+        if saved_as:
+            st.success(
+                f"Saved as **{saved_as}**. It is on disk under "
+                "`data/profiles/runs/`, reloadable above, and the Evidence tab "
+                "and post-hoc judges can read it — enable **Show document "
+                "analyses in run pickers** in the sidebar to select it there.",
+                icon="💾")
+        else:
+            with st.container(border=True):
+                st.markdown("**Save this analysis**")
+                st.caption(
+                    "Writes a run snapshot so the result survives closing this "
+                    "tab. Tagged as a document analysis, so it stays out of the "
+                    "study's run pickers unless you opt in from the sidebar."
+                )
+                sv1, sv2 = st.columns([2, 1])
+                save_label = sv1.text_input(
+                    "Label (optional)", key="adhoc_save_label",
+                    placeholder="e.g. Acme 2026 annual report")
+                sv2.markdown("&nbsp;", unsafe_allow_html=True)
+                if sv2.button("💾 Save analysis", type="primary",
+                              key="adhoc_save"):
+                    try:
+                        rid = adhoc_mod.save_run(
+                            res, k=res.get("k", TOP_K),
+                            label=save_label.strip() or None,
+                            documents=res.get("documents"))
+                    except Exception as e:  # noqa: BLE001 — surface, don't crash
+                        st.error(f"Could not save: {e}")
+                    else:
+                        st.session_state["adhoc_saved_as"] = rid
+                        st.rerun()
+
+        dl1, dl2 = st.columns(2)
+        dl1.download_button(
+            "profile.json",
+            json.dumps({"subject": res["subject"], "profile": prof},
+                       ensure_ascii=False, indent=2),
+            file_name=f"adhoc_profile_{res['subject']}.json")
+        dl2.download_button(
+            "per_question.jsonl",
+            "\n".join(json.dumps(r, ensure_ascii=False) for r in res["rows"]),
+            file_name=f"adhoc_rows_{res['subject']}.jsonl")
+        if st.button("Clear result", key="adhoc_clear"):
+            del st.session_state["adhoc_result"]
+            st.session_state.pop("adhoc_saved_as", None)
+            st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# Compare tab — diff two run snapshots (the point of saving runs)
