@@ -162,3 +162,164 @@ def test_load_topic_info_applies_curation(tmp_path, monkeypatch):
     (tmp_path / tp.TOPIC_INFO_NAME).write_text(json.dumps(info))
     monkeypatch.setattr(tp, "TOPICS_DIR", tmp_path)
     assert tp.load_topic_info()["topics"][0]["keywords"] == ["copyright"]
+    # Writers get the raw record back, so a relabel never bakes curation in.
+    assert tp.load_topic_info(curated=False)["topics"][0]["keywords"] == [
+        "copyright", "setting"]
+
+
+def test_selection_skips_global_curation_and_counts_its_boilerplate():
+    kws, furniture = tp.select_keywords(
+        ["setting", "motley fool", "june 8th", "settlement", "copyright"])
+    assert kws == ["settlement", "copyright"]
+    assert furniture == 1          # only the boilerplate hit, not filler/dates
+
+
+# ---------------------------------------------------------------------------
+# Keyword selection: the label-quality layer (pure — no BERTopic, no corpus)
+# ---------------------------------------------------------------------------
+def test_phrase_containment_redundancy_is_dropped():
+    """'opus' wins its slot, so its three restatements must not take three more."""
+    kws, _ = tp.select_keywords(
+        ["opus", "claude opus", "opus 46", "opus 45", "evaluation", "sonnet"])
+    assert kws == ["opus", "evaluation", "sonnet"]
+
+
+def test_superset_first_still_suppresses_the_subset():
+    """Order follows c-TF-IDF rank, so a phrase can arrive before its head."""
+    kws, _ = tp.select_keywords(["national security", "national", "federal"])
+    assert kws == ["national security", "federal"]
+
+
+def test_inflections_collapse_to_the_higher_ranked_form():
+    kws, _ = tp.select_keywords(["evaluation", "evaluations", "model",
+                                 "models", "safety"])
+    assert kws == ["evaluation", "model", "safety"]
+
+
+def test_inflection_rule_covers_the_y_and_e_endings():
+    """company/companies and evaluate/evaluating are still one word each."""
+    assert tp._same_stem("company", "companies")
+    assert tp._same_stem("evaluate", "evaluating")
+    assert tp._same_stem("train", "training")
+
+
+def test_terms_of_art_are_not_treated_as_inflections():
+    """'r' and 'y'/'e' are not English inflections, so these are two words.
+
+    'compute' is a term of art in this corpus and must not lose its slot to
+    'computer'; policy/police was a known collision of the older length-based
+    rule.
+    """
+    assert not tp._same_stem("compute", "computer")
+    assert not tp._same_stem("policy", "police")
+    kws, _ = tp.select_keywords(["compute", "computer", "cluster"])
+    assert kws == ["compute", "computer", "cluster"]
+
+
+def test_distinct_words_sharing_a_prefix_are_kept():
+    """The stem rule must not swallow genuinely different vocabulary."""
+    kws, _ = tp.select_keywords(["interpretability", "interpret", "internal"])
+    # interpret/interpretability share only a 9-char prefix with a long
+    # remainder, and 'internal' diverges at 5 — all three survive.
+    assert "interpretability" in kws and "internal" in kws
+
+
+def test_pure_numbers_never_take_a_slot():
+    kws, furniture = tp.select_keywords(["46", "2021", "opus", "-", "sonnet"])
+    assert kws == ["opus", "sonnet"]
+    assert furniture == 0          # numbers are noise, not furniture
+
+
+def test_corpus_furniture_is_dropped_and_counted():
+    kws, furniture = tp.select_keywords(
+        ["newstex", "arxiv preprint", "et al", "settlement", "copyright"])
+    assert kws == ["settlement", "copyright"]
+    assert furniture == 3
+
+
+def test_stop_phrases_survive_as_ordinary_words_elsewhere():
+    """'sole discretion' is footer text; 'discretion' alone is ordinary."""
+    dropped, _ = tp.select_keywords(["sole discretion"])
+    assert dropped == []
+    kept, _ = tp.select_keywords(["discretion", "judgment"])
+    assert kept == ["discretion", "judgment"]
+
+
+def test_selection_respects_the_requested_count():
+    kws, _ = tp.select_keywords([f"term{i}" for i in range(50)], n=4)
+    assert len(kws) == 4
+
+
+def test_duplication_score_separates_templated_from_varied_text():
+    templated = ["Newstex authoritative content is provided as is"] * 6
+    varied = ["export controls on advanced chips",
+              "the board appointed a new chief executive",
+              "researchers published a peer reviewed paper",
+              "customers renewed their enterprise subscriptions",
+              "the settlement covers pirated books",
+              "regulators opened a formal inquiry"]
+    assert tp.duplication_score(templated) > 0.9
+    assert tp.duplication_score(varied) < 0.1
+
+
+def test_duplication_score_degenerate_inputs():
+    assert tp.duplication_score([]) == 0.0
+    assert tp.duplication_score(["only one document"]) == 0.0
+    assert tp.duplication_score(["", "   "]) == 0.0
+
+
+def test_duplication_score_is_deterministic_over_a_sample():
+    texts = [f"document number {i} about governance and oversight"
+             for i in range(200)]
+    assert tp.duplication_score(texts) == tp.duplication_score(texts)
+
+
+def test_describe_topic_flags_templated_clusters_but_keeps_keywords():
+    d = tp.describe_topic(["dividend", "quarterly", "moving average"],
+                          duplication=0.61)
+    assert d["is_boilerplate"] is True
+    # The label is plain data — the flag lives in is_boilerplate, and the
+    # marker is applied by display_label at render time.
+    assert d["label"] == "dividend, quarterly, moving average"
+    # The keywords stay: which boilerplate it is is what makes the flag useful.
+    assert d["keywords"] == ["dividend", "quarterly", "moving average"]
+    assert d["duplication"] == 0.61
+
+
+def test_describe_topic_leaves_real_topics_unmarked():
+    d = tp.describe_topic(["settlement", "copyright", "authors", "judge"],
+                          duplication=0.06)
+    assert d["is_boilerplate"] is False
+    assert d["label"] == "settlement, copyright, authors, judge"
+
+
+def test_describe_topic_flags_a_topic_the_stoplist_emptied():
+    """No duplication signal, but nothing survived except furniture."""
+    d = tp.describe_topic(["newstex", "arxiv", "et al", "doi"])
+    assert d["is_boilerplate"] is True
+    assert d["n_furniture_terms"] == 4
+
+
+def test_describe_topic_without_a_duplication_signal_omits_the_field():
+    d = tp.describe_topic(["settlement", "copyright", "authors"])
+    assert "duplication" not in d
+    assert d["is_boilerplate"] is False
+
+
+def test_display_label_applies_the_marker_only_to_flagged_topics():
+    flagged = {"label": "dividend, quarterly", "is_boilerplate": True}
+    real = {"label": "settlement, copyright", "is_boilerplate": False}
+    assert tp.display_label(flagged) == "\u26a0 dividend, quarterly"
+    assert tp.display_label(real) == "settlement, copyright"
+
+
+def test_display_label_does_not_double_mark_a_legacy_label():
+    """Snapshots written before the marker moved out of the data carry it."""
+    legacy = {"label": "\u26a0 dividend, quarterly", "is_boilerplate": True}
+    assert tp.display_label(legacy) == "\u26a0 dividend, quarterly"
+
+
+def test_clean_label_strips_a_legacy_marker_and_tolerates_junk():
+    assert tp.clean_label("\u26a0 motley fool") == "motley fool"
+    assert tp.clean_label("motley fool") == "motley fool"
+    assert tp.clean_label(None) == ""

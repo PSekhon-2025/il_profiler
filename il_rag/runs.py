@@ -17,6 +17,20 @@ Layout:
 
 run_id is "YYYY-MM-DD_HHMMSS" — sortable and filesystem-safe. A run is the unit
 of comparison; --fresh always mints a new one, a resumed run reuses CURRENT.
+
+Two KINDS of run share this layout:
+
+  corpus  the study's own runs — the questionnaire against the ingested
+          corpus, keyed by (org in ORGS) x (source_type in SOURCE_TYPES).
+  adhoc   one saved document analysis (il_rag/adhoc.py): the same
+          questionnaire against uploaded files, keyed by an arbitrary subject
+          name and the "uploaded" source type.
+
+They share the folder layout on purpose — an ad-hoc snapshot is a real run, so
+the post-hoc judges read it unchanged — but meta.json carries kind="adhoc" so
+the corpus-facing pickers can filter them out. Mixing an uploaded document into
+the six research profiles would misrepresent the study, and the ORGS-keyed
+charts cannot render an arbitrary subject anyway.
 """
 import json
 import shutil
@@ -47,6 +61,21 @@ QUOTE_SPANS_NAME = "spans.jsonl"
 QUOTE_SUMMARY_NAME = "summary.json"
 
 QUESTIONS_PER_ORG = len(CATEGORIES) * 3  # structural invariant (9 categories x 3)
+
+# meta["kind"]. Absent on every run written before ad-hoc saving existed, so
+# KIND_CORPUS is the default everywhere rather than a value that must be
+# backfilled.
+KIND_CORPUS = "corpus"
+KIND_ADHOC = "adhoc"
+
+
+def run_kind(meta: dict) -> str:
+    """A run's kind, defaulting to corpus for snapshots predating the field."""
+    return meta.get("kind") or KIND_CORPUS
+
+
+def is_adhoc(meta: dict) -> bool:
+    return run_kind(meta) == KIND_ADHOC
 
 
 # ---------------------------------------------------------------------------
@@ -188,22 +217,42 @@ def finalize_meta(run_id: str, rows: list[dict], orgs: list[str],
     )
 
 
-def list_runs() -> list[dict]:
-    """All run metas, newest first (by run_id, which is chronological)."""
+def list_runs(kind: str | None = None) -> list[dict]:
+    """Run metas, newest first (by run_id, which is chronological).
+
+    `kind` filters to one kind (KIND_CORPUS / KIND_ADHOC); None returns every
+    run. The default is deliberately unfiltered — a caller that wants only the
+    study's runs has to say so, so no code path silently loses a run it should
+    have shown.
+    """
     if not RUNS_DIR.exists():
         return []
     metas = []
     for d in RUNS_DIR.iterdir():
         if d.is_dir() and (d / META_NAME).exists():
             metas.append(read_meta(d.name))
+    if kind is not None:
+        metas = [m for m in metas if run_kind(m) == kind]
     return sorted(metas, key=lambda m: m.get("run_id", ""), reverse=True)
 
 
 def display_name(meta: dict) -> str:
-    """Human label for a run in dropdowns: id, optional label, status."""
+    """Human label for a run in dropdowns: id, optional label, status.
+
+    Ad-hoc runs lead with their subject rather than their id: the id is the
+    least informative thing about "the questionnaire against three PDFs about
+    Acme", and the 📄 is what stops one being mistaken for a study run in a
+    mixed dropdown.
+    """
     run_id = meta.get("run_id", "?")
     label = meta.get("label") or ""
     flag = "" if meta.get("status") == "complete" else " · partial"
+    if is_adhoc(meta):
+        subject = meta.get("subject") or "?"
+        n_docs = len(meta.get("documents") or [])
+        docs = f" · {n_docs} doc{'s' if n_docs != 1 else ''}" if n_docs else ""
+        head = f"📄 {subject}{docs} · {run_id}"
+        return head + (f" — {label}" if label else "") + flag
     return f"{run_id}" + (f" — {label}" if label else "") + flag
 
 

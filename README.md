@@ -72,29 +72,35 @@ macOS: double-click **`Launch IL Profiler.command`** in Finder (or run
 Windows: double-click **`Launch IL Profiler.bat`** in Explorer (or run
 `.venv\Scripts\streamlit run app.py`).
 
-The app opens in your browser with five tabs:
+The app opens in your browser with seven tabs. The **active run is picked once in the sidebar** so no two tabs can show different snapshots, and a **Show methodology** toggle reveals the derivation behind every number:
 
-- **Run** — paste/save your API key, build the vector index, and run the
+- **Setup** — paste/save your API key, build the vector index, and run the
   questionnaire for any subset of labs/sources, with live logs. Stages run as
   the same resumable subprocesses as the CLI. Each run is saved as its own
   snapshot (optionally labelled), so a re-run never overwrites an earlier one.
-- **Results** — pick any saved run, then view the six profiles as grouped bar
-  charts (published vs thirdparty per lab), dominant-logic metrics, an automatic
-  Family/Religion sanity-check banner, a per-category heatmap, and downloads.
-- **Audit** — pick a run, then filter and read every question's RAG answer,
-  graded weights, and matcher reasoning (plus supporting quotes and grounding
-  bucket when those checks were enabled).
-- **Hallucination** — the five opt-in checks for any saved run: alert banners
-  when a detection fires, retrieval-grounding buckets with a score histogram,
-  unverified-quote listings, quote provenance (why each failed quote failed,
-  and whether its content holds up anyway — launchable from this tab), the
-  metamorphic eval (launchable from this tab, flagged items shown
-  variant-by-variant), and the embedding-agreement check (binary + graded
-  closeness metrics, launchable from this tab).
-- **Compare runs** — diff two snapshots: per-logic profile deltas (B − A),
-  a question-wording and reference-answer diff (including per-question
-  overrides), and a per-question answer/weight diff. This is how you see what
-  a rewritten questionnaire changed.
+- **Profiles** — the finding on its own: the six profiles as grouped bar charts
+  (published vs thirdparty per lab), run provenance, dominant-logic metrics, the
+  automatic Family/Religion sanity-check banner, a per-category heatmap,
+  bootstrap-CI error bars, and downloads.
+- **Confidence** — the one place that answers *can I believe this run?*. It
+  opens with a verdict board: one row per check with what it tests, its number,
+  and a verdict — including the checks that have **not** run, because an unrun
+  check is not a passed one. Below it, each check in full: bootstrap confidence
+  intervals, replicate runs, the embedding and keyword judges, retrieval
+  grounding, quote verification, quote provenance, and the metamorphic eval.
+  The evals that cost API calls are launchable from their own sections.
+- **Evidence** — filter and read every question's RAG answer, graded weights and
+  matcher reasoning, plus supporting quotes, grounding bucket, and the excerpts
+  the answer was built from.
+- **Corpus** — the inductive topic layer: what the corpus is about, topic ×
+  logic, the coverage audit of what the questionnaire never asks, keyword
+  retention, and the keyword-neighbourhood explorer.
+- **Compare** — diff two snapshots: per-logic profile deltas (B − A), a
+  question-wording and reference-answer diff (including per-question overrides),
+  and a per-question answer/weight diff. This is how you see what a rewritten
+  questionnaire changed. The only tab that picks its own runs.
+- **Document** — run the questionnaire against uploaded files instead of the
+  corpus, and save the result as a tagged run snapshot.
 
 ### Source links in the audit trail (optional, local only)
 
@@ -618,8 +624,8 @@ scripts/
   13_run_topic_keywords.py    stage 13 (optional): topic-keyword retention +
                               the word-pair calibration it scores against
 tests/                offline unit tests (pytest; all API calls stubbed)
-app.py                Streamlit GUI (Run / Results / Audit / Hallucination /
-                      Topics / Analyse a document / Compare runs)
+app.py                Streamlit GUI (Setup / Profiles / Confidence /
+                      Evidence / Corpus / Compare / Document)
 Launch IL Profiler.command   double-clickable launcher (macOS)
 Launch IL Profiler.bat       double-clickable launcher (Windows)
 ```
