@@ -8,6 +8,7 @@ import json
 
 import pytest
 
+from il_rag import topic_curation as tc
 from il_rag import topics as tp
 from il_rag.questionnaire import LOGICS
 
@@ -107,3 +108,57 @@ def test_build_crosstab_end_to_end(tmp_path, monkeypatch):
     assert cov["chunks_never_retrieved_share"] == pytest.approx(0.5)
     # And it was persisted into the run folder.
     assert (run_dir / tp.RUN_SUBDIR / tp.RUN_CROSSTAB_NAME).exists()
+
+
+# ---------------------------------------------------------------------------
+# Keyword curation
+# ---------------------------------------------------------------------------
+def test_date_and_number_rule_spares_model_names():
+    for junk in ["june 8th", "157 billion", "64k", "monday june", "q1", "15year"]:
+        assert tc.is_date_or_number(junk), junk
+    for name in ["gpt4o", "claude 35", "asl3", "o3", "colm 2025", "sonnet 45"]:
+        assert not tc.is_date_or_number(name), name
+
+
+def test_global_discards_apply_to_any_fit():
+    kept, dropped = tc.curate_keywords(
+        ["alignment", "setting", "ofthe", "june 01", "motley fool"],
+        topic=3, fitted_at="some-other-fit")
+    assert kept == ["alignment"]
+    assert [d["keyword"] for d in dropped] == ["setting", "ofthe", "june 01",
+                                               "motley fool"]
+    assert all(d["reason"] for d in dropped)
+
+
+def test_topic_discards_only_apply_to_the_curated_fit():
+    """Topic ids are renumbered by a refit, so per-topic decisions must not
+    leak onto whatever topic inherits the id."""
+    assert tc.curate_keywords(["state"], 6, tc.CURATED_FITTED_AT)[0] == []
+    assert tc.curate_keywords(["state"], 6, "2030-01-01T00:00:00")[0] == ["state"]
+
+
+def test_curate_info_relabels_keeps_raw_and_is_idempotent():
+    info = {"fitted_at": tc.CURATED_FITTED_AT, "topics": [
+        {"topic": 8, "is_outlier": False, "label": "assistant, compliant, ...",
+         "keywords": ["assistant", "compliant", "ofthe", "violation"]},
+        {"topic": 11, "is_outlier": False, "label": "commentary, ...",
+         "keywords": ["commentary", "warranties"]},
+    ]}
+    out = tc.curate_info(info)
+    t8, t11 = out["topics"]
+    assert t8["keywords"] == ["compliant", "violation"]
+    assert t8["label"] == "compliant, violation"
+    assert t8["keywords_raw"] == ["assistant", "compliant", "ofthe", "violation"]
+    assert {d["keyword"] for d in t8["keywords_discarded"]} == {"assistant", "ofthe"}
+    # An emptied topic still gets a distinct label.
+    assert t11["keywords"] == [] and "11" in t11["label"]
+    assert tc.curate_info(out) is out and len(t8["keywords_discarded"]) == 2
+
+
+def test_load_topic_info_applies_curation(tmp_path, monkeypatch):
+    info = {"fitted_at": "2030-01-01T00:00:00", "topics": [
+        {"topic": 0, "is_outlier": False, "label": "x",
+         "keywords": ["copyright", "setting"]}]}
+    (tmp_path / tp.TOPIC_INFO_NAME).write_text(json.dumps(info))
+    monkeypatch.setattr(tp, "TOPICS_DIR", tmp_path)
+    assert tp.load_topic_info()["topics"][0]["keywords"] == ["copyright"]

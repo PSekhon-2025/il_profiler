@@ -50,6 +50,7 @@ from collections import defaultdict
 from datetime import datetime
 
 from . import runs
+from . import topic_curation
 from .config import CHROMA_DIR, COLLECTION_NAME, DATA_DIR, ORGS, SOURCE_TYPES
 from .questionnaire import LOGICS
 
@@ -149,6 +150,9 @@ def fit_topics(min_topic_size: int = DEFAULT_MIN_TOPIC_SIZE,
         vectorizer_model=vectorizer,
         ctfidf_model=ClassTfidfTransformer(reduce_frequent_words=True),
         min_topic_size=min_topic_size,
+        # Over-fetched so that curation below can drop junk terms and still
+        # leave n_keywords per topic.
+        top_n_words=n_keywords * 3,
         calculate_probabilities=False,
         verbose=True,
     )
@@ -167,14 +171,23 @@ def fit_topics(min_topic_size: int = DEFAULT_MIN_TOPIC_SIZE,
 
     topic_records = []
     for t in sorted(sizes):
-        words = [w for w, _ in (model.get_topic(t) or [])][:n_keywords]
+        # Only the fit-independent curation applies here (extraction debris,
+        # boilerplate, filler, dates/numbers); per-topic decisions are keyed to
+        # a fit and cannot exist yet.
+        candidates = [w for w, _ in (model.get_topic(t) or [])]
+        kept, dropped = topic_curation.curate_keywords(candidates)
+        words = kept[:n_keywords]
+        # Record only the discards that outranked the last kept word — the
+        # ones that would otherwise have been keywords.
+        cutoff = candidates.index(words[-1]) if words else len(candidates)
         topic_records.append({
             "topic": t,
             "size": sizes[t],
             "is_outlier": t == OUTLIER_TOPIC,
             "keywords": words,
-            "label": ("(unclustered)" if t == OUTLIER_TOPIC
-                      else ", ".join(words[:4])),
+            "keywords_discarded": [d for d in dropped
+                                   if candidates.index(d["keyword"]) < cutoff],
+            "label": topic_curation.topic_label(t, words, t == OUTLIER_TOPIC),
             "by_org": {o: by_org[t].get(o, 0) for o in ORGS},
             "by_source": {s: by_source[t].get(s, 0) for s in SOURCE_TYPES},
         })
@@ -206,8 +219,16 @@ def fit_topics(min_topic_size: int = DEFAULT_MIN_TOPIC_SIZE,
 # Reading results (no BERTopic needed — this is what the app uses)
 # ---------------------------------------------------------------------------
 def load_topic_info() -> dict | None:
+    """topic_info.json with keyword curation applied (see topic_curation.py).
+
+    Curated at load rather than by rewriting the file, so the fitted output on
+    disk stays the raw record and every reader — app, cross-tab, keyword
+    retention — sees the same cleaned keywords and labels.
+    """
     path = TOPICS_DIR / TOPIC_INFO_NAME
-    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
+    if not path.exists():
+        return None
+    return topic_curation.curate_info(json.loads(path.read_text(encoding="utf-8")))
 
 
 def load_chunk_topics() -> dict | None:
