@@ -67,6 +67,7 @@ from collections import defaultdict
 from datetime import datetime
 
 from . import runs
+from . import topic_curation
 from .config import CHROMA_DIR, COLLECTION_NAME, DATA_DIR, ORGS, SOURCE_TYPES
 from .grounding import content_tokens
 from .questionnaire import LOGICS
@@ -259,6 +260,11 @@ def select_keywords(candidates: list[str],
     second value is what flags a topic as boilerplate, and it counts only
     stoplist hits, never redundancy, because a topic full of synonyms is a real
     topic while a topic full of licensing text is not.
+
+    The fit-independent half of topic_curation (extraction debris, filler,
+    dates and dollar figures, boilerplate) is also skipped here, so its junk
+    never takes a slot that the candidate pool could refill; its boilerplate
+    hits count as furniture like the stoplist's.
     """
     kept: list[str] = []
     furniture = 0
@@ -266,6 +272,10 @@ def select_keywords(candidates: list[str],
         term = " ".join(str(raw).lower().split())
         if not term or _NON_WORD_RE.match(term):
             continue                                  # "46", "2021", "-"
+        reason = topic_curation.discard_reason(term)
+        if reason:
+            furniture += int(reason == topic_curation.BOILERPLATE)
+            continue
         if term in KEYWORD_STOP_PHRASES:
             furniture += 1
             continue
@@ -521,7 +531,9 @@ def relabel_topics(n_keywords: int = DEFAULT_N_KEYWORDS) -> dict:
             f"Relabelling needs the local-only extras ({e}); install with:\n"
             "    .venv/bin/pip install -r requirements-topics.txt") from e
 
-    info = load_topic_info()
+    # Raw, not curated: this rewrites topic_info.json, and baking the load-time
+    # curation into the file would stop it being re-applied on later loads.
+    info = load_topic_info(curated=False)
     chunk_topics = load_chunk_topics()
     if info is None or chunk_topics is None:
         raise SystemExit(
@@ -648,9 +660,19 @@ def _refresh_crosstab_labels(info: dict) -> int:
 # ---------------------------------------------------------------------------
 # Reading results (no BERTopic needed — this is what the app uses)
 # ---------------------------------------------------------------------------
-def load_topic_info() -> dict | None:
+def load_topic_info(curated: bool = True) -> dict | None:
+    """topic_info.json with keyword curation applied (see topic_curation.py).
+
+    Curated at load rather than by rewriting the file, so the fitted output on
+    disk stays the raw record and every reader — app, cross-tab, keyword
+    retention — sees the same cleaned keywords and labels. `curated=False` is
+    for writers (relabel_topics) that must round-trip the raw record.
+    """
     path = TOPICS_DIR / TOPIC_INFO_NAME
-    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
+    if not path.exists():
+        return None
+    info = json.loads(path.read_text(encoding="utf-8"))
+    return topic_curation.curate_info(info) if curated else info
 
 
 def load_chunk_topics() -> dict | None:
