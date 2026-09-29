@@ -30,11 +30,17 @@ def _is_transient(err: Exception) -> bool:
     """Heuristic: is this error worth retrying (server-side / network blip)?"""
     msg = str(err)
     low = msg.lower()
+    # Checked by class name too: the SDK's APITimeoutError says only
+    # "Request timed out." — no status code, no "timeout" in the text.
+    name = type(err).__name__.lower()
     return (
         any(code in msg for code in ("429", "500", "502", "503", "504"))
         or "connection" in low
         or "timeout" in low
+        or "timed out" in low
         or "temporarily unavailable" in low
+        or "timeout" in name
+        or "connection" in name
     )
 
 

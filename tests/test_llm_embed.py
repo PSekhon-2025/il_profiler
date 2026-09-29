@@ -48,6 +48,18 @@ def test_together_backend_uses_the_api(monkeypatch):
     assert llm.embed(["x"]) == [[0.5, 0.5]]
 
 
+def test_sdk_timeout_is_retried_not_raised():
+    # The Together SDK's timeout reads "Request timed out." — it crashed the
+    # 2026-09-29 metamorphic run because nothing in it said "timeout".
+    from together import APITimeoutError
+
+    import httpx
+    err = APITimeoutError(request=httpx.Request("POST", "https://x"))
+    assert llm._is_transient(err)
+    assert llm._is_transient(RuntimeError("Request timed out."))
+    assert not llm._is_transient(ValueError("400 model_not_available"))
+
+
 def test_missing_sentence_transformers_gives_an_actionable_error(monkeypatch):
     monkeypatch.setattr(llm, "_local_model", None)
     monkeypatch.setitem(sys.modules, "sentence_transformers", None)
