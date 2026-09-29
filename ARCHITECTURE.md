@@ -103,7 +103,15 @@ weights → aggregate (mean per logic) → percentage profile per (lab, source)
 ```
 
 - **LLM**: TogetherAI `openai/gpt-oss-120b` (both the answer and the grading).
-- **Embeddings**: TogetherAI `intfloat/multilingual-e5-large-instruct` (1024-dim).
+- **Embeddings**: `intfloat/multilingual-e5-large-instruct` (1024-dim), run
+  locally through sentence-transformers. The index was built with Together's
+  hosted copy of the same model; Together dropped it from its serverless tier in
+  September 2026, so embeddings moved local. Before switching, re-embedded chunks
+  were checked against the stored vectors (cosine ≥ 0.9995) and a saved run's
+  162 retrievals were replayed: 161 returned the identical five chunks, the other
+  differed by a 0.0001 tie at rank five. `IL_PROFILER_EMBED_BACKEND=together`
+  restores the API path for use with a dedicated endpoint. Local embeddings need
+  `requirements-topics.txt`, so the deployed container cannot start new runs.
 - **Vector store**: local **ChromaDB**, collection `il_corpus`, cosine space.
 
 ---
@@ -1413,7 +1421,7 @@ il_rag/
   pdf_sources.py         chunk → source PDF, for the audit trail's links (§12.1)
   article_pdfs.py        (local) RTF press dumps → one PDF per record (§12.2)
   bootstrap_ci.py        confidence intervals over the profiles
-  json_utils.py, llm.py  shared JSON extraction; Together chat/embed wrappers
+  json_utils.py, llm.py  shared JSON extraction; Together chat + local/Together embeddings
 scripts/
   01_ingest.py  02_run_profiles.py  03_run_metamorphic_eval.py
   04_run_embedding_agreement.py  05_run_bootstrap_ci.py

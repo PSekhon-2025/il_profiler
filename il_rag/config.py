@@ -71,6 +71,14 @@ TOGETHER_API_KEY = os.environ.get("TOGETHER_API_KEY")
 GENERATION_MODEL = "openai/gpt-oss-120b"                     # RAG answers + matching
 EMBEDDING_MODEL = "intfloat/multilingual-e5-large-instruct"  # 1024-dim
 EMBEDDING_DIM = 1024
+# Where embeddings are computed. Together AI stopped serving this model on its
+# serverless tier in September 2026 (calls now fail with model_not_available),
+# so the default runs the same open weights locally via sentence-transformers.
+# Verified against the existing index before switching: re-embedded chunks match
+# the stored Together vectors at cosine >= 0.9995, and 161/162 retrievals of a
+# saved run reproduce the identical five chunks — the one exception a 0.0001 tie
+# at rank five. "together" is kept for use with a dedicated Together endpoint.
+EMBEDDING_BACKEND = os.environ.get("IL_PROFILER_EMBED_BACKEND", "local")
 
 # ---------------------------------------------------------------------------
 # Chunking / retrieval

@@ -10,3 +10,8 @@
 #   .venv/bin/pip install -r requirements-topics.txt
 #   .venv/bin/python scripts/07_run_topics.py fit
 bertopic>=0.16.0
+
+# Local embeddings (il_rag/llm.py, the default backend) load the e5 model
+# through sentence-transformers. BERTopic already pulls it in; listed here so
+# the dependency is explicit now that every run needs it.
+sentence-transformers>=3.0
