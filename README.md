@@ -53,6 +53,7 @@ macOS / Linux:
 cd il_profiler
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
+.venv/bin/pip install -r requirements-topics.txt   # local embeddings + topic layer
 cp .env.example .env        # then paste your TOGETHER_API_KEY
 ```
 
@@ -62,8 +63,14 @@ Windows (PowerShell or cmd):
 cd il_profiler
 python -m venv .venv
 .venv\Scripts\pip install -r requirements.txt
+.venv\Scripts\pip install -r requirements-topics.txt
 copy .env.example .env      REM then paste your TOGETHER_API_KEY
 ```
+
+Embeddings run locally (`intfloat/multilingual-e5-large-instruct`, which
+Together no longer serves on its pay-per-call tier), so the second install is
+required. The first run downloads the model weights (~1.1 GB) once; answering
+and grading still use Together, so the API key is still needed.
 
 ## Run — GUI (recommended)
 
@@ -586,7 +593,7 @@ il_rag/
   config.py           paths, models, hyperparameters, study design
   questionnaire.py    27 questions + per-question 7-logic reference answers
                       (the researcher's finalized set, from New Question Set.docx)
-  llm.py              Together chat/embeddings with transient-error retry
+  llm.py              Together chat; embeddings local by default (Together optional)
   json_utils.py       shared JSON extraction from LLM replies
   ingest.py           parse corpora -> chunk -> embed -> Chroma
   retriever.py        (org, source_type)-scoped semantic retrieval

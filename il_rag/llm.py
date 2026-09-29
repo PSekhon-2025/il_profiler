@@ -1,4 +1,4 @@
-"""Together AI client wrappers: chat and embeddings, with transient-error retry.
+"""Model wrappers: Together AI chat, and embeddings (local or Together), with retry.
 
 Why this exists: long ingestion and evaluation runs make hundreds of API calls;
 a single 502 or rate-limit must not kill a run. Transient errors are retried
@@ -9,7 +9,7 @@ import time
 
 from together import Together
 
-from .config import EMBEDDING_MODEL, GENERATION_MODEL, require_api_key
+from .config import EMBEDDING_BACKEND, EMBEDDING_MODEL, GENERATION_MODEL, require_api_key
 
 # Exponential backoff schedule (seconds). Generous because the eval is
 # resumable — better to wait out a blip than abort a half-finished run.
@@ -30,11 +30,17 @@ def _is_transient(err: Exception) -> bool:
     """Heuristic: is this error worth retrying (server-side / network blip)?"""
     msg = str(err)
     low = msg.lower()
+    # Checked by class name too: the SDK's APITimeoutError says only
+    # "Request timed out." — no status code, no "timeout" in the text.
+    name = type(err).__name__.lower()
     return (
         any(code in msg for code in ("429", "500", "502", "503", "504"))
         or "connection" in low
         or "timeout" in low
+        or "timed out" in low
         or "temporarily unavailable" in low
+        or "timeout" in name
+        or "connection" in name
     )
 
 
@@ -59,12 +65,48 @@ def chat(messages: list[dict], *, temperature: float = 0.0, max_tokens: int = 10
     raise RuntimeError(f"Together chat API still failing after retries: {last}")
 
 
-def embed(texts: list[str]) -> list[list[float]]:
-    """Embed a batch of texts with retry. Raises on persistent failure.
+_local_model = None
 
-    Oversize (400) errors are NOT handled here — the caller (ingest) bisects
-    the batch, because only it knows how to drop a single bad chunk.
+
+def _local_embedder():
+    """Load the embedding model once per process (the weights are ~1.1 GB)."""
+    global _local_model
+    if _local_model is None:
+        try:
+            from sentence_transformers import SentenceTransformer
+        except ImportError as e:
+            raise RuntimeError(
+                "Local embeddings need sentence-transformers: "
+                ".venv/bin/pip install -r requirements-topics.txt "
+                "(or set IL_PROFILER_EMBED_BACKEND=together with a dedicated "
+                "Together endpoint).") from e
+        _local_model = SentenceTransformer(EMBEDDING_MODEL)
+    return _local_model
+
+
+def embed(texts: list[str]) -> list[list[float]]:
+    """Embed a batch of texts. Raises on persistent failure.
+
+    Local backend (default): unit-normalized, matching the vectors Together
+    returned when the index was built, so they are interchangeable with the
+    stored ones. The first call downloads the weights if they are not cached.
+    It truncates over-long inputs at the model's 512-token limit rather than
+    raising, so ingest's oversize bisection is never triggered locally.
+
+    Together backend: retried on transient errors. Oversize (400) errors are
+    NOT handled here — the caller (ingest) bisects the batch, because only it
+    knows how to drop a single bad chunk.
     """
+    if EMBEDDING_BACKEND == "local":
+        vecs = _local_embedder().encode(
+            list(texts), normalize_embeddings=True, convert_to_numpy=True,
+            batch_size=16, show_progress_bar=False)
+        return vecs.tolist()
+    return _embed_together(texts)
+
+
+def _embed_together(texts: list[str]) -> list[list[float]]:
+    """Together embeddings endpoint, with transient-error retry."""
     last = None
     for wait in BACKOFF:
         try:
